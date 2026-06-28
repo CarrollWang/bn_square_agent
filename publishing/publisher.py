@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from ..core.config import AccountConfig, Settings
@@ -104,5 +105,35 @@ class PublishingService:
             result = {"error": str(exc)}
             self.db.mark_published(generated_id, result=result, success=False)
             return PublishResult(account.key, generated_id, False, result)
-        self.db.mark_published(generated_id, result=result, success=True)
-        return PublishResult(account.key, generated_id, True, result)
+        success = self._is_publish_success(result)
+        self.db.mark_published(generated_id, result=result, success=success)
+        return PublishResult(account.key, generated_id, success, result)
+
+    @staticmethod
+    def _is_publish_success(result: dict[str, Any]) -> bool:
+        if result.get("isError") is True:
+            return False
+
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict) and "success" in structured:
+            return structured.get("success") is True
+
+        if "success" in result:
+            return result.get("success") is True
+
+        content = result.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    continue
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and "success" in payload:
+                    return payload.get("success") is True
+
+        return False

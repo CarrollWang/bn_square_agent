@@ -123,7 +123,9 @@ function formatMonitorLogs(status) {
       for (const run of item.runs || []) {
         const result = run.error
           ? `失败：${run.error}`
-          : `终稿#${run.approved_generated_id || "-"}，发布：${run.publish_success ? "成功" : "未发布"}`;
+          : `终稿#${run.approved_generated_id || "-"}，发布：${
+              run.publish_success ? "成功" : `失败 ${publishErrorText(run.publish_result)}`
+            }`;
         lines.push(`  · 账号 ${run.account_key}: ${result}`);
       }
     }
@@ -132,6 +134,23 @@ function formatMonitorLogs(status) {
   }
 
   return lines.join("\n");
+}
+
+function publishErrorText(result) {
+  if (!result) return "";
+  const structured = result.structuredContent;
+  if (structured?.error) return structured.error;
+  if (result.error) return result.error;
+  for (const item of result.content || []) {
+    if (!item?.text) continue;
+    try {
+      const payload = JSON.parse(item.text);
+      if (payload.error) return payload.error;
+    } catch {
+      // ignore plain text tool output
+    }
+  }
+  return "";
 }
 
 async function loadAccounts() {

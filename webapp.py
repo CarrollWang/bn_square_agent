@@ -108,6 +108,9 @@ async def run_material_monitor_once() -> dict[str, Any]:
                                     "publish_success": run.publish_result.success
                                     if run.publish_result
                                     else None,
+                                    "publish_result": run.publish_result.result
+                                    if run.publish_result
+                                    else None,
                                 }
                                 for run in runs
                             ],
