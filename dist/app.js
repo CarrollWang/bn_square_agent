@@ -8,10 +8,20 @@ const sourceForm = document.querySelector("#sourceForm");
 const runForm = document.querySelector("#runForm");
 const settingsForm = document.querySelector("#settingsForm");
 const settingsStatus = document.querySelector("#settingsStatus");
+const llmModelOptions = document.querySelector("#llmModelOptions");
 
 function show(value) {
   output.textContent =
     typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 async function requestJson(url, options = {}) {
@@ -37,12 +47,18 @@ async function loadAccounts() {
     const item = document.createElement("div");
     item.className = "account-item";
     item.innerHTML = `
-      <strong>${account.name || account.account_key}</strong>
-      <div class="muted">key: ${account.account_key}</div>
-      <div class="muted">cookie: ${account.cookie_saved ? "已保存" : "缺失"} (${account.cookie_length})</div>
-      <div class="muted">cookie names: ${(account.cookie_names || []).slice(0, 8).join(", ") || "无"}</div>
+      <strong>${escapeHtml(account.name || account.account_key)}</strong>
+      <div class="muted">key: ${escapeHtml(account.account_key)}</div>
+      <div class="muted">cookie: ${
+        account.cookie_saved ? "已保存" : "缺失"
+      } (${account.cookie_length})</div>
+      <div class="muted">cookie names: ${escapeHtml(
+        (account.cookie_names || []).slice(0, 8).join(", ") || "无"
+      )}</div>
       <div class="mini-actions">
-        <button type="button" data-delete-account="${account.account_key}">删除</button>
+        <button type="button" data-delete-account="${escapeHtml(
+          account.account_key
+        )}">删除</button>
       </div>
     `;
     accountsList.appendChild(item);
@@ -60,10 +76,14 @@ async function loadSources() {
     const item = document.createElement("div");
     item.className = "account-item";
     item.innerHTML = `
-      <strong>${source.name}</strong>
-      <div class="muted">${source.url}</div>
-      <div class="muted">last: ${source.last_checked_at || "未采集"}</div>
-      ${source.last_error ? `<div class="muted">error: ${source.last_error}</div>` : ""}
+      <strong>${escapeHtml(source.name)}</strong>
+      <div class="muted">${escapeHtml(source.url)}</div>
+      <div class="muted">last: ${escapeHtml(source.last_checked_at || "未采集")}</div>
+      ${
+        source.last_error
+          ? `<div class="muted">error: ${escapeHtml(source.last_error)}</div>`
+          : ""
+      }
       <div class="mini-actions">
         <button type="button" data-check-source="${source.id}">采集这个源</button>
         <button type="button" data-delete-source="${source.id}">删除</button>
@@ -88,9 +108,13 @@ async function loadItems() {
         ? `${material.content.slice(0, 180)}...`
         : material.content;
     item.innerHTML = `
-      <strong>${material.title || material.source_name || `素材 #${material.id}`}</strong>
-      <div class="muted">${material.author || ""} ${material.url || ""}</div>
-      <p>${preview}</p>
+      <strong>${escapeHtml(
+        material.title || material.source_name || `素材 #${material.id}`
+      )}</strong>
+      <div class="muted">${escapeHtml(material.author || "")} ${escapeHtml(
+      material.url || ""
+    )}</div>
+      <p>${escapeHtml(preview)}</p>
       <div class="mini-actions">
         <button type="button" data-run-material="${material.id}">运行</button>
       </div>
@@ -122,10 +146,11 @@ async function loadMonitorStatus() {
 
 async function loadSettings() {
   const settings = await requestJson("/api/settings");
-  settingsForm.elements.llm_api_key.value = "";
+  settingsForm.elements.llm_api_key.value = settings.llm_api_key_masked || "";
   settingsForm.elements.llm_base_url.value = settings.llm_base_url || "";
   settingsForm.elements.llm_model.value = settings.llm_model || "";
-  settingsForm.elements.dashscope_api_key.value = "";
+  settingsForm.elements.dashscope_api_key.value =
+    settings.dashscope_api_key_masked || "";
   settingsForm.elements.dashscope_embedding_model.value =
     settings.dashscope_embedding_model || "";
   settingsForm.elements.auto_publish.checked = Boolean(settings.auto_publish);
@@ -138,10 +163,18 @@ async function loadSettings() {
     settings.material_ttl_seconds || 7200;
   settingsForm.elements.material_consume_batch_size.value =
     settings.material_consume_batch_size || 1;
+
+  llmModelOptions.innerHTML = "";
+  for (const model of settings.llm_model_options || []) {
+    const option = document.createElement("option");
+    option.value = model;
+    llmModelOptions.appendChild(option);
+  }
+
   settingsStatus.textContent = JSON.stringify(
     {
-      llm_api_key: settings.llm_api_key_configured ? "已配置" : "缺失",
-      dashscope_api_key: settings.dashscope_api_key_configured ? "已配置" : "缺失",
+      llm_api_key: settings.llm_api_key_masked || "缺失",
+      dashscope_api_key: settings.dashscope_api_key_masked || "缺失",
       llm_base_url: settings.llm_base_url || "缺失",
       llm_model: settings.llm_model || "缺失",
     },
@@ -194,11 +227,17 @@ settingsForm.addEventListener("submit", async (event) => {
 
 async function saveSettingsForm() {
   const form = new FormData(settingsForm);
+  const llmApiKey = form.get("llm_api_key").trim();
+  const dashscopeApiKey = form.get("dashscope_api_key").trim();
+  const unchangedSecret = (value) => value.includes("*") || value.includes("•");
   const payload = {
-    llm_api_key: form.get("llm_api_key").trim() || null,
+    llm_api_key: llmApiKey && !unchangedSecret(llmApiKey) ? llmApiKey : null,
     llm_base_url: form.get("llm_base_url").trim(),
     llm_model: form.get("llm_model").trim(),
-    dashscope_api_key: form.get("dashscope_api_key").trim() || null,
+    dashscope_api_key:
+      dashscopeApiKey && !unchangedSecret(dashscopeApiKey)
+        ? dashscopeApiKey
+        : null,
     dashscope_embedding_model: form.get("dashscope_embedding_model").trim(),
     auto_publish: form.get("auto_publish") === "on",
     auto_consume_materials: form.get("auto_consume_materials") === "on",
@@ -331,6 +370,4 @@ Promise.all([
   loadItems(),
   loadMonitorStatus(),
   loadSettings(),
-]).catch((error) =>
-  show(error.message)
-);
+]).catch((error) => show(error.message));

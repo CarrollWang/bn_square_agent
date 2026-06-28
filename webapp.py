@@ -168,6 +168,20 @@ class LLMTestResult(BaseModel):
     message: str
 
 
+def mask_secret(value: str | None) -> str:
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}{'*' * 8}{value[-4:]}"
+
+
+def is_masked_secret(value: str | None) -> bool:
+    if not value:
+        return False
+    return "*" in value or "•" in value
+
+
 def get_settings() -> Settings:
     base = Settings.from_env()
     db = Database(base.database_path)
@@ -212,9 +226,21 @@ def read_settings() -> dict:
     settings = get_settings()
     return {
         "llm_api_key_configured": bool(settings.llm_api_key),
+        "llm_api_key_masked": mask_secret(settings.llm_api_key),
         "llm_base_url": settings.llm_base_url,
         "llm_model": settings.llm_model,
+        "llm_model_options": [
+            "qwen-plus",
+            "qwen-turbo",
+            "qwen-max",
+            "qwen-long",
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "gpt-4.1-mini",
+            "gpt-4o-mini",
+        ],
         "dashscope_api_key_configured": bool(settings.dashscope_api_key),
+        "dashscope_api_key_masked": mask_secret(settings.dashscope_api_key),
         "dashscope_embedding_model": settings.dashscope_embedding_model,
         "mcp_url": settings.mcp_url,
         "mcp_publish_tool": settings.mcp_publish_tool,
@@ -257,7 +283,9 @@ def save_settings(payload: SettingsPayload) -> dict:
     for field, key in secret_fields.items():
         value = data.get(field)
         if value:
-            values[key] = str(value).strip()
+            secret_value = str(value).strip()
+            if not is_masked_secret(secret_value):
+                values[key] = secret_value
     for field, key in bool_fields.items():
         value = data.get(field)
         if value is not None:

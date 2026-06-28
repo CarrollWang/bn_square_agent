@@ -44,7 +44,7 @@
         <form id="settingsForm" class="stack compact-form">
           <label>
             <span>LLM API Key</span>
-            <input name="llm_api_key" placeholder="留空则不覆盖已保存密钥" />
+            <input name="llm_api_key" placeholder="已保存时显示加密掩码；输入新 key 可覆盖" />
           </label>
           <label>
             <span>LLM Base URL</span>
@@ -52,11 +52,12 @@
           </label>
           <label>
             <span>LLM Model</span>
-            <input name="llm_model" placeholder="模型名" />
+            <input name="llm_model" list="llmModelOptions" placeholder="选择或输入模型名" />
+            <datalist id="llmModelOptions"></datalist>
           </label>
           <label>
             <span>DashScope API Key</span>
-            <input name="dashscope_api_key" placeholder="留空则不覆盖已保存密钥" />
+            <input name="dashscope_api_key" placeholder="已保存时显示加密掩码；输入新 key 可覆盖" />
           </label>
           <label>
             <span>Embedding Model</span>
