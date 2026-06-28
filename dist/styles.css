@@ -178,6 +178,35 @@ button:disabled {
   line-height: 1.4;
 }
 
+.auto-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.auto-summary div {
+  border: 1px solid #d9e0e7;
+  border-radius: 6px;
+  padding: 10px;
+  background: #f7f9fb;
+}
+
+.auto-summary strong,
+.auto-summary span {
+  display: block;
+}
+
+.auto-summary strong {
+  color: #16202a;
+  font-size: 16px;
+}
+
+.auto-summary span {
+  margin-top: 4px;
+  color: #6b7785;
+  font-size: 12px;
+}
+
 .output {
   min-height: 220px;
   margin: 16px 0 0;

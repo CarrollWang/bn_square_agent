@@ -5,7 +5,6 @@ const itemsList = document.querySelector("#itemsList");
 const monitorStatus = document.querySelector("#monitorStatus");
 const accountForm = document.querySelector("#accountForm");
 const sourceForm = document.querySelector("#sourceForm");
-const runForm = document.querySelector("#runForm");
 const settingsForm = document.querySelector("#settingsForm");
 const settingsStatus = document.querySelector("#settingsStatus");
 const llmModelOptions = document.querySelector("#llmModelOptions");
@@ -14,6 +13,9 @@ const llmModelSelect = document.querySelector("#llmModelSelect");
 const llmModelsStatus = document.querySelector("#llmModelsStatus");
 const llmApiKeyHint = document.querySelector("#llmApiKeyHint");
 const dashscopeApiKeyHint = document.querySelector("#dashscopeApiKeyHint");
+const autoRunState = document.querySelector("#autoRunState");
+const autoRunInterval = document.querySelector("#autoRunInterval");
+const autoRunConsume = document.querySelector("#autoRunConsume");
 
 function show(value) {
   output.textContent =
@@ -27,6 +29,11 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function formatTime(value) {
+  if (!value) return "-";
+  return new Date(value).toLocaleString();
 }
 
 function setLlmModels(models, selectedModel = "") {
@@ -74,6 +81,59 @@ async function requestJson(url, options = {}) {
   return data;
 }
 
+function formatMonitorLogs(status) {
+  const lines = [];
+  lines.push(`[${new Date().toLocaleString()}] 自动运行状态：${status.running ? "运行中" : "等待下一轮"}`);
+  lines.push(`采集间隔：${status.poll_interval_seconds}s；素材有效期：${status.ttl_seconds}s；每轮消费：${status.consume_batch_size}`);
+  lines.push(`自动消费：${status.auto_consume_materials ? "开启" : "关闭"}`);
+  lines.push(`上次开始：${formatTime(status.last_started_at)}`);
+  lines.push(`上次结束：${formatTime(status.last_finished_at)}`);
+  lines.push(`过期清理：${status.expired_count || 0} 条`);
+  if (status.last_error) {
+    lines.push(`错误：${status.last_error}`);
+  }
+
+  lines.push("");
+  lines.push("采集日志：");
+  if ((status.last_results || []).length) {
+    for (const item of status.last_results) {
+      lines.push(`- source#${item.source_id}: 找到 ${item.found ?? 0} 条，新增 ${item.inserted ?? 0} 条`);
+    }
+  } else {
+    lines.push("- 暂无采集记录");
+  }
+
+  lines.push("");
+  lines.push("打标日志：");
+  if ((status.last_tag_results || []).length) {
+    for (const item of status.last_tag_results.slice(0, 12)) {
+      const tag = item.tag || {};
+      const symbol = tag.symbol || tag.token || "-";
+      lines.push(`- material#${item.material_item_id}: ${item.tag_status} ${symbol} ${tag.direction || ""}`);
+    }
+  } else {
+    lines.push("- 本轮无新增待打标素材");
+  }
+
+  lines.push("");
+  lines.push("消费/发布日志：");
+  if ((status.last_consume_results || []).length) {
+    for (const item of status.last_consume_results) {
+      lines.push(`- material#${item.material_item_id}: ${item.title || "-"}`);
+      for (const run of item.runs || []) {
+        const result = run.error
+          ? `失败：${run.error}`
+          : `终稿#${run.approved_generated_id || "-"}，发布：${run.publish_success ? "成功" : "未发布"}`;
+        lines.push(`  · 账号 ${run.account_key}: ${result}`);
+      }
+    }
+  } else {
+    lines.push("- 暂无消费记录");
+  }
+
+  return lines.join("\n");
+}
+
 async function loadAccounts() {
   const accounts = await requestJson("/api/accounts");
   accountsList.innerHTML = "";
@@ -87,16 +147,10 @@ async function loadAccounts() {
     item.innerHTML = `
       <strong>${escapeHtml(account.name || account.account_key)}</strong>
       <div class="muted">key: ${escapeHtml(account.account_key)}</div>
-      <div class="muted">cookie: ${
-        account.cookie_saved ? "已保存" : "缺失"
-      } (${account.cookie_length})</div>
-      <div class="muted">cookie names: ${escapeHtml(
-        (account.cookie_names || []).slice(0, 8).join(", ") || "无"
-      )}</div>
+      <div class="muted">cookie: ${account.cookie_saved ? "已保存" : "缺失"} (${account.cookie_length})</div>
+      <div class="muted">cookie names: ${escapeHtml((account.cookie_names || []).slice(0, 8).join(", ") || "无")}</div>
       <div class="mini-actions">
-        <button type="button" data-delete-account="${escapeHtml(
-          account.account_key
-        )}">删除</button>
+        <button type="button" data-delete-account="${escapeHtml(account.account_key)}">删除</button>
       </div>
     `;
     accountsList.appendChild(item);
@@ -117,11 +171,7 @@ async function loadSources() {
       <strong>${escapeHtml(source.name)}</strong>
       <div class="muted">${escapeHtml(source.url)}</div>
       <div class="muted">last: ${escapeHtml(source.last_checked_at || "未采集")}</div>
-      ${
-        source.last_error
-          ? `<div class="muted">error: ${escapeHtml(source.last_error)}</div>`
-          : ""
-      }
+      ${source.last_error ? `<div class="muted">error: ${escapeHtml(source.last_error)}</div>` : ""}
       <div class="mini-actions">
         <button type="button" data-check-source="${source.id}">采集这个源</button>
         <button type="button" data-delete-source="${source.id}">删除</button>
@@ -145,17 +195,12 @@ async function loadItems() {
       material.content.length > 180
         ? `${material.content.slice(0, 180)}...`
         : material.content;
+    const tag = material.tag_json ? JSON.parse(material.tag_json) : null;
     item.innerHTML = `
-      <strong>${escapeHtml(
-        material.title || material.source_name || `素材 #${material.id}`
-      )}</strong>
-      <div class="muted">${escapeHtml(material.author || "")} ${escapeHtml(
-      material.url || ""
-    )}</div>
+      <strong>${escapeHtml(material.title || material.source_name || `素材 #${material.id}`)}</strong>
+      <div class="muted">${escapeHtml(material.author || "")} ${escapeHtml(material.url || "")}</div>
+      <div class="muted">tag: ${escapeHtml(material.tag_status || "pending")} ${escapeHtml(tag?.symbol || "")}</div>
       <p>${escapeHtml(preview)}</p>
-      <div class="mini-actions">
-        <button type="button" data-run-material="${material.id}">运行</button>
-      </div>
     `;
     itemsList.appendChild(item);
   }
@@ -181,44 +226,34 @@ async function loadMonitorStatus() {
     null,
     2
   );
+  autoRunState.textContent = status.running ? "运行中" : "等待下一轮";
+  autoRunInterval.textContent = `${status.poll_interval_seconds}s`;
+  autoRunConsume.textContent = status.auto_consume_materials ? "开启" : "关闭";
+  show(formatMonitorLogs(status));
 }
 
 async function loadSettings() {
   const settings = await requestJson("/api/settings");
   settingsForm.elements.llm_api_key.value = settings.llm_api_key_masked || "";
-  setFieldHint(
-    llmApiKeyHint,
-    settings.llm_api_key_configured,
-    settings.llm_api_key_masked
-  );
+  setFieldHint(llmApiKeyHint, settings.llm_api_key_configured, settings.llm_api_key_masked);
   settingsForm.elements.llm_base_url.value = settings.llm_base_url || "";
   settingsForm.elements.llm_model.value = settings.llm_model || "";
-  settingsForm.elements.dashscope_api_key.value =
-    settings.dashscope_api_key_masked || "";
-  setFieldHint(
-    dashscopeApiKeyHint,
-    settings.dashscope_api_key_configured,
-    settings.dashscope_api_key_masked
-  );
+  settingsForm.elements.dashscope_api_key.value = settings.dashscope_api_key_masked || "";
+  setFieldHint(dashscopeApiKeyHint, settings.dashscope_api_key_configured, settings.dashscope_api_key_masked);
   settingsForm.elements.dashscope_embedding_model.value =
     settings.dashscope_embedding_model || "";
   settingsForm.elements.auto_publish.checked = Boolean(settings.auto_publish);
-  settingsForm.elements.auto_consume_materials.checked = Boolean(
-    settings.auto_consume_materials
-  );
+  settingsForm.elements.auto_consume_materials.checked = Boolean(settings.auto_consume_materials);
   settingsForm.elements.material_poll_interval_seconds.value =
     settings.material_poll_interval_seconds || 300;
-  settingsForm.elements.material_ttl_seconds.value =
-    settings.material_ttl_seconds || 7200;
+  settingsForm.elements.material_ttl_seconds.value = settings.material_ttl_seconds || 7200;
   settingsForm.elements.material_consume_batch_size.value =
     settings.material_consume_batch_size || 1;
 
   setLlmModels(settings.llm_model_options || [], settings.llm_model || "");
-  if (llmModelsStatus) {
-    llmModelsStatus.textContent = settings.llm_model
-      ? `当前模型：${settings.llm_model}`
-      : "填好 URL 和 Key 后点击获取模型";
-  }
+  llmModelsStatus.textContent = settings.llm_model
+    ? `当前模型：${settings.llm_model}`
+    : "填好 URL 和 Key 后点击获取模型";
 
   settingsStatus.textContent = JSON.stringify(
     {
@@ -232,6 +267,36 @@ async function loadSettings() {
   );
 }
 
+async function saveSettingsForm() {
+  const form = new FormData(settingsForm);
+  const llmApiKey = form.get("llm_api_key").trim();
+  const dashscopeApiKey = form.get("dashscope_api_key").trim();
+  const unchangedSecret = (value) => value.includes("*") || value.includes("•");
+  const payload = {
+    llm_api_key: llmApiKey && !unchangedSecret(llmApiKey) ? llmApiKey : null,
+    llm_base_url: form.get("llm_base_url").trim(),
+    llm_model: form.get("llm_model").trim(),
+    dashscope_api_key:
+      dashscopeApiKey && !unchangedSecret(dashscopeApiKey)
+        ? dashscopeApiKey
+        : null,
+    dashscope_embedding_model: form.get("dashscope_embedding_model").trim(),
+    auto_publish: form.get("auto_publish") === "on",
+    auto_consume_materials: form.get("auto_consume_materials") === "on",
+    material_poll_interval_seconds: Number(form.get("material_poll_interval_seconds") || 300),
+    material_ttl_seconds: Number(form.get("material_ttl_seconds") || 7200),
+    material_consume_batch_size: Number(form.get("material_consume_batch_size") || 1),
+  };
+  show("保存配置...");
+  const result = await requestJson("/api/settings", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  await loadSettings();
+  await loadMonitorStatus();
+  show(result);
+}
+
 accountForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(accountForm);
@@ -240,7 +305,7 @@ accountForm.addEventListener("submit", async (event) => {
     name: form.get("name").trim(),
     cookie: form.get("cookie").trim(),
   };
-  show("保存中...");
+  show("保存账号...");
   await requestJson("/api/accounts", {
     method: "POST",
     body: JSON.stringify(payload),
@@ -274,57 +339,6 @@ settingsForm.addEventListener("submit", async (event) => {
   await saveSettingsForm();
 });
 
-async function saveSettingsForm() {
-  const form = new FormData(settingsForm);
-  const llmApiKey = form.get("llm_api_key").trim();
-  const dashscopeApiKey = form.get("dashscope_api_key").trim();
-  const unchangedSecret = (value) => value.includes("*") || value.includes("•");
-  const payload = {
-    llm_api_key: llmApiKey && !unchangedSecret(llmApiKey) ? llmApiKey : null,
-    llm_base_url: form.get("llm_base_url").trim(),
-    llm_model: form.get("llm_model").trim(),
-    dashscope_api_key:
-      dashscopeApiKey && !unchangedSecret(dashscopeApiKey)
-        ? dashscopeApiKey
-        : null,
-    dashscope_embedding_model: form.get("dashscope_embedding_model").trim(),
-    auto_publish: form.get("auto_publish") === "on",
-    auto_consume_materials: form.get("auto_consume_materials") === "on",
-    material_poll_interval_seconds: Number(
-      form.get("material_poll_interval_seconds") || 300
-    ),
-    material_ttl_seconds: Number(form.get("material_ttl_seconds") || 7200),
-    material_consume_batch_size: Number(
-      form.get("material_consume_batch_size") || 1
-    ),
-  };
-  show("保存配置...");
-  const result = await requestJson("/api/settings", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  await loadSettings();
-  await loadMonitorStatus();
-  show(result);
-}
-
-runForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = new FormData(runForm);
-  const payload = {
-    title: form.get("title").trim() || null,
-    url: form.get("url").trim() || null,
-    content: form.get("content").trim(),
-    auto_publish: form.get("publish") === "on",
-  };
-  show("运行中...");
-  const data = await requestJson("/api/run", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  show(data);
-});
-
 document.querySelector("#refreshAccounts").addEventListener("click", loadAccounts);
 document.querySelector("#refreshSettings").addEventListener("click", loadSettings);
 document.querySelector("#testLlm").addEventListener("click", async () => {
@@ -337,24 +351,18 @@ document.querySelector("#testLlm").addEventListener("click", async () => {
 document.querySelector("#testEmbedding").addEventListener("click", async () => {
   await saveSettingsForm();
   show("测试 Embedding 连接...");
-  const data = await requestJson("/api/settings/test-embedding", {
-    method: "POST",
-  });
+  const data = await requestJson("/api/settings/test-embedding", { method: "POST" });
   show(data);
   await loadSettings();
 });
 fetchLlmModelsButton.addEventListener("click", async () => {
   try {
     fetchLlmModelsButton.disabled = true;
-    if (llmModelsStatus) {
-      llmModelsStatus.textContent = "正在保存配置并获取模型列表...";
-    }
+    llmModelsStatus.textContent = "正在保存配置并获取模型列表...";
     show("正在保存配置并获取模型列表...");
     await saveSettingsForm();
     const data = await requestJson("/api/settings/models", { method: "POST" });
-    if (!data.ok) {
-      throw new Error(data.message || "获取模型失败");
-    }
+    if (!data.ok) throw new Error(data.message || "获取模型失败");
     const currentModel = settingsForm.elements.llm_model.value.trim();
     const models = data.models || [];
     const selectedModel = models.includes(currentModel) ? currentModel : models[0] || "";
@@ -363,21 +371,12 @@ fetchLlmModelsButton.addEventListener("click", async () => {
       await saveSettingsForm();
     }
     setLlmModels(models, selectedModel);
-    if (llmModelsStatus) {
-      llmModelsStatus.textContent = selectedModel
-        ? `已获取 ${models.length} 个模型，当前模型：${selectedModel}`
-        : `已获取 ${models.length} 个模型`;
-    }
-    show({
-      ok: true,
-      selected_model: selectedModel || null,
-      count: models.length,
-      models,
-    });
+    llmModelsStatus.textContent = selectedModel
+      ? `已获取 ${models.length} 个模型，当前模型：${selectedModel}`
+      : `已获取 ${models.length} 个模型`;
+    show({ ok: true, selected_model: selectedModel || null, count: models.length, models });
   } catch (error) {
-    if (llmModelsStatus) {
-      llmModelsStatus.textContent = `获取失败：${error.message}`;
-    }
+    llmModelsStatus.textContent = `获取失败：${error.message}`;
     show(error.message);
   } finally {
     fetchLlmModelsButton.disabled = false;
@@ -390,7 +389,7 @@ llmModelSelect.addEventListener("change", () => {
 });
 document.querySelector("#refreshItems").addEventListener("click", loadItems);
 document.querySelector("#checkSources").addEventListener("click", async () => {
-  show("采集中...");
+  show("立即采集并消费...");
   const data = await requestJson("/api/material-sources/check", { method: "POST" });
   await loadSources();
   await loadItems();
@@ -398,7 +397,7 @@ document.querySelector("#checkSources").addEventListener("click", async () => {
   show(data);
 });
 document.querySelector("#checkTools").addEventListener("click", async () => {
-  show("检查中...");
+  show("检查 MCP 中...");
   show(await requestJson("/api/mcp/tools"));
 });
 
@@ -435,21 +434,6 @@ sourcesList.addEventListener("click", async (event) => {
   await loadSources();
   await loadItems();
   await loadMonitorStatus();
-  show(data);
-});
-
-itemsList.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-run-material]");
-  if (!button) return;
-  show("运行素材...");
-  const data = await requestJson("/api/material-items/run", {
-    method: "POST",
-    body: JSON.stringify({
-      material_item_id: Number(button.dataset.runMaterial),
-      auto_publish: runForm.elements.publish.checked,
-    }),
-  });
-  await loadItems();
   show(data);
 });
 

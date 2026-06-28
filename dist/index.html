@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>BN Square Agent</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260628-3" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260628-4" />
   </head>
   <body>
     <main class="shell">
@@ -101,7 +101,7 @@
       <section class="panel sources">
         <header>
           <h2>素材源</h2>
-          <button id="checkSources" type="button">采集</button>
+          <button id="checkSources" type="button">立即采集</button>
         </header>
 
         <form id="sourceForm" class="stack">
@@ -129,34 +129,29 @@
 
       <section class="panel runner">
         <header>
-          <h2>素材运行</h2>
+          <h2>自动运行</h2>
           <button id="checkTools" type="button">检查 MCP</button>
         </header>
 
-        <form id="runForm" class="stack">
-          <label>
-            <span>标题</span>
-            <input name="title" placeholder="可选" />
-          </label>
-          <label>
-            <span>来源链接</span>
-            <input name="url" placeholder="可选" />
-          </label>
-          <label>
-            <span>素材内容</span>
-            <textarea name="content" rows="14" placeholder="输入需要改写运营的素材" required></textarea>
-          </label>
-          <label class="check">
-            <input name="publish" type="checkbox" checked />
-            <span>生成后自动发布</span>
-          </label>
-          <button type="submit">开始运行</button>
-        </form>
+        <div class="auto-summary">
+          <div>
+            <strong id="autoRunState">加载中</strong>
+            <span>后台服务</span>
+          </div>
+          <div>
+            <strong id="autoRunInterval">-</strong>
+            <span>采集间隔</span>
+          </div>
+          <div>
+            <strong id="autoRunConsume">-</strong>
+            <span>自动消费</span>
+          </div>
+        </div>
 
-        <pre id="output" class="output">等待操作...</pre>
+        <pre id="output" class="output">等待自动运行日志...</pre>
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260628-3"></script>
+    <script src="/static/app.js?v=20260628-4"></script>
   </body>
 </html>
