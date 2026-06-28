@@ -175,6 +175,7 @@ async function loadMonitorStatus() {
       expired_count: status.expired_count,
       last_error: status.last_error,
       last_results: status.last_results,
+      last_tag_results: status.last_tag_results,
       last_consume_results: status.last_consume_results,
     },
     null,
@@ -355,14 +356,23 @@ fetchLlmModelsButton.addEventListener("click", async () => {
       throw new Error(data.message || "获取模型失败");
     }
     const currentModel = settingsForm.elements.llm_model.value.trim();
-    setLlmModels(data.models || [], currentModel);
+    const models = data.models || [];
+    const selectedModel = models.includes(currentModel) ? currentModel : models[0] || "";
+    if (selectedModel && selectedModel !== currentModel) {
+      settingsForm.elements.llm_model.value = selectedModel;
+      await saveSettingsForm();
+    }
+    setLlmModels(models, selectedModel);
     if (llmModelsStatus) {
-      llmModelsStatus.textContent = `已获取 ${(data.models || []).length} 个模型`;
+      llmModelsStatus.textContent = selectedModel
+        ? `已获取 ${models.length} 个模型，当前模型：${selectedModel}`
+        : `已获取 ${models.length} 个模型`;
     }
     show({
       ok: true,
-      count: (data.models || []).length,
-      models: data.models || [],
+      selected_model: selectedModel || null,
+      count: models.length,
+      models,
     });
   } catch (error) {
     if (llmModelsStatus) {

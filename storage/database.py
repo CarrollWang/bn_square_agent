@@ -167,6 +167,10 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'new' CHECK(
                     status IN ('new', 'used', 'ignored', 'failed')
                 ),
+                tag_status TEXT NOT NULL DEFAULT 'pending',
+                tag_json TEXT,
+                tag_error TEXT,
+                tagged_at TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -189,6 +193,17 @@ class Database:
             connection.execute("ALTER TABLE accounts ADD COLUMN checked_at TEXT")
         if "check_error" not in account_columns:
             connection.execute("ALTER TABLE accounts ADD COLUMN check_error TEXT")
+        material_columns = self._columns(connection, "material_items")
+        if "tag_status" not in material_columns:
+            connection.execute(
+                "ALTER TABLE material_items ADD COLUMN tag_status TEXT NOT NULL DEFAULT 'pending'"
+            )
+        if "tag_json" not in material_columns:
+            connection.execute("ALTER TABLE material_items ADD COLUMN tag_json TEXT")
+        if "tag_error" not in material_columns:
+            connection.execute("ALTER TABLE material_items ADD COLUMN tag_error TEXT")
+        if "tagged_at" not in material_columns:
+            connection.execute("ALTER TABLE material_items ADD COLUMN tagged_at TEXT")
 
     def upsert_material_source(
         self,
@@ -301,6 +316,7 @@ class Database:
         self,
         *,
         status: str | None = "new",
+        tag_status: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         query = """
@@ -312,6 +328,10 @@ class Database:
         if status:
             query += " WHERE i.status = ?"
             params.append(status)
+        if tag_status:
+            query += " AND" if params else " WHERE"
+            query += " i.tag_status = ?"
+            params.append(tag_status)
         query += " ORDER BY i.created_at DESC, i.id DESC LIMIT ?"
         params.append(limit)
         with self.connect() as connection:
@@ -348,6 +368,38 @@ class Database:
                 WHERE id = ?
                 """,
                 (status, error, utc_now(), item_id),
+            )
+
+    def pending_material_items_for_tagging(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self.list_material_items(status="new", tag_status="pending", limit=limit)
+
+    def save_material_tag(
+        self,
+        item_id: int,
+        *,
+        tag_status: str,
+        tag: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE material_items
+                SET tag_status = ?,
+                    tag_json = ?,
+                    tag_error = ?,
+                    tagged_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    tag_status,
+                    json.dumps(tag, ensure_ascii=False) if tag is not None else None,
+                    error,
+                    utc_now(),
+                    utc_now(),
+                    item_id,
+                ),
             )
 
     def expire_stale_material_items(self, *, ttl_seconds: int) -> int:

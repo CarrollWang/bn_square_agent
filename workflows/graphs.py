@@ -34,6 +34,26 @@ class ContentState(TypedDict, total=False):
     approved_generated_id: int | None
 
 
+def default_style_profile(account_key: str) -> StyleProfile:
+    return StyleProfile.model_construct(
+        persona=f"{account_key} auto operator",
+        risk_level="中",
+        favorite_topics=["加密市场", "合约走势", "热点代币"],
+        favorite_words=["关注", "可能", "继续", "位置", "风险"],
+        opening_style="直接点出代币和方向，开头给出明确观点。",
+        tone="短句、直接、有运营感，但避免承诺收益。",
+        beliefs=[
+            "只基于素材已有信息改写，不新增未经素材支持的事实。",
+            "观点可以明确，但预测必须保留不确定表达。",
+            "优先保留代币、方向、关键事件和风险提示。",
+        ],
+        structure_patterns=[
+            "先说结论，再解释素材中的触发点。",
+            "最后给出关注点或风险提醒。",
+        ],
+    )
+
+
 def build_profile_graph(
     db: Database,
     analysis_agent: AnalysisAgent,
@@ -87,7 +107,7 @@ def build_content_graph(
 ):
     def prepare(state: ContentState) -> ContentState:
         account_key = state.get("account_key", "default")
-        profile = db.get_profile(account_key)
+        profile = db.get_profile(account_key) or default_style_profile(account_key)
         if not profile:
             raise ValueError(f"请先为账号 {account_key} 导入历史文章并生成写作风格档案")
         material_id = state.get("material_id")

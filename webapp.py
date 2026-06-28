@@ -13,6 +13,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .ai.llm import StructuredLLM
+from .ai.material_tagger import MaterialTagger
 from .core.config import AccountConfig, Settings
 from .core.config import add_no_proxy_host
 from .publishing.account_check import BinanceAccountChecker
@@ -31,6 +32,7 @@ monitor_state: dict[str, Any] = {
     "last_finished_at": None,
     "last_results": [],
     "last_consume_results": [],
+    "last_tag_results": [],
     "last_error": None,
     "expired_count": 0,
 }
@@ -46,10 +48,45 @@ async def run_material_monitor_once() -> dict[str, Any]:
             ttl_seconds=settings.material_ttl_seconds
         )
         results = await asyncio.to_thread(MaterialSourceService(db).check_all)
+        tag_results: list[dict[str, Any]] = []
+        tagger = MaterialTagger()
+        for material in db.pending_material_items_for_tagging(limit=100):
+            try:
+                tag = tagger.tag(
+                    title=material.get("title"),
+                    content=material["content"],
+                )
+                tag_status = "accepted" if tag.accepted else "rejected"
+                db.save_material_tag(
+                    material["id"],
+                    tag_status=tag_status,
+                    tag=tag.to_dict(),
+                )
+                tag_results.append(
+                    {
+                        "material_item_id": material["id"],
+                        "tag_status": tag_status,
+                        "tag": tag.to_dict(),
+                    }
+                )
+            except Exception as exc:
+                db.save_material_tag(
+                    material["id"],
+                    tag_status="failed",
+                    error=str(exc),
+                )
+                tag_results.append(
+                    {
+                        "material_item_id": material["id"],
+                        "tag_status": "failed",
+                        "error": str(exc),
+                    }
+                )
         consume_results: list[dict[str, Any]] = []
         if settings.auto_consume_materials:
             materials = db.list_material_items(
                 status="new",
+                tag_status="accepted",
                 limit=settings.material_consume_batch_size,
             )
             if materials:
@@ -79,6 +116,7 @@ async def run_material_monitor_once() -> dict[str, Any]:
         monitor_state.update(
             {
                 "last_results": results,
+                "last_tag_results": tag_results,
                 "last_consume_results": consume_results,
                 "last_error": None,
                 "expired_count": expired_count,
