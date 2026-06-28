@@ -9,6 +9,8 @@ const runForm = document.querySelector("#runForm");
 const settingsForm = document.querySelector("#settingsForm");
 const settingsStatus = document.querySelector("#settingsStatus");
 const llmModelOptions = document.querySelector("#llmModelOptions");
+const fetchLlmModelsButton = document.querySelector("#fetchLlmModels");
+const llmModelSelect = document.querySelector("#llmModelSelect");
 
 function show(value) {
   output.textContent =
@@ -22,6 +24,32 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function setLlmModels(models, selectedModel = "") {
+  const uniqueModels = Array.from(new Set(models.filter(Boolean)));
+  llmModelOptions.innerHTML = "";
+  llmModelSelect.innerHTML = "";
+
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = uniqueModels.length
+    ? "选择一个模型"
+    : "填好 URL 和 Key 后获取模型";
+  llmModelSelect.appendChild(placeholder);
+
+  for (const model of uniqueModels) {
+    const dataOption = document.createElement("option");
+    dataOption.value = model;
+    llmModelOptions.appendChild(dataOption);
+
+    const selectOption = document.createElement("option");
+    selectOption.value = model;
+    selectOption.textContent = model;
+    llmModelSelect.appendChild(selectOption);
+  }
+
+  llmModelSelect.value = uniqueModels.includes(selectedModel) ? selectedModel : "";
 }
 
 async function requestJson(url, options = {}) {
@@ -164,12 +192,7 @@ async function loadSettings() {
   settingsForm.elements.material_consume_batch_size.value =
     settings.material_consume_batch_size || 1;
 
-  llmModelOptions.innerHTML = "";
-  for (const model of settings.llm_model_options || []) {
-    const option = document.createElement("option");
-    option.value = model;
-    llmModelOptions.appendChild(option);
-  }
+  setLlmModels(settings.llm_model_options || [], settings.llm_model || "");
 
   settingsStatus.textContent = JSON.stringify(
     {
@@ -293,6 +316,33 @@ document.querySelector("#testEmbedding").addEventListener("click", async () => {
   });
   show(data);
   await loadSettings();
+});
+fetchLlmModelsButton.addEventListener("click", async () => {
+  try {
+    fetchLlmModelsButton.disabled = true;
+    show("正在保存配置并获取模型列表...");
+    await saveSettingsForm();
+    const data = await requestJson("/api/settings/models", { method: "POST" });
+    if (!data.ok) {
+      throw new Error(data.message || "获取模型失败");
+    }
+    const currentModel = settingsForm.elements.llm_model.value.trim();
+    setLlmModels(data.models || [], currentModel);
+    show({
+      ok: true,
+      count: (data.models || []).length,
+      models: data.models || [],
+    });
+  } catch (error) {
+    show(error.message);
+  } finally {
+    fetchLlmModelsButton.disabled = false;
+  }
+});
+llmModelSelect.addEventListener("change", () => {
+  if (llmModelSelect.value) {
+    settingsForm.elements.llm_model.value = llmModelSelect.value;
+  }
 });
 document.querySelector("#refreshItems").addEventListener("click", loadItems);
 document.querySelector("#checkSources").addEventListener("click", async () => {

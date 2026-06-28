@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+import httpx
 from pydantic import BaseModel, Field
 
 from .ai.llm import StructuredLLM
@@ -182,6 +183,40 @@ def is_masked_secret(value: str | None) -> bool:
     return "*" in value or "•" in value
 
 
+def fetch_openai_models(settings: Settings) -> list[str]:
+    missing = [
+        name
+        for name, value in (
+            ("LLM_API_KEY", settings.llm_api_key),
+            ("LLM_BASE_URL", settings.llm_base_url),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"缺少配置: {', '.join(missing)}")
+
+    url = f"{settings.llm_base_url.rstrip('/')}/models"
+    with httpx.Client(trust_env=False, timeout=20) as client:
+        response = client.get(
+            url,
+            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    data = payload.get("data", payload)
+    if not isinstance(data, list):
+        raise ValueError("模型接口返回格式不正确")
+
+    models = []
+    for item in data:
+        if isinstance(item, str):
+            models.append(item)
+        elif isinstance(item, dict) and item.get("id"):
+            models.append(str(item["id"]))
+    return sorted(dict.fromkeys(models))
+
+
 def get_settings() -> Settings:
     base = Settings.from_env()
     db = Database(base.database_path)
@@ -229,16 +264,7 @@ def read_settings() -> dict:
         "llm_api_key_masked": mask_secret(settings.llm_api_key),
         "llm_base_url": settings.llm_base_url,
         "llm_model": settings.llm_model,
-        "llm_model_options": [
-            "qwen-plus",
-            "qwen-turbo",
-            "qwen-max",
-            "qwen-long",
-            "deepseek-chat",
-            "deepseek-reasoner",
-            "gpt-4.1-mini",
-            "gpt-4o-mini",
-        ],
+        "llm_model_options": [settings.llm_model] if settings.llm_model else [],
         "dashscope_api_key_configured": bool(settings.dashscope_api_key),
         "dashscope_api_key_masked": mask_secret(settings.dashscope_api_key),
         "dashscope_embedding_model": settings.dashscope_embedding_model,
@@ -313,6 +339,16 @@ def test_llm() -> dict:
         return result.model_dump()
     except Exception as exc:
         return {"ok": False, "message": str(exc)}
+
+
+@app.post("/api/settings/models")
+def list_llm_models() -> dict:
+    settings = get_settings()
+    try:
+        models = fetch_openai_models(settings)
+        return {"ok": True, "models": models}
+    except Exception as exc:
+        return {"ok": False, "message": str(exc), "models": []}
 
 
 @app.post("/api/settings/test-embedding")

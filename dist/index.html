@@ -55,6 +55,12 @@
             <input name="llm_model" list="llmModelOptions" placeholder="选择或输入模型名" />
             <datalist id="llmModelOptions"></datalist>
           </label>
+          <div class="model-picker">
+            <button id="fetchLlmModels" type="button">获取模型</button>
+            <select id="llmModelSelect">
+              <option value="">填好 URL 和 Key 后获取模型</option>
+            </select>
+          </div>
           <label>
             <span>DashScope API Key</span>
             <input name="dashscope_api_key" placeholder="已保存时显示加密掩码；输入新 key 可覆盖" />

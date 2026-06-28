@@ -67,12 +67,14 @@ label {
 
 input,
 textarea,
+select,
 button {
   font: inherit;
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border: 1px solid #cbd5df;
   border-radius: 6px;
@@ -148,6 +150,16 @@ button:disabled {
 .mini-actions button {
   padding: 6px 9px;
   font-size: 12px;
+}
+
+.model-picker {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+}
+
+.model-picker button {
+  white-space: nowrap;
 }
 
 .account-item strong {
