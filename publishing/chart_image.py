@@ -73,23 +73,112 @@ class ChartImageService:
             )
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-            page.wait_for_timeout(8000)
+            self._dismiss_popups(page)
+            if not self._wait_for_chart_pixels(page):
+                browser.close()
+                return None
             for selector in (
                 "[data-testid='kline-chart']",
                 ".chart-widget",
                 ".tradingview-widget-container",
+                "[class*='chart']",
                 "canvas",
             ):
                 locator = page.locator(selector).first
                 try:
                     if locator.count() and locator.bounding_box():
                         png = locator.screenshot(type="png", timeout=10_000)
+                        if self._png_has_chart_content(png):
+                            browser.close()
+                            return "data:image/png;base64," + base64.b64encode(
+                                png
+                            ).decode("ascii")
+                except Exception:
+                    continue
+            try:
+                clip = self._chart_clip(page)
+                if clip:
+                    png = page.screenshot(type="png", clip=clip)
+                    if self._png_has_chart_content(png):
                         browser.close()
                         return "data:image/png;base64," + base64.b64encode(png).decode(
                             "ascii"
                         )
-                except Exception:
-                    continue
-            png = page.screenshot(type="png", full_page=False)
+            except Exception:
+                pass
             browser.close()
-            return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+            return None
+
+    @staticmethod
+    def _dismiss_popups(page) -> None:
+        for text in ("接受", "同意", "Accept", "I Understand", "我知道了"):
+            try:
+                button = page.get_by_text(text).first
+                if button.count() and button.is_visible(timeout=1000):
+                    button.click(timeout=1000)
+            except Exception:
+                continue
+
+    def _wait_for_chart_pixels(self, page) -> bool:
+        deadline = self.timeout_ms
+        step = 1000
+        waited = 0
+        while waited < deadline:
+            try:
+                if page.evaluate(
+                    """() => {
+                        const canvases = Array.from(document.querySelectorAll('canvas'));
+                        for (const canvas of canvases) {
+                            const box = canvas.getBoundingClientRect();
+                            if (box.width < 200 || box.height < 160) continue;
+                            const ctx = canvas.getContext('2d');
+                            if (!ctx) continue;
+                            const width = Math.min(canvas.width, 320);
+                            const height = Math.min(canvas.height, 220);
+                            if (width < 80 || height < 80) continue;
+                            const data = ctx.getImageData(0, 0, width, height).data;
+                            let bright = 0;
+                            let varied = 0;
+                            for (let i = 0; i < data.length; i += 16) {
+                                const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+                                if (a && (r > 35 || g > 35 || b > 35)) bright++;
+                                if (Math.abs(r - g) > 8 || Math.abs(g - b) > 8) varied++;
+                            }
+                            if (bright > 500 && varied > 100) return true;
+                        }
+                        return false;
+                    }"""
+                ):
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(step)
+            waited += step
+        return False
+
+    @staticmethod
+    def _chart_clip(page) -> dict | None:
+        return page.evaluate(
+            """() => {
+                const candidates = Array.from(document.querySelectorAll('canvas, [class*=chart], [data-testid*=chart]'));
+                let best = null;
+                for (const node of candidates) {
+                    const box = node.getBoundingClientRect();
+                    if (box.width < 300 || box.height < 220) continue;
+                    if (!best || box.width * box.height > best.width * best.height) {
+                        best = {x: box.x, y: box.y, width: box.width, height: box.height};
+                    }
+                }
+                if (!best) return null;
+                return {
+                    x: Math.max(0, best.x),
+                    y: Math.max(0, best.y),
+                    width: Math.min(window.innerWidth - Math.max(0, best.x), best.width),
+                    height: Math.min(window.innerHeight - Math.max(0, best.y), best.height)
+                };
+            }"""
+        )
+
+    @staticmethod
+    def _png_has_chart_content(png: bytes) -> bool:
+        return len(png) > 20_000
