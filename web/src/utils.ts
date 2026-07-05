@@ -51,6 +51,37 @@ export function publishErrorText(result: any) {
   return "";
 }
 
+function scoreText(review: any) {
+  const scores = review?.scores || {};
+  const parts = [
+    `事实${scores.factual_fidelity ?? "-"}`,
+    `风格${scores.style_match ?? "-"}`,
+    `原创${scores.originality ?? "-"}`,
+    `表达${scores.expression_quality ?? "-"}`,
+  ];
+  return parts.join("/");
+}
+
+function formatReviewFailure(run: any) {
+  const failed = (run.generated_details || []).filter((item: any) => item.status === "failed");
+  if (!failed.length) return [];
+  const lines: string[] = [];
+  for (const item of failed) {
+    const review = item.review || {};
+    lines.push(
+      `    审核未通过：候选#${item.id}，重写${item.rewrite_count ?? 0}次，评分 ${scoreText(review)}`,
+    );
+    if (item.content_preview) lines.push(`    候选摘要：${item.content_preview}`);
+    for (const issue of review.issues || []) {
+      lines.push(`    - 问题：${issue}`);
+    }
+    for (const instruction of review.rewrite_instructions || []) {
+      lines.push(`    - 修改建议：${instruction}`);
+    }
+  }
+  return lines;
+}
+
 export function formatMonitorLogs(status?: MonitorStatus | null) {
   if (!status) return "监控状态加载中...";
   const lines: string[] = [];
@@ -103,12 +134,20 @@ export function formatMonitorLogs(status?: MonitorStatus | null) {
     for (const item of status.last_consume_results) {
       lines.push(`- material#${item.material_item_id}: ${item.title || "-"}`);
       for (const run of item.runs || []) {
-        const result = run.error
-          ? `失败：${run.error}`
-          : `终稿#${run.approved_generated_id || "-"}，发布：${
-              run.publish_success ? "成功" : `失败 ${publishErrorText(run.publish_result)}`
-            }`;
+        let result = "";
+        if (run.error) {
+          result = `运行失败：${run.error}`;
+        } else if (!run.approved_generated_id) {
+          result = "审核失败：未生成通过审核的终稿";
+        } else if (run.publish_success === true) {
+          result = `终稿#${run.approved_generated_id}，发布：成功`;
+        } else if (run.publish_success === false) {
+          result = `终稿#${run.approved_generated_id}，发布失败：${publishErrorText(run.publish_result) || "未知错误"}`;
+        } else {
+          result = `终稿#${run.approved_generated_id}，未发布`;
+        }
         lines.push(`  · 账号 ${run.account_key}: ${result}`);
+        lines.push(...formatReviewFailure(run));
       }
     }
   } else {

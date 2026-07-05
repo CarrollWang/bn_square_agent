@@ -33,6 +33,24 @@ export const api = {
     requestJson<any>(`/api/accounts/${encodeURIComponent(accountKey)}/check`, {
       method: "POST",
     }),
+  startCookieImport: (payload: { account_key: string; name?: string }) =>
+    requestJson<{ ok: boolean; session_id: string; message: string }>("/api/accounts/import-cookie/start", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  finishCookieImport: (sessionId: string) =>
+    requestJson<{ ok: boolean; account_key: string; cookie_length: number; cookie_names: string[] }>(
+      "/api/accounts/import-cookie/finish",
+      {
+        method: "POST",
+        body: JSON.stringify({ session_id: sessionId }),
+      },
+    ),
+  cancelCookieImport: (sessionId: string) =>
+    requestJson<{ ok: boolean }>("/api/accounts/import-cookie/cancel", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId }),
+    }),
   settings: () => requestJson<Settings>("/api/settings"),
   saveSettings: (payload: Record<string, unknown>) =>
     requestJson<{ ok: boolean; saved: string[] }>("/api/settings", {

@@ -1,4 +1,5 @@
 chromadb
+dashscope
 fastapi
 httpx
 langchain-community

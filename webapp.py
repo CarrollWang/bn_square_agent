@@ -4,9 +4,11 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.message import EmailMessage
+import json
 from pathlib import Path
 import smtplib
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -46,6 +48,8 @@ monitor_state: dict[str, Any] = {
     "last_alert_error": None,
     "last_alert_sent": False,
 }
+
+cookie_login_sessions: dict[str, dict[str, Any]] = {}
 
 
 def _consume_results_have_failure(consume_results: list[dict[str, Any]]) -> bool:
@@ -180,6 +184,42 @@ def _paused_monitor_delay(settings: Settings) -> int:
     return max(10, min(settings.material_poll_interval_seconds, 60))
 
 
+def _generated_detail(db: Database, generated_id: int) -> dict[str, Any]:
+    row = db.get_generated(generated_id)
+    review = None
+    if row.get("review_json"):
+        try:
+            review = json.loads(row["review_json"])
+        except ValueError:
+            review = {"raw": row["review_json"]}
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "candidate_index": row["candidate_index"],
+        "rewrite_count": row["rewrite_count"],
+        "content_preview": (row.get("content") or "")[:240],
+        "review": review,
+    }
+
+
+def _run_payload(db: Database, run: Any) -> dict[str, Any]:
+    details = []
+    for generated_id in run.generated_ids:
+        try:
+            details.append(_generated_detail(db, generated_id))
+        except Exception as exc:
+            details.append({"id": generated_id, "error": str(exc)})
+    return {
+        "account_key": run.account_key,
+        "generated_ids": run.generated_ids,
+        "approved_generated_id": run.approved_generated_id,
+        "generated_details": details,
+        "error": run.error,
+        "publish_success": run.publish_result.success if run.publish_result else None,
+        "publish_result": run.publish_result.result if run.publish_result else None,
+    }
+
+
 async def run_material_monitor_once() -> dict[str, Any]:
     settings = get_settings()
     db = get_db()
@@ -266,20 +306,7 @@ async def run_material_monitor_once() -> dict[str, Any]:
                         {
                             "material_item_id": material["id"],
                             "title": material.get("title"),
-                            "runs": [
-                                {
-                                    "account_key": run.account_key,
-                                    "approved_generated_id": run.approved_generated_id,
-                                    "error": run.error,
-                                    "publish_success": run.publish_result.success
-                                    if run.publish_result
-                                    else None,
-                                    "publish_result": run.publish_result.result
-                                    if run.publish_result
-                                    else None,
-                                }
-                                for run in runs
-                            ],
+                            "runs": [_run_payload(db, run) for run in runs],
                         }
                     )
                     monitor_state["last_consume_results"] = consume_results
@@ -351,12 +378,23 @@ async def lifespan(app_: FastAPI):
 
 app = FastAPI(title="BN Square Agent", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=DIST_DIR), name="static")
+app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
 
 
 class AccountPayload(BaseModel):
     account_key: str = Field(min_length=1)
     name: str | None = None
     cookie: str = Field(min_length=1)
+
+
+class AccountCookieImportStartPayload(BaseModel):
+    account_key: str = Field(min_length=1)
+    name: str | None = None
+    login_url: str | None = None
+
+
+class AccountCookieImportFinishPayload(BaseModel):
+    session_id: str = Field(min_length=1)
 
 
 class RunPayload(BaseModel):
@@ -654,6 +692,122 @@ def save_account(payload: AccountPayload) -> dict:
     return {"ok": True}
 
 
+def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str:
+    filtered = []
+    for cookie in cookies:
+        domain = (cookie.get("domain") or "").lstrip(".")
+        if not domain.endswith("binance.com"):
+            continue
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+        filtered.append((str(name), str(value)))
+    filtered.sort(key=lambda item: item[0].lower())
+    return "; ".join(f"{name}={value}" for name, value in filtered)
+
+
+@app.post("/api/accounts/import-cookie/start")
+def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
+    key = payload.account_key.strip()
+    name = (payload.name or key).strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="账号标识必填")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Playwright 不可用: {exc}") from exc
+
+    session_id = uuid4().hex
+    login_url = payload.login_url or "https://www.binance.com/zh-CN/login"
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=False)
+        context = browser.new_context(locale="zh-CN")
+        page = context.new_page()
+        page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
+    except Exception as exc:
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"打开登录窗口失败: {exc}") from exc
+
+    cookie_login_sessions[session_id] = {
+        "account_key": key,
+        "name": name,
+        "playwright": playwright,
+        "browser": browser,
+        "context": context,
+        "page": page,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "message": "登录窗口已打开。请在窗口中完成 Binance 登录后，回到本页点击完成导入。",
+    }
+
+
+@app.post("/api/accounts/import-cookie/finish")
+def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
+    session = cookie_login_sessions.pop(payload.session_id, None)
+    if not session:
+        raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
+
+    browser = session["browser"]
+    context = session["context"]
+    playwright = session["playwright"]
+    try:
+        cookies = context.cookies(["https://www.binance.com", "https://accounts.binance.com"])
+        cookie_header = _cookie_header_from_playwright_cookies(cookies)
+        if not cookie_header:
+            raise HTTPException(
+                status_code=400,
+                detail="未读取到 Binance Cookie。请确认已在弹出的窗口里完成登录。",
+            )
+        get_db().upsert_account(
+            account_key=session["account_key"],
+            name=session["name"],
+            cookie=cookie_header,
+        )
+        return {
+            "ok": True,
+            "account_key": session["account_key"],
+            "cookie_length": len(cookie_header),
+            "cookie_names": [
+                item["name"]
+                for item in BinanceAccountChecker._parse_cookie_header(cookie_header)
+            ],
+        }
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+
+
+@app.post("/api/accounts/import-cookie/cancel")
+def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
+    session = cookie_login_sessions.pop(payload.session_id, None)
+    if not session:
+        return {"ok": True}
+    try:
+        session["browser"].close()
+    except Exception:
+        pass
+    try:
+        session["playwright"].stop()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
 @app.delete("/api/accounts/{account_key}")
 def delete_account(account_key: str) -> dict:
     get_db().disable_account(account_key)
@@ -727,21 +881,7 @@ def run(payload: RunPayload) -> dict:
         url=payload.url,
     )
     return {
-        "runs": [
-            {
-                "account_key": run.account_key,
-                "generated_ids": run.generated_ids,
-                "approved_generated_id": run.approved_generated_id,
-                "error": run.error,
-                "publish_result": {
-                    "success": run.publish_result.success,
-                    "result": run.publish_result.result,
-                }
-                if run.publish_result
-                else None,
-            }
-            for run in runs
-        ]
+        "runs": [_run_payload(services.db, run) for run in runs]
     }
 
 
@@ -844,19 +984,5 @@ def run_material_item(payload: RunMaterialPayload) -> dict:
     services.operator.auto_publish = payload.auto_publish
     runs = services.operator.run_material_item_for_all_accounts(payload.material_item_id)
     return {
-        "runs": [
-            {
-                "account_key": run.account_key,
-                "generated_ids": run.generated_ids,
-                "approved_generated_id": run.approved_generated_id,
-                "error": run.error,
-                "publish_result": {
-                    "success": run.publish_result.success,
-                    "result": run.publish_result.result,
-                }
-                if run.publish_result
-                else None,
-            }
-            for run in runs
-        ]
+        "runs": [_run_payload(services.db, run) for run in runs]
     }

@@ -29,6 +29,11 @@ class StructuredLLM:
     @staticmethod
     def _extract_json(text: str) -> str:
         text = text.strip()
+        if text.lower().startswith("<!doctype html") or text.lower().startswith("<html"):
+            raise ValueError(
+                "LLM 接口返回了 HTML 页面，请检查 LLM_BASE_URL 是否为 OpenAI 兼容 API 根路径，"
+                "例如 https://example.com/v1，而不是网页首页。"
+            )
         fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
         if fenced:
             return fenced.group(1).strip()
@@ -41,6 +46,58 @@ class StructuredLLM:
         closing = "}" if text[start] == "{" else "]"
         end = text.rfind(closing)
         return text[start : end + 1] if end >= start else text[start:]
+
+    @staticmethod
+    def _message_content(message: object) -> str:
+        if message is None:
+            return ""
+        if isinstance(message, str):
+            return message
+        if isinstance(message, dict):
+            content = message.get("content", "")
+        else:
+            content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content") or ""
+                    if isinstance(text, str):
+                        parts.append(text)
+                    elif isinstance(text, dict) and isinstance(text.get("value"), str):
+                        parts.append(text["value"])
+            return "\n".join(parts)
+        return str(content or "")
+
+    @classmethod
+    def _response_text(cls, response: object) -> str:
+        if isinstance(response, str):
+            return response
+        if isinstance(response, dict):
+            choices = response.get("choices") or []
+            if choices:
+                first = choices[0]
+                if isinstance(first, dict):
+                    return cls._message_content(first.get("message") or first.get("delta"))
+                return cls._message_content(getattr(first, "message", None))
+            output_text = response.get("output_text")
+            if isinstance(output_text, str):
+                return output_text
+            return json.dumps(response, ensure_ascii=False)
+
+        choices = getattr(response, "choices", None)
+        if choices:
+            first = choices[0]
+            return cls._message_content(getattr(first, "message", None))
+
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str):
+            return output_text
+        return str(response or "")
 
     def invoke(
         self,
@@ -71,7 +128,7 @@ class StructuredLLM:
                 messages=messages,
                 temperature=0.2,
             )
-            text = response.choices[0].message.content or ""
+            text = self._response_text(response)
             try:
                 return response_model.model_validate_json(self._extract_json(text))
             except (ValidationError, ValueError) as exc:

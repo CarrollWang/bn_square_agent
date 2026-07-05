@@ -22,6 +22,11 @@
       </el-form-item>
       <el-form-item class="wide">
         <el-button type="primary" :loading="saving" @click="saveAccount">保存账号</el-button>
+        <el-button :loading="importing" @click="startCookieImport">打开登录窗口导入 Cookie</el-button>
+        <el-button v-if="cookieImportSessionId" type="success" :loading="finishingImport" @click="finishCookieImport">
+          完成导入
+        </el-button>
+        <el-button v-if="cookieImportSessionId" plain @click="cancelCookieImport">取消导入</el-button>
       </el-form-item>
     </el-form>
 
@@ -67,6 +72,9 @@ import { formatTime } from "@/utils";
 
 const accounts = ref<Account[]>([]);
 const saving = ref(false);
+const importing = ref(false);
+const finishingImport = ref(false);
+const cookieImportSessionId = ref("");
 const form = reactive({
   account_key: "",
   name: "",
@@ -93,6 +101,48 @@ async function saveAccount() {
   } finally {
     saving.value = false;
   }
+}
+
+async function startCookieImport() {
+  const accountKey = form.account_key.trim();
+  if (!accountKey) {
+    ElMessage.warning("请先填写账号标识");
+    return;
+  }
+  importing.value = true;
+  try {
+    const result = await api.startCookieImport({
+      account_key: accountKey,
+      name: form.name.trim(),
+    });
+    cookieImportSessionId.value = result.session_id;
+    ElMessage.success(result.message);
+  } finally {
+    importing.value = false;
+  }
+}
+
+async function finishCookieImport() {
+  if (!cookieImportSessionId.value) return;
+  finishingImport.value = true;
+  try {
+    const result = await api.finishCookieImport(cookieImportSessionId.value);
+    cookieImportSessionId.value = "";
+    form.account_key = "";
+    form.name = "";
+    form.cookie = "";
+    await loadAccounts();
+    ElMessage.success(`Cookie 已导入：${result.cookie_length} 字符`);
+  } finally {
+    finishingImport.value = false;
+  }
+}
+
+async function cancelCookieImport() {
+  if (!cookieImportSessionId.value) return;
+  await api.cancelCookieImport(cookieImportSessionId.value);
+  cookieImportSessionId.value = "";
+  ElMessage.success("已取消导入");
 }
 
 async function checkAccount(accountKey: string) {
