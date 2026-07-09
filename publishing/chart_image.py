@@ -5,6 +5,8 @@ import base64
 import re
 from typing import Literal
 
+from ..core.config import playwright_proxy_settings
+
 
 MarketKind = Literal["future", "spot"]
 
@@ -53,20 +55,26 @@ class ChartImageService:
         base = target.symbol.removesuffix("USDT")
         return f"https://www.binance.com/zh-CN/trade/{base}_USDT"
 
-    def image_for_text(self, text: str) -> str | None:
+    def image_for_text(self, text: str, *, proxy_url: str = "") -> str | None:
         target = self.extract_target(text)
         if not target:
             return None
-        return self.capture_chart(target)
+        return self.capture_chart(target, proxy_url=proxy_url)
 
-    def capture_chart(self, target: ChartTarget) -> str | None:
+    def capture_chart(self, target: ChartTarget, *, proxy_url: str = "") -> str | None:
         from playwright.sync_api import sync_playwright
 
         url = self.chart_url(target)
         with sync_playwright() as p:
+            launch_args = {
+                "headless": True,
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+            proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
+            if proxy:
+                launch_args["proxy"] = proxy
             browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
+                **launch_args,
             )
             context = browser.new_context(
                 viewport={"width": 1280, "height": 720},

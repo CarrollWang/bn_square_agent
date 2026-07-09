@@ -4,7 +4,7 @@
       <div class="toolbar">
         <div class="toolbar-title">
           <strong>系统设置</strong>
-          <span>大模型、邮件预警、自动运行参数</span>
+          <span>大模型、发布、邮件预警、自动运行参数</span>
         </div>
         <el-space wrap>
           <el-button v-if="activeTab === 'llm'" plain :loading="testingLlm" @click="testLlm">测试 LLM</el-button>
@@ -79,6 +79,16 @@
 
       <el-tab-pane label="自动运行设置" name="runtime">
         <el-form :model="form" label-width="170px" class="settings-form">
+          <el-form-item label="默认 MCP 地址" class="wide">
+            <el-input v-model="form.mcp_url" placeholder="https://your-mcp.example.com/mcp" />
+          </el-form-item>
+          <el-form-item label="默认发布工具">
+            <el-input v-model="form.mcp_publish_tool" placeholder="publish_binance_square" />
+          </el-form-item>
+          <el-form-item label="默认 MCP Token" class="wide">
+            <el-input v-model="form.mcp_auth_token" placeholder="已保存时显示加密掩码；输入新 token 可覆盖" />
+            <div class="muted">当前：{{ settings?.mcp_auth_token_masked || "未保存" }}</div>
+          </el-form-item>
           <el-form-item label="自动循环">
             <el-switch v-model="form.auto_monitor_enabled" />
           </el-form-item>
@@ -139,6 +149,9 @@ const form = reactive<Record<string, any>>({
   llm_model: "",
   dashscope_api_key: "",
   dashscope_embedding_model: "text-embedding-v3",
+  mcp_url: "",
+  mcp_publish_tool: "publish_binance_square",
+  mcp_auth_token: "",
   auto_monitor_enabled: true,
   auto_publish: true,
   auto_consume_materials: true,
@@ -169,6 +182,9 @@ function applySettings(data: Settings) {
   form.llm_model = data.llm_model || "";
   form.dashscope_api_key = data.dashscope_api_key_masked || "";
   form.dashscope_embedding_model = data.dashscope_embedding_model || "text-embedding-v3";
+  form.mcp_url = data.mcp_url || "";
+  form.mcp_publish_tool = data.mcp_publish_tool || "publish_binance_square";
+  form.mcp_auth_token = data.mcp_auth_token_masked || "";
   form.auto_monitor_enabled = Boolean(data.auto_monitor_enabled);
   form.auto_publish = Boolean(data.auto_publish);
   form.auto_consume_materials = Boolean(data.auto_consume_materials);
@@ -201,6 +217,10 @@ function payload() {
     dashscope_api_key:
       form.dashscope_api_key && !isMasked(form.dashscope_api_key) ? form.dashscope_api_key : null,
     dashscope_embedding_model: form.dashscope_embedding_model,
+    mcp_url: form.mcp_url,
+    mcp_publish_tool: form.mcp_publish_tool,
+    mcp_auth_token:
+      form.mcp_auth_token && !isMasked(form.mcp_auth_token) ? form.mcp_auth_token : null,
     auto_monitor_enabled: form.auto_monitor_enabled,
     auto_publish: form.auto_publish,
     auto_consume_materials: form.auto_consume_materials,

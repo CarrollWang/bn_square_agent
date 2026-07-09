@@ -16,8 +16,13 @@ from pydantic import BaseModel, Field
 
 from .ai.llm import StructuredLLM
 from .ai.material_tagger import MaterialTagger
-from .core.config import AccountConfig, Settings
-from .core.config import add_no_proxy_host
+from .core.config import (
+    AccountConfig,
+    Settings,
+    add_no_proxy_host,
+    mask_url_credentials,
+    normalize_proxy_url,
+)
 from .publishing.account_check import BinanceAccountChecker
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
@@ -356,7 +361,10 @@ app.mount("/static", StaticFiles(directory=DIST_DIR), name="static")
 class AccountPayload(BaseModel):
     account_key: str = Field(min_length=1)
     name: str | None = None
-    cookie: str = Field(min_length=1)
+    cookie: str | None = None
+    proxy_url: str | None = None
+    mcp_url: str | None = None
+    mcp_auth_token: str | None = None
 
 
 class RunPayload(BaseModel):
@@ -374,6 +382,7 @@ class SettingsPayload(BaseModel):
     dashscope_embedding_model: str | None = None
     mcp_url: str | None = None
     mcp_publish_tool: str | None = None
+    mcp_auth_token: str | None = None
     auto_publish: bool | None = None
     auto_monitor_enabled: bool | None = None
     auto_consume_materials: bool | None = None
@@ -460,12 +469,23 @@ def fetch_openai_models(settings: Settings) -> list[str]:
 
 def get_settings() -> Settings:
     base = Settings.from_env()
-    db = Database(base.database_path)
+    db = base.build_database()
     return base.with_overrides(db.get_app_settings())
 
 
 def get_db() -> Database:
-    return Database(Settings.from_env().database_path)
+    return Settings.from_env().build_database()
+
+
+def _account_from_row(row: dict[str, Any]) -> AccountConfig:
+    return AccountConfig(
+        key=row["account_key"],
+        name=row["name"],
+        cookie=row.get("cookie") or "",
+        proxy_url=row.get("proxy_url") or "",
+        mcp_url=row.get("mcp_url") or "",
+        mcp_auth_token=row.get("mcp_auth_token") or "",
+    )
 
 
 @app.get("/")
@@ -490,10 +510,36 @@ def list_accounts() -> list[dict]:
             "check_status": row.get("check_status"),
             "checked_at": row.get("checked_at"),
             "check_error": row.get("check_error"),
+            "proxy_configured": bool(row.get("proxy_url")),
+            "proxy_url_masked": mask_url_credentials(row.get("proxy_url") or ""),
+            "mcp_url": row.get("mcp_url") or "",
+            "mcp_auth_token_configured": bool(row.get("mcp_auth_token")),
             "created_at": row["created_at"],
         }
         for row in rows
     ]
+
+
+@app.get("/api/accounts/{account_key}")
+def read_account(account_key: str) -> dict:
+    account = next(
+        (
+            row
+            for row in get_db().list_accounts(include_disabled=True)
+            if row["account_key"] == account_key
+        ),
+        None,
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return {
+        "account_key": account["account_key"],
+        "name": account["name"],
+        "cookie_saved": bool(account.get("cookie")),
+        "proxy_url": account.get("proxy_url") or "",
+        "mcp_url": account.get("mcp_url") or "",
+        "mcp_auth_token_configured": bool(account.get("mcp_auth_token")),
+    }
 
 
 @app.get("/api/settings")
@@ -510,6 +556,8 @@ def read_settings() -> dict:
         "dashscope_embedding_model": settings.dashscope_embedding_model,
         "mcp_url": settings.mcp_url,
         "mcp_publish_tool": settings.mcp_publish_tool,
+        "mcp_auth_token_configured": bool(settings.mcp_auth_token),
+        "mcp_auth_token_masked": mask_secret(settings.mcp_auth_token),
         "auto_monitor_enabled": settings.auto_monitor_enabled,
         "auto_publish": settings.auto_publish,
         "auto_consume_materials": settings.auto_consume_materials,
@@ -548,6 +596,7 @@ def save_settings(payload: SettingsPayload) -> dict:
     secret_fields = {
         "llm_api_key": "LLM_API_KEY",
         "dashscope_api_key": "DASHSCOPE_API_KEY",
+        "mcp_auth_token": "MCP_AUTH_TOKEN",
         "smtp_password": "SMTP_PASSWORD",
     }
     bool_fields = {
@@ -641,15 +690,40 @@ def test_embedding() -> dict:
 
 @app.post("/api/accounts")
 def save_account(payload: AccountPayload) -> dict:
+    db = get_db()
     key = payload.account_key.strip()
-    name = (payload.name or key).strip()
-    cookie = payload.cookie.strip()
-    if not key or not cookie:
-        raise HTTPException(status_code=400, detail="账号标识和 Cookie 必填")
-    get_db().upsert_account(
+    existing = next(
+        (row for row in db.list_accounts(include_disabled=True) if row["account_key"] == key),
+        None,
+    )
+    raw_name = payload.name if payload.name is not None else (
+        existing.get("name") if existing else key
+    )
+    name = raw_name.strip() if raw_name else key
+    cookie = payload.cookie.strip() if payload.cookie is not None else None
+    proxy_url = payload.proxy_url if payload.proxy_url is not None else None
+    mcp_url = payload.mcp_url.strip() if payload.mcp_url is not None else None
+    mcp_auth_token = (
+        payload.mcp_auth_token.strip()
+        if payload.mcp_auth_token is not None
+        else None
+    )
+    try:
+        if proxy_url is not None:
+            proxy_url = normalize_proxy_url(proxy_url) if proxy_url.strip() else ""
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not key:
+        raise HTTPException(status_code=400, detail="账号标识必填")
+    if existing is None and not cookie:
+        raise HTTPException(status_code=400, detail="新账号必须提供 Cookie")
+    db.upsert_account(
         account_key=key,
         name=name,
         cookie=cookie,
+        proxy_url=proxy_url,
+        mcp_url=mcp_url,
+        mcp_auth_token=mcp_auth_token,
     )
     return {"ok": True}
 
@@ -671,7 +745,10 @@ def check_account(account_key: str) -> dict:
         raise HTTPException(status_code=404, detail="账号不存在")
     if not account["cookie"]:
         raise HTTPException(status_code=400, detail="账号缺少 Cookie")
-    result = BinanceAccountChecker().check(account["cookie"])
+    result = BinanceAccountChecker().check(
+        account["cookie"],
+        proxy_url=account.get("proxy_url") or "",
+    )
     status = "valid" if result.valid else "invalid"
     db.update_account_check(
         account_key,
@@ -688,11 +765,27 @@ def check_account(account_key: str) -> dict:
 @app.get("/api/mcp/tools")
 def mcp_tools() -> dict:
     settings = get_settings()
-    client = RemoteMCPClient(settings.mcp_url, auth_token=settings.mcp_auth_token)
+    selected_account: dict[str, Any] | None = None
+    mcp_url = settings.mcp_url
+    mcp_auth_token = settings.mcp_auth_token
+    if not mcp_url:
+        for row in get_db().list_accounts():
+            if row.get("mcp_url"):
+                selected_account = row
+                mcp_url = row["mcp_url"]
+                mcp_auth_token = row.get("mcp_auth_token") or settings.mcp_auth_token
+                break
+    if not mcp_url:
+        raise HTTPException(
+            status_code=400,
+            detail="未配置全局 MCP_URL，也没有账号配置独立 MCP 地址",
+        )
+    client = RemoteMCPClient(mcp_url, auth_token=mcp_auth_token)
     client.initialize()
     tools = client.list_tools()
     return {
-        "mcp_url": settings.mcp_url,
+        "mcp_url": mcp_url,
+        "account_key": selected_account["account_key"] if selected_account else None,
         "tools": [
             {
                 "name": tool.name,
@@ -709,14 +802,7 @@ def mcp_tools() -> dict:
 @app.post("/api/run")
 def run(payload: RunPayload) -> dict:
     services = build_services()
-    accounts = [
-        AccountConfig(
-            key=row["account_key"],
-            name=row["name"],
-            cookie=row["cookie"],
-        )
-        for row in services.db.list_accounts()
-    ]
+    accounts = [_account_from_row(row) for row in services.db.list_accounts()]
     if not accounts:
         raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
     services.operator.accounts = tuple(accounts)
@@ -830,14 +916,7 @@ def set_material_monitor_enabled(payload: MonitorEnabledPayload) -> dict:
 @app.post("/api/material-items/run")
 def run_material_item(payload: RunMaterialPayload) -> dict:
     services = build_services()
-    accounts = [
-        AccountConfig(
-            key=row["account_key"],
-            name=row["name"],
-            cookie=row["cookie"],
-        )
-        for row in services.db.list_accounts()
-    ]
+    accounts = [_account_from_row(row) for row in services.db.list_accounts()]
     if not accounts:
         raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
     services.operator.accounts = tuple(accounts)

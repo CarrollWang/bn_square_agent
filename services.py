@@ -18,6 +18,9 @@ def _load_accounts_from_db(db: Database) -> tuple[AccountConfig, ...]:
             key=row["account_key"],
             name=row["name"],
             cookie=row["cookie"],
+            proxy_url=row.get("proxy_url") or "",
+            mcp_url=row.get("mcp_url") or "",
+            mcp_auth_token=row.get("mcp_auth_token") or "",
         )
         for row in db.list_accounts()
     )
@@ -36,14 +39,17 @@ class Services:
 
 def build_services(settings: Settings | None = None) -> Services:
     settings = settings or Settings.from_env()
-    db = Database(settings.database_path)
+    db = settings.build_database()
     settings = settings.with_overrides(db.get_app_settings())
     llm = StructuredLLM(settings)
     for account in settings.accounts:
         db.upsert_account(
             account_key=account.key,
             name=account.name,
-            cookie=account.cookie,
+            cookie=account.cookie or None,
+            proxy_url=account.proxy_url or None,
+            mcp_url=account.mcp_url or None,
+            mcp_auth_token=account.mcp_auth_token or None,
         )
     accounts = _load_accounts_from_db(db)
     rag = StyleRAG(settings)

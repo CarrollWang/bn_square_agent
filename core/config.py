@@ -5,7 +5,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import os
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -21,6 +21,49 @@ def add_no_proxy_host(host: str) -> None:
     value = ",".join(hosts)
     os.environ["NO_PROXY"] = value
     os.environ["no_proxy"] = value
+
+
+def normalize_proxy_url(value: str) -> str:
+    proxy = value.strip()
+    if not proxy:
+        return ""
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+    parts = urlsplit(proxy)
+    if not parts.scheme or not parts.netloc or not parts.hostname:
+        raise ValueError("代理地址格式不正确，请使用 http://host:port 这类格式")
+    return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+def mask_url_credentials(value: str) -> str:
+    url = value.strip()
+    if not url or "://" not in url:
+        return url
+    parts = urlsplit(url)
+    if not parts.username and not parts.password:
+        return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, f"****@{host}", "", "", ""))
+
+
+def playwright_proxy_settings(proxy_url: str) -> dict[str, str] | None:
+    proxy = normalize_proxy_url(proxy_url)
+    if not proxy:
+        return None
+    parts = urlsplit(proxy)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    settings = {
+        "server": urlunsplit((parts.scheme, host, "", "", "")),
+    }
+    if parts.username:
+        settings["username"] = unquote(parts.username)
+    if parts.password:
+        settings["password"] = unquote(parts.password)
+    return settings
 
 
 def normalize_openai_base_url(value: str) -> str:
@@ -44,6 +87,9 @@ class AccountConfig:
     key: str
     name: str
     cookie: str
+    proxy_url: str = ""
+    mcp_url: str = ""
+    mcp_auth_token: str = ""
 
 
 def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
@@ -80,6 +126,13 @@ def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
                 key=key,
                 name=str(item.get("name") or key),
                 cookie=str(item.get("cookie") or "").strip(),
+                proxy_url=normalize_proxy_url(
+                    str(item.get("proxy_url") or item.get("proxy") or "")
+                )
+                if item.get("proxy_url") or item.get("proxy")
+                else "",
+                mcp_url=str(item.get("mcp_url") or "").strip(),
+                mcp_auth_token=str(item.get("mcp_auth_token") or "").strip(),
             )
         )
     return tuple(accounts)
@@ -92,6 +145,8 @@ class Settings:
     llm_model: str
     dashscope_api_key: str
     dashscope_embedding_model: str
+    app_secret_key: str
+    secret_key_path: Path
     database_path: Path
     chroma_path: Path
     publish_mode: str
@@ -129,13 +184,17 @@ class Settings:
             dashscope_embedding_model=os.getenv(
                 "DASHSCOPE_EMBEDDING_MODEL", "text-embedding-v3"
             ),
+            app_secret_key=os.getenv("APP_SECRET_KEY", "").strip(),
+            secret_key_path=_resolve_project_path(
+                os.getenv("SECRET_KEY_PATH", "./data/app_secret.key")
+            ),
             database_path=_resolve_project_path(
                 os.getenv("DATABASE_PATH", "./data/bn_square.db")
             ),
             chroma_path=_resolve_project_path(os.getenv("CHROMA_PATH", "./chroma_db")),
             publish_mode=publish_mode,
             accounts=_load_accounts(os.getenv("AGENT_ACCOUNTS", "")),
-            mcp_url=os.getenv("MCP_URL", "https://qianxin.xyz/mcp").strip(),
+            mcp_url=os.getenv("MCP_URL", "").strip(),
             mcp_publish_tool=os.getenv("MCP_PUBLISH_TOOL", "").strip(),
             mcp_auth_token=os.getenv("MCP_AUTH_TOKEN", "").strip(),
             auto_monitor_enabled=os.getenv("AUTO_MONITOR_ENABLED", "1")
@@ -197,8 +256,6 @@ class Settings:
             raise ValueError("缺少配置: DASHSCOPE_API_KEY")
 
     def validate_for_publish(self) -> None:
-        if not self.mcp_url:
-            raise ValueError("缺少配置: MCP_URL")
         missing = [account.key for account in self.accounts if not account.cookie]
         if missing:
             raise ValueError(f"以下账号缺少 cookie: {', '.join(missing)}")
@@ -279,6 +336,15 @@ class Settings:
             smtp_password=text("SMTP_PASSWORD", self.smtp_password),
             smtp_from=text("SMTP_FROM", self.smtp_from),
             smtp_use_tls=boolean("SMTP_USE_TLS", self.smtp_use_tls),
+        )
+
+    def build_database(self):
+        from ..storage.database import Database
+        from .secret_store import SecretStore
+
+        return Database(
+            self.database_path,
+            secret_store=SecretStore.from_settings(self),
         )
 
 

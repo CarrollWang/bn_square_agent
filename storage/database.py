@@ -8,7 +8,16 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
 
+from ..core.secret_store import SecretStore
 from ..models.schemas import ContentReview, PostAnalysis, StyleProfile
+
+
+ACCOUNT_SECRET_COLUMNS = frozenset(
+    {"cookie", "proxy_url", "mcp_auth_token", "signature_key"}
+)
+SECRET_APP_SETTING_KEYS = frozenset(
+    {"LLM_API_KEY", "DASHSCOPE_API_KEY", "MCP_AUTH_TOKEN", "SMTP_PASSWORD"}
+)
 
 
 def utc_now() -> str:
@@ -16,8 +25,9 @@ def utc_now() -> str:
 
 
 class Database:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, *, secret_store: SecretStore):
         self.path = Path(path)
+        self.secret_store = secret_store
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init_schema()
 
@@ -120,6 +130,9 @@ class Database:
                 account_key TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 cookie TEXT NOT NULL DEFAULT '',
+                proxy_url TEXT NOT NULL DEFAULT '',
+                mcp_url TEXT NOT NULL DEFAULT '',
+                mcp_auth_token TEXT NOT NULL DEFAULT '',
                 signature_key TEXT,
                 check_status TEXT NOT NULL DEFAULT 'unchecked',
                 checked_at TEXT,
@@ -185,6 +198,18 @@ class Database:
             connection.execute(
                 "ALTER TABLE accounts ADD COLUMN cookie TEXT NOT NULL DEFAULT ''"
             )
+        if "proxy_url" not in account_columns:
+            connection.execute(
+                "ALTER TABLE accounts ADD COLUMN proxy_url TEXT NOT NULL DEFAULT ''"
+            )
+        if "mcp_url" not in account_columns:
+            connection.execute(
+                "ALTER TABLE accounts ADD COLUMN mcp_url TEXT NOT NULL DEFAULT ''"
+            )
+        if "mcp_auth_token" not in account_columns:
+            connection.execute(
+                "ALTER TABLE accounts ADD COLUMN mcp_auth_token TEXT NOT NULL DEFAULT ''"
+            )
         if "signature_key" not in account_columns:
             connection.execute("ALTER TABLE accounts ADD COLUMN signature_key TEXT")
         if "check_status" not in account_columns:
@@ -208,6 +233,63 @@ class Database:
             connection.execute("ALTER TABLE material_items ADD COLUMN tag_error TEXT")
         if "tagged_at" not in material_columns:
             connection.execute("ALTER TABLE material_items ADD COLUMN tagged_at TEXT")
+        self._migrate_secret_storage(connection)
+
+    def _migrate_secret_storage(self, connection: sqlite3.Connection) -> None:
+        for column in ACCOUNT_SECRET_COLUMNS:
+            rows = connection.execute(
+                f"SELECT account_key, {column} FROM accounts"
+            ).fetchall()
+            for row in rows:
+                current = row[column]
+                if current is None:
+                    continue
+                value = str(current)
+                if not value or self.secret_store.is_encrypted(value):
+                    continue
+                connection.execute(
+                    f"UPDATE accounts SET {column} = ? WHERE account_key = ?",
+                    (self.secret_store.encrypt(value), row["account_key"]),
+                )
+
+        rows = connection.execute("SELECT key, value FROM app_settings").fetchall()
+        for row in rows:
+            key = str(row["key"])
+            value = str(row["value"])
+            if (
+                key not in SECRET_APP_SETTING_KEYS
+                or not value
+                or self.secret_store.is_encrypted(value)
+            ):
+                continue
+            connection.execute(
+                """
+                UPDATE app_settings
+                SET value = ?, updated_at = ?
+                WHERE key = ?
+                """,
+                (self.secret_store.encrypt(value), utc_now(), key),
+            )
+
+    def _encrypt_secret(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return self.secret_store.encrypt(value)
+
+    def _decrypt_secret(self, value: Any, *, label: str) -> str | None:
+        if value is None:
+            return None
+        return self.secret_store.decrypt(str(value), label=label)
+
+    def _decode_account_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        account = dict(row)
+        account_key = str(account.get("account_key") or "")
+        for column in ACCOUNT_SECRET_COLUMNS:
+            account[column] = self._decrypt_secret(
+                account.get(column),
+                label=f"accounts.{account_key}.{column}",
+            )
+        return account
 
     def _ensure_material_items_source_fk(self, connection: sqlite3.Connection) -> None:
         foreign_keys = connection.execute(
@@ -518,27 +600,66 @@ class Database:
             normalized = f"{account_key or 'default'}\0{role or ''}\0{normalized}"
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-    def upsert_account(self, *, account_key: str, name: str, cookie: str = "") -> None:
+    def upsert_account(
+        self,
+        *,
+        account_key: str,
+        name: str,
+        cookie: str | None = None,
+        proxy_url: str | None = None,
+        mcp_url: str | None = None,
+        mcp_auth_token: str | None = None,
+    ) -> None:
+        encrypted_cookie = self._encrypt_secret(cookie)
+        encrypted_proxy_url = self._encrypt_secret(proxy_url)
+        encrypted_mcp_auth_token = self._encrypt_secret(mcp_auth_token)
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO accounts (account_key, name, cookie, enabled, created_at)
-                VALUES (?, ?, ?, 1, ?)
+                INSERT INTO accounts (
+                    account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
+                    enabled, created_at
+                )
+                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), 1, ?)
                 ON CONFLICT(account_key) DO UPDATE SET
                     name = excluded.name,
                     cookie = CASE
-                        WHEN excluded.cookie = '' THEN accounts.cookie
+                        WHEN ? IS NULL THEN accounts.cookie
                         ELSE excluded.cookie
+                    END,
+                    proxy_url = CASE
+                        WHEN ? IS NULL THEN accounts.proxy_url
+                        ELSE excluded.proxy_url
+                    END,
+                    mcp_url = CASE
+                        WHEN ? IS NULL THEN accounts.mcp_url
+                        ELSE excluded.mcp_url
+                    END,
+                    mcp_auth_token = CASE
+                        WHEN ? IS NULL THEN accounts.mcp_auth_token
+                        ELSE excluded.mcp_auth_token
                     END,
                     enabled = 1
                 """,
-                (account_key, name, cookie, utc_now()),
+                (
+                    account_key,
+                    name,
+                    encrypted_cookie,
+                    encrypted_proxy_url,
+                    mcp_url,
+                    encrypted_mcp_auth_token,
+                    utc_now(),
+                    encrypted_cookie,
+                    encrypted_proxy_url,
+                    mcp_url,
+                    encrypted_mcp_auth_token,
+                ),
             )
 
     def list_accounts(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         query = """
-            SELECT account_key, name, cookie, signature_key, check_status,
-                checked_at, check_error, enabled, created_at
+            SELECT account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
+                signature_key, check_status, checked_at, check_error, enabled, created_at
             FROM accounts
         """
         params: tuple[Any, ...] = ()
@@ -547,7 +668,7 @@ class Database:
         query += " ORDER BY created_at, account_key"
         with self.connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_account_row(row) for row in rows]
 
     def disable_account(self, account_key: str) -> None:
         with self.connect() as connection:
@@ -564,6 +685,7 @@ class Database:
         status: str,
         error: str | None = None,
     ) -> None:
+        encrypted_signature_key = self._encrypt_secret(signature_key)
         with self.connect() as connection:
             connection.execute(
                 """
@@ -574,18 +696,33 @@ class Database:
                     check_error = ?
                 WHERE account_key = ?
                 """,
-                (signature_key, status, utc_now(), error, account_key),
+                (encrypted_signature_key, status, utc_now(), error, account_key),
             )
 
     def get_app_settings(self) -> dict[str, str]:
         with self.connect() as connection:
             rows = connection.execute("SELECT key, value FROM app_settings").fetchall()
-        return {str(row["key"]): str(row["value"]) for row in rows}
+        values: dict[str, str] = {}
+        for row in rows:
+            key = str(row["key"])
+            value = str(row["value"])
+            if key in SECRET_APP_SETTING_KEYS:
+                value = self._decrypt_secret(
+                    value,
+                    label=f"app_settings.{key}",
+                ) or ""
+            values[key] = value
+        return values
 
     def set_app_settings(self, values: dict[str, str]) -> None:
         now = utc_now()
         with self.connect() as connection:
             for key, value in values.items():
+                stored_value = (
+                    self._encrypt_secret(value)
+                    if key in SECRET_APP_SETTING_KEYS
+                    else value
+                )
                 connection.execute(
                     """
                     INSERT INTO app_settings (key, value, updated_at)
@@ -594,7 +731,7 @@ class Database:
                         value = excluded.value,
                         updated_at = excluded.updated_at
                     """,
-                    (key, value, now),
+                    (key, stored_value, now),
                 )
 
     def add_source_post(

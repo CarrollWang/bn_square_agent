@@ -49,7 +49,7 @@
           <h1>{{ pageTitle }}</h1>
           <p>多账号采集、改写、配图、发布自动运营台</p>
         </div>
-        <el-tag type="success" effect="plain">远程 MCP qianxin.xyz</el-tag>
+        <el-tag type="success" effect="plain">MCP 发布通道</el-tag>
       </el-header>
       <el-main class="app-main">
         <router-view />

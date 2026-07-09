@@ -10,7 +10,7 @@
           {{ monitor?.auto_monitor_enabled ? "暂停自动运行" : "启动自动运行" }}
         </el-button>
         <el-button type="primary" plain :loading="runningOnce" @click="runOnce">立即运行</el-button>
-        <el-button plain :loading="checkingMcp" @click="checkMcp">检查 MCP</el-button>
+        <el-button plain :loading="checkingMcp" @click="checkMcp">检查发布通道</el-button>
       </el-space>
     </div>
 
@@ -54,7 +54,7 @@
       <pre class="log-box">{{ formatMonitorLogs(monitor) }}</pre>
     </el-card>
 
-    <el-dialog v-model="mcpDialogVisible" title="MCP 工具检查" width="720px">
+    <el-dialog v-model="mcpDialogVisible" title="发布通道检查" width="720px">
       <pre class="dialog-json">{{ mcpResult }}</pre>
     </el-dialog>
   </div>

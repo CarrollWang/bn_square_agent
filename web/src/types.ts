@@ -10,7 +10,20 @@ export interface Account {
   check_status?: string;
   checked_at?: string;
   check_error?: string;
+  proxy_configured: boolean;
+  proxy_url_masked: string;
+  mcp_url: string;
+  mcp_auth_token_configured: boolean;
   created_at: string;
+}
+
+export interface AccountDetail {
+  account_key: string;
+  name: string;
+  cookie_saved: boolean;
+  proxy_url: string;
+  mcp_url: string;
+  mcp_auth_token_configured: boolean;
 }
 
 export interface MaterialSource {
@@ -72,6 +85,10 @@ export interface Settings {
   dashscope_api_key_configured: boolean;
   dashscope_api_key_masked: string;
   dashscope_embedding_model: string;
+  mcp_url: string;
+  mcp_publish_tool: string;
+  mcp_auth_token_configured: boolean;
+  mcp_auth_token_masked: string;
   auto_monitor_enabled: boolean;
   auto_publish: boolean;
   auto_consume_materials: boolean;

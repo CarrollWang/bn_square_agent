@@ -8,6 +8,19 @@ from .core.config import Settings
 from .publishing.mcp_client import RemoteMCPClient
 
 
+def _resolve_mcp_target(settings: Settings) -> tuple[str, str, str | None]:
+    if settings.mcp_url:
+        return settings.mcp_url, settings.mcp_auth_token, None
+    for account in settings.accounts:
+        if account.mcp_url:
+            return (
+                account.mcp_url,
+                account.mcp_auth_token or settings.mcp_auth_token,
+                account.key,
+            )
+    raise SystemExit("未配置全局 MCP_URL，也没有账号配置独立 MCP 地址")
+
+
 def _read_content(args: argparse.Namespace) -> str:
     if args.file:
         return Path(args.file).read_text(encoding="utf-8")
@@ -19,12 +32,17 @@ def _read_content(args: argparse.Namespace) -> str:
 def check_config(_: argparse.Namespace) -> int:
     settings = Settings.from_env()
     print("配置检查")
-    print(f"- MCP_URL: {settings.mcp_url}")
+    print(f"- MCP_URL: {settings.mcp_url or '(未配置，允许账号单独配置)'}")
     print(f"- AUTO_PUBLISH: {settings.auto_publish}")
     print(f"- accounts: {len(settings.accounts)}")
     for account in settings.accounts:
         cookie_state = "已配置" if account.cookie else "缺失"
-        print(f"  - {account.key} ({account.name}): cookie {cookie_state}")
+        proxy_state = account.proxy_url or "默认出口"
+        mcp_state = account.mcp_url or "沿用全局"
+        print(
+            f"  - {account.key} ({account.name}): cookie {cookie_state}; "
+            f"proxy {proxy_state}; mcp {mcp_state}"
+        )
     print(f"- LLM_API_KEY: {'已配置' if settings.llm_api_key else '缺失'}")
     print(f"- LLM_BASE_URL: {'已配置' if settings.llm_base_url else '缺失'}")
     print(f"- LLM_MODEL: {'已配置' if settings.llm_model else '缺失'}")
@@ -34,10 +52,12 @@ def check_config(_: argparse.Namespace) -> int:
 
 def list_tools(_: argparse.Namespace) -> int:
     settings = Settings.from_env()
-    client = RemoteMCPClient(settings.mcp_url, auth_token=settings.mcp_auth_token)
+    mcp_url, auth_token, account_key = _resolve_mcp_target(settings)
+    client = RemoteMCPClient(mcp_url, auth_token=auth_token)
     client.initialize()
     tools = client.list_tools()
-    print(f"远程 MCP 工具: {settings.mcp_url}")
+    target = f"{mcp_url} (account={account_key})" if account_key else mcp_url
+    print(f"远程 MCP 工具: {target}")
     for tool in tools:
         required = tool.input_schema.get("required", []) if tool.input_schema else []
         print(f"- {tool.name}")
@@ -87,6 +107,18 @@ def serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def serve_mcp(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    uvicorn.run(
+        "bn_square_agent.publishing.self_hosted_mcp:app",
+        host=args.host,
+        port=args.port,
+        reload=False,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bn-square-agent")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -109,6 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", type=int, default=8787)
     server.set_defaults(func=serve)
+
+    mcp_server = subparsers.add_parser(
+        "serve-mcp",
+        help="启动自建 Binance Square 发布 MCP 服务",
+    )
+    mcp_server.add_argument("--host", default="127.0.0.1")
+    mcp_server.add_argument("--port", type=int, default=8788)
+    mcp_server.set_defaults(func=serve_mcp)
 
     return parser
 

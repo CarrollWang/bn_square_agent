@@ -4,24 +4,50 @@
       <div class="toolbar">
         <div class="toolbar-title">
           <strong>账号管理</strong>
-          <span>保存 Binance Cookie，多账号自动发文</span>
+          <span>保存 Binance Cookie，给每个账号配置独立发布通道和代理</span>
         </div>
         <el-button plain @click="loadAccounts">刷新</el-button>
       </div>
     </template>
 
-    <el-form :model="form" label-width="120px" class="form-grid">
+    <el-alert
+      title="编辑已有账号时，Cookie 和独立 MCP Token 留空会保留已保存值。代理和独立 MCP 地址留空则表示不启用该账号覆盖。"
+      type="info"
+      :closable="false"
+      show-icon
+      class="form-alert"
+    />
+
+    <el-form :model="form" label-width="140px" class="form-grid">
       <el-form-item label="账号标识">
-        <el-input v-model="form.account_key" placeholder="acc_1" />
+        <el-input v-model="form.account_key" :disabled="Boolean(editingAccountKey)" placeholder="acc_1" />
       </el-form-item>
       <el-form-item label="显示名称">
         <el-input v-model="form.name" placeholder="账号 1" />
       </el-form-item>
+      <el-form-item label="独立代理" class="wide">
+        <el-input
+          v-model="form.proxy_url"
+          placeholder="http://user:pass@host:port 或 socks5://host:port"
+        />
+      </el-form-item>
+      <el-form-item label="独立 MCP 地址" class="wide">
+        <el-input v-model="form.mcp_url" placeholder="留空则沿用全局 MCP_URL" />
+      </el-form-item>
+      <el-form-item label="独立 MCP Token" class="wide">
+        <el-input v-model="form.mcp_auth_token" placeholder="留空则沿用已保存值或全局 Token" />
+      </el-form-item>
       <el-form-item label="Binance Cookie" class="wide">
-        <el-input v-model="form.cookie" type="textarea" :rows="6" placeholder="粘贴浏览器 Cookie" />
+        <el-input
+          v-model="form.cookie"
+          type="textarea"
+          :rows="6"
+          :placeholder="editingAccountKey ? '留空则保留已保存 Cookie；输入新 Cookie 可覆盖' : '粘贴浏览器 Cookie'"
+        />
       </el-form-item>
       <el-form-item class="wide">
         <el-button type="primary" :loading="saving" @click="saveAccount">保存账号</el-button>
+        <el-button v-if="editingAccountKey" plain @click="resetForm">取消编辑</el-button>
       </el-form-item>
     </el-form>
 
@@ -41,15 +67,34 @@
           <div class="muted">{{ (row.cookie_names || []).slice(0, 6).join(", ") || "无" }}</div>
         </template>
       </el-table-column>
+      <el-table-column label="隔离网络" min-width="220">
+        <template #default="{ row }">
+          <el-tag :type="row.proxy_configured ? 'warning' : 'info'" effect="plain">
+            {{ row.proxy_configured ? "独立代理" : "默认出口" }}
+          </el-tag>
+          <div class="muted">{{ row.proxy_url_masked || "未配置" }}</div>
+        </template>
+      </el-table-column>
+      <el-table-column label="发布通道" min-width="260">
+        <template #default="{ row }">
+          <div>{{ row.mcp_url || "沿用全局 MCP_URL" }}</div>
+          <div class="muted">
+            {{ row.mcp_auth_token_configured ? "账号独立 Token 已保存" : "沿用全局 Token / 无 Token" }}
+          </div>
+        </template>
+      </el-table-column>
       <el-table-column label="检测" width="170">
         <template #default="{ row }">
           <div>{{ row.check_status || "unchecked" }}</div>
           <div class="muted">{{ formatTime(row.checked_at) }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="190" fixed="right">
+      <el-table-column label="操作" width="250" fixed="right">
         <template #default="{ row }">
           <el-button size="small" @click="checkAccount(row.account_key)">检测</el-button>
+          <el-button size="small" plain :loading="loadingAccountKey === row.account_key" @click="editAccount(row.account_key)">
+            编辑
+          </el-button>
           <el-button size="small" type="danger" plain @click="deleteAccount(row.account_key)">删除</el-button>
         </template>
       </el-table-column>
@@ -67,14 +112,29 @@ import { formatTime } from "@/utils";
 
 const accounts = ref<Account[]>([]);
 const saving = ref(false);
+const editingAccountKey = ref("");
+const loadingAccountKey = ref("");
 const form = reactive({
   account_key: "",
   name: "",
   cookie: "",
+  proxy_url: "",
+  mcp_url: "",
+  mcp_auth_token: "",
 });
 
 async function loadAccounts() {
   accounts.value = await api.accounts();
+}
+
+function resetForm() {
+  editingAccountKey.value = "";
+  form.account_key = "";
+  form.name = "";
+  form.cookie = "";
+  form.proxy_url = "";
+  form.mcp_url = "";
+  form.mcp_auth_token = "";
 }
 
 async function saveAccount() {
@@ -83,15 +143,32 @@ async function saveAccount() {
     await api.saveAccount({
       account_key: form.account_key.trim(),
       name: form.name.trim(),
-      cookie: form.cookie.trim(),
+      cookie: form.cookie.trim() || null,
+      proxy_url: form.proxy_url.trim(),
+      mcp_url: form.mcp_url.trim(),
+      mcp_auth_token: form.mcp_auth_token.trim() || null,
     });
-    form.account_key = "";
-    form.name = "";
-    form.cookie = "";
+    resetForm();
     await loadAccounts();
     ElMessage.success("账号已保存");
   } finally {
     saving.value = false;
+  }
+}
+
+async function editAccount(accountKey: string) {
+  loadingAccountKey.value = accountKey;
+  try {
+    const detail = await api.account(accountKey);
+    editingAccountKey.value = detail.account_key;
+    form.account_key = detail.account_key;
+    form.name = detail.name || "";
+    form.cookie = "";
+    form.proxy_url = detail.proxy_url || "";
+    form.mcp_url = detail.mcp_url || "";
+    form.mcp_auth_token = "";
+  } finally {
+    loadingAccountKey.value = "";
   }
 }
 
@@ -117,6 +194,10 @@ onMounted(loadAccounts);
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 2px 16px;
   max-width: 1040px;
+}
+
+.form-alert {
+  margin-bottom: 16px;
 }
 
 .form-grid .wide {

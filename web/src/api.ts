@@ -1,5 +1,6 @@
 import type {
   Account,
+  AccountDetail,
   MaterialItem,
   MaterialSource,
   MonitorStatus,
@@ -20,7 +21,16 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
 
 export const api = {
   accounts: () => requestJson<Account[]>("/api/accounts"),
-  saveAccount: (payload: { account_key: string; name?: string; cookie: string }) =>
+  account: (accountKey: string) =>
+    requestJson<AccountDetail>(`/api/accounts/${encodeURIComponent(accountKey)}`),
+  saveAccount: (payload: {
+    account_key: string;
+    name?: string;
+    cookie?: string | null;
+    proxy_url?: string;
+    mcp_url?: string;
+    mcp_auth_token?: string | null;
+  }) =>
     requestJson<{ ok: boolean }>("/api/accounts", {
       method: "POST",
       body: JSON.stringify(payload),

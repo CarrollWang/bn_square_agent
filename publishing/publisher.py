@@ -27,23 +27,43 @@ class MCPPublisher:
     def __init__(self, settings: Settings):
         settings.validate_for_publish()
         self.settings = settings
-        self.client = RemoteMCPClient(
-            settings.mcp_url,
-            auth_token=settings.mcp_auth_token,
-        )
         self.chart_images = ChartImageService()
-        self._tools: list[MCPTool] | None = None
+        self._tools_by_target: dict[tuple[str, str], list[MCPTool]] = {}
 
-    def _ensure_tools(self) -> list[MCPTool]:
-        if self._tools is None:
-            self.client.initialize()
-            self._tools = self.client.list_tools()
-        return self._tools
+    def _resolve_mcp_url(self, account: AccountConfig) -> str:
+        url = account.mcp_url or self.settings.mcp_url
+        if not url:
+            raise RuntimeError(
+                f"账号 {account.key} 未配置独立 MCP 地址，且全局 MCP_URL 为空"
+            )
+        return url
 
-    def resolve_publish_tool(self) -> str:
+    def _resolve_mcp_auth_token(self, account: AccountConfig) -> str:
+        return account.mcp_auth_token or self.settings.mcp_auth_token
+
+    def _client_for_account(self, account: AccountConfig) -> RemoteMCPClient:
+        return RemoteMCPClient(
+            self._resolve_mcp_url(account),
+            auth_token=self._resolve_mcp_auth_token(account),
+        )
+
+    def _ensure_tools(self, account: AccountConfig) -> list[MCPTool]:
+        key = (
+            self._resolve_mcp_url(account),
+            self._resolve_mcp_auth_token(account),
+        )
+        tools = self._tools_by_target.get(key)
+        if tools is None:
+            client = self._client_for_account(account)
+            client.initialize()
+            tools = client.list_tools()
+            self._tools_by_target[key] = tools
+        return tools
+
+    def resolve_publish_tool(self, account: AccountConfig) -> str:
         if self.settings.mcp_publish_tool:
             return self.settings.mcp_publish_tool
-        tools = self._ensure_tools()
+        tools = self._ensure_tools(account)
         if any(tool.name == DEFAULT_PUBLISH_TOOL for tool in tools):
             return DEFAULT_PUBLISH_TOOL
         for tool in tools:
@@ -59,7 +79,11 @@ class MCPPublisher:
         account: AccountConfig,
         generated: dict[str, Any],
     ) -> dict[str, Any]:
-        tool_name = self.resolve_publish_tool()
+        if not account.cookie:
+            raise RuntimeError(f"账号 {account.key} 缺少 Cookie，无法发布")
+        tool_name = self.resolve_publish_tool(account)
+        client = self._client_for_account(account)
+        client.initialize()
         content = re.sub(
             r"\n*\{future\}\([A-Z0-9]{2,30}USDT\)\s*",
             "",
@@ -83,13 +107,18 @@ class MCPPublisher:
         if target:
             coin = target.symbol.removesuffix("USDT")
             arguments["coins"] = f"{coin}:{target.market}"
+        if account.proxy_url:
+            arguments["proxy_url"] = account.proxy_url
         try:
-            image_base64 = self.chart_images.image_for_text(chart_text)
+            image_base64 = self.chart_images.image_for_text(
+                chart_text,
+                proxy_url=account.proxy_url,
+            )
             if image_base64:
                 arguments["image_base64"] = image_base64
         except Exception as exc:
             _ = exc
-        return self.client.call_tool(tool_name, arguments)
+        return client.call_tool(tool_name, arguments)
 
 
 class PublishingService:

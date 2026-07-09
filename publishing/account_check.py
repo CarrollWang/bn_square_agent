@@ -5,6 +5,8 @@ from typing import Any
 
 import httpx
 
+from ..core.config import normalize_proxy_url, playwright_proxy_settings
+
 
 BINANCE_BASE_URL = "https://www.binance.com"
 
@@ -57,14 +59,16 @@ class BinanceAccountChecker:
                     return found
         return None
 
-    def check(self, cookie: str) -> AccountCheckResult:
+    def check(self, cookie: str, proxy_url: str = "") -> AccountCheckResult:
         headers = self._headers(cookie)
+        proxy = normalize_proxy_url(proxy_url) if proxy_url else ""
         try:
             with httpx.Client(
                 timeout=self.timeout,
                 follow_redirects=True,
                 headers=headers,
                 trust_env=False,
+                proxy=proxy or None,
             ) as client:
                 auth = client.post("/".join([BINANCE_BASE_URL, "bapi/accounts/v1/public/authcenter/auth"]))
                 auth_json = auth.json()
@@ -128,7 +132,7 @@ class BinanceAccountChecker:
                     raw=last_payload,
                 )
         except Exception as exc:
-            browser_result = self._check_with_playwright(cookie)
+            browser_result = self._check_with_playwright(cookie, proxy_url=proxy)
             if browser_result.error:
                 return AccountCheckResult(
                     valid=browser_result.valid,
@@ -169,14 +173,25 @@ class BinanceAccountChecker:
             )
         return items
 
-    def _check_with_playwright(self, cookie: str) -> AccountCheckResult:
+    def _check_with_playwright(
+        self,
+        cookie: str,
+        *,
+        proxy_url: str = "",
+    ) -> AccountCheckResult:
         try:
             from playwright.sync_api import sync_playwright
 
             with sync_playwright() as p:
+                launch_args: dict[str, Any] = {
+                    "headless": True,
+                    "args": ["--disable-blink-features=AutomationControlled"],
+                }
+                proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
+                if proxy:
+                    launch_args["proxy"] = proxy
                 browser = p.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
+                    **launch_args,
                 )
                 context = browser.new_context(
                     locale="zh-CN",
