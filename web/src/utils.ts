@@ -27,6 +27,7 @@ export function nextRunLabel(status?: MonitorStatus | null) {
     published: "成功节奏",
     publish_failed: "失败重试",
     collect_failed: "采集重试",
+    locked: "等待其他实例",
     paused: "已暂停",
     paused_after_failures: "连续失败暂停",
     error: "异常重试",
@@ -103,11 +104,18 @@ export function formatMonitorLogs(status?: MonitorStatus | null) {
     for (const item of status.last_consume_results) {
       lines.push(`- material#${item.material_item_id}: ${item.title || "-"}`);
       for (const run of item.runs || []) {
-        const result = run.error
-          ? `失败：${run.error}`
-          : `终稿#${run.approved_generated_id || "-"}，发布：${
-              run.publish_success ? "成功" : `失败 ${publishErrorText(run.publish_result)}`
-            }`;
+        let result = "";
+        if (run.status === "skipped") {
+          result = `跳过：${run.skipped_reason || "账号当前不可用"}`;
+        } else if (run.status === "already_published") {
+          result = `终稿#${run.approved_generated_id || "-"}，此前已发布`;
+        } else if (run.error) {
+          result = `失败：${run.error}`;
+        } else if (run.publish_success) {
+          result = `终稿#${run.approved_generated_id || "-"}，发布：成功`;
+        } else {
+          result = `终稿#${run.approved_generated_id || "-"}，发布：失败 ${publishErrorText(run.publish_result)}`;
+        }
         lines.push(`  · 账号 ${run.account_key}: ${result}`);
       }
     }

@@ -212,9 +212,13 @@ async function deleteSource(sourceId: number) {
 }
 
 async function runMaterial(materialId: number) {
-  await api.runMaterialItem(materialId);
-  await loadItems();
-  ElMessage.success("素材已运行");
+  try {
+    await api.runMaterialItem(materialId);
+    await loadItems();
+    ElMessage.success("素材已运行");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "运行失败");
+  }
 }
 
 watch(

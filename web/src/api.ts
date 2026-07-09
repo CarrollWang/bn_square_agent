@@ -1,9 +1,14 @@
 import type {
   Account,
+  AccountPerformanceDashboard,
   AccountDetail,
+  CookieImportFinishResult,
+  CookieImportStartResult,
   MaterialItem,
   MaterialSource,
   MonitorStatus,
+  PublishAccountSummary,
+  PublishHistoryItem,
   Settings,
 } from "./types";
 
@@ -43,6 +48,25 @@ export const api = {
     requestJson<any>(`/api/accounts/${encodeURIComponent(accountKey)}/check`, {
       method: "POST",
     }),
+  startCookieImport: (payload: {
+    account_key: string;
+    name?: string;
+    login_url?: string;
+  }) =>
+    requestJson<CookieImportStartResult>("/api/accounts/import-cookie/start", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  finishCookieImport: (session_id: string) =>
+    requestJson<CookieImportFinishResult>("/api/accounts/import-cookie/finish", {
+      method: "POST",
+      body: JSON.stringify({ session_id }),
+    }),
+  cancelCookieImport: (session_id: string) =>
+    requestJson<{ ok: boolean }>("/api/accounts/import-cookie/cancel", {
+      method: "POST",
+      body: JSON.stringify({ session_id }),
+    }),
   settings: () => requestJson<Settings>("/api/settings"),
   saveSettings: (payload: Record<string, unknown>) =>
     requestJson<{ ok: boolean; saved: string[] }>("/api/settings", {
@@ -68,6 +92,18 @@ export const api = {
     requestJson<any>(`/api/material-sources/${sourceId}/check`, { method: "POST" }),
   materialItems: (limit = 80) =>
     requestJson<MaterialItem[]>(`/api/material-items?status=new&limit=${limit}`),
+  publishHistory: (params: { limit?: number; account_key?: string; status?: string } = {}) => {
+    const search = new URLSearchParams();
+    if (params.limit) search.set("limit", String(params.limit));
+    if (params.account_key) search.set("account_key", params.account_key);
+    if (params.status) search.set("status", params.status);
+    const query = search.toString();
+    return requestJson<PublishHistoryItem[]>(`/api/history/publishes${query ? `?${query}` : ""}`);
+  },
+  publishAccountSummaries: () =>
+    requestJson<PublishAccountSummary[]>("/api/history/accounts"),
+  accountPerformance: (days = 7) =>
+    requestJson<AccountPerformanceDashboard>(`/api/performance/accounts?days=${days}`),
   monitor: () => requestJson<MonitorStatus>("/api/material-monitor"),
   setMonitorEnabled: (enabled: boolean) =>
     requestJson<{ ok: boolean; enabled: boolean }>("/api/material-monitor/enabled", {

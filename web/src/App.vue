@@ -21,6 +21,14 @@
           <el-icon><User /></el-icon>
           <span>账号管理</span>
         </el-menu-item>
+        <el-menu-item index="/performance">
+          <el-icon><DataAnalysis /></el-icon>
+          <span>账号表现</span>
+        </el-menu-item>
+        <el-menu-item index="/history">
+          <el-icon><Document /></el-icon>
+          <span>发文历史</span>
+        </el-menu-item>
         <el-sub-menu index="sources">
           <template #title>
             <el-icon><FolderOpened /></el-icon>
@@ -61,7 +69,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { useRoute } from "vue-router";
-import { FolderOpened, Monitor, Setting, User } from "@element-plus/icons-vue";
+import { DataAnalysis, Document, FolderOpened, Monitor, Setting, User } from "@element-plus/icons-vue";
 
 const route = useRoute();
 
@@ -69,6 +77,8 @@ const pageTitle = computed(() => {
   const map: Record<string, string> = {
     dashboard: "自动运行",
     accounts: "账号管理",
+    performance: "账号表现",
+    history: "发文历史",
     sources: "素材中心",
     settings: "系统设置",
   };

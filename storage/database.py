@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any, Iterator
 
 from ..core.secret_store import SecretStore
@@ -33,9 +34,11 @@ class Database:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA journal_mode = WAL")
         try:
             yield connection
             connection.commit()
@@ -91,6 +94,13 @@ class Database:
                     updated_at TEXT NOT NULL,
                     UNIQUE(source_post_id, candidate_index),
                     FOREIGN KEY(source_post_id) REFERENCES source_posts(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS job_locks (
+                    job_name TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -191,6 +201,36 @@ class Database:
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(source_id) REFERENCES material_sources(id)
             );
+
+            CREATE TABLE IF NOT EXISTS material_account_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_item_id INTEGER NOT NULL,
+                account_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('published', 'failed', 'skipped')
+                ),
+                generated_id INTEGER,
+                publish_json TEXT,
+                error TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempted_at TEXT,
+                published_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(material_item_id, account_key),
+                FOREIGN KEY(material_item_id) REFERENCES material_items(id),
+                FOREIGN KEY(account_key) REFERENCES accounts(account_key),
+                FOREIGN KEY(generated_id) REFERENCES generated_posts(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_material_items_status_tag_created
+                ON material_items(status, tag_status, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_generated_posts_account_status_created
+                ON generated_posts(account_key, status, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_generated_posts_publish_status
+                ON generated_posts(publish_status, published_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_material_account_runs_material_status
+                ON material_account_runs(material_item_id, status, account_key);
             """
         )
         account_columns = self._columns(connection, "accounts")
@@ -290,6 +330,49 @@ class Database:
                 label=f"accounts.{account_key}.{column}",
             )
         return account
+
+    def try_acquire_job_lock(
+        self,
+        job_name: str,
+        *,
+        owner_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        expires_at = int(time.time()) + max(1, lease_seconds)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT owner_id, expires_at FROM job_locks WHERE job_name = ?",
+                (job_name,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO job_locks (job_name, owner_id, expires_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (job_name, owner_id, expires_at, utc_now()),
+                )
+                return True
+
+            if int(row["expires_at"] or 0) <= int(time.time()):
+                connection.execute(
+                    """
+                    UPDATE job_locks
+                    SET owner_id = ?, expires_at = ?, updated_at = ?
+                    WHERE job_name = ?
+                    """,
+                    (owner_id, expires_at, utc_now(), job_name),
+                )
+                return True
+        return False
+
+    def release_job_lock(self, job_name: str, *, owner_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM job_locks WHERE job_name = ? AND owner_id = ?",
+                (job_name, owner_id),
+            )
 
     def _ensure_material_items_source_fk(self, connection: sqlite3.Connection) -> None:
         foreign_keys = connection.execute(
@@ -543,6 +626,132 @@ class Database:
 
     def pending_material_items_for_tagging(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return self.list_material_items(status="new", tag_status="pending", limit=limit)
+
+    def get_material_account_run(
+        self,
+        material_item_id: int,
+        account_key: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM material_account_runs
+                WHERE material_item_id = ? AND account_key = ?
+                """,
+                (material_item_id, account_key),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_material_account_runs(self, material_item_id: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM material_account_runs
+                WHERE material_item_id = ?
+                ORDER BY created_at, account_key
+                """,
+                (material_item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_material_queue_for_account(
+        self,
+        account_key: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    i.*,
+                    s.name AS source_name,
+                    s.source_type,
+                    r.status AS run_status,
+                    r.error AS run_error,
+                    r.attempt_count
+                FROM material_items i
+                LEFT JOIN material_sources s ON s.id = i.source_id
+                LEFT JOIN material_account_runs r
+                    ON r.material_item_id = i.id AND r.account_key = ?
+                WHERE i.status = 'new'
+                    AND i.tag_status = 'accepted'
+                    AND (r.status IS NULL OR r.status = 'failed')
+                ORDER BY
+                    COALESCE(i.source_created_at, i.created_at) ASC,
+                    i.id ASC
+                LIMIT ?
+                """,
+                (account_key, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_material_account_run(
+        self,
+        material_item_id: int,
+        *,
+        account_key: str,
+        status: str,
+        generated_id: int | None = None,
+        publish_result: dict[str, Any] | None = None,
+        error: str | None = None,
+        increment_attempts: bool = False,
+    ) -> None:
+        now = utc_now()
+        attempt_delta = 1 if increment_attempts else 0
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO material_account_runs (
+                    material_item_id,
+                    account_key,
+                    status,
+                    generated_id,
+                    publish_json,
+                    error,
+                    attempt_count,
+                    last_attempted_at,
+                    published_at,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(material_item_id, account_key) DO UPDATE SET
+                    status = excluded.status,
+                    generated_id = CASE
+                        WHEN excluded.generated_id IS NULL
+                        THEN material_account_runs.generated_id
+                        ELSE excluded.generated_id
+                    END,
+                    publish_json = excluded.publish_json,
+                    error = excluded.error,
+                    attempt_count = material_account_runs.attempt_count + ?,
+                    last_attempted_at = CASE
+                        WHEN excluded.last_attempted_at IS NULL
+                        THEN material_account_runs.last_attempted_at
+                        ELSE excluded.last_attempted_at
+                    END,
+                    published_at = excluded.published_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    material_item_id,
+                    account_key,
+                    status,
+                    generated_id,
+                    json.dumps(publish_result, ensure_ascii=False)
+                    if publish_result is not None
+                    else None,
+                    error,
+                    attempt_delta,
+                    now if increment_attempts else None,
+                    now if status == "published" else None,
+                    now,
+                    now,
+                    attempt_delta,
+                ),
+            )
 
     def save_material_tag(
         self,
@@ -962,6 +1171,89 @@ class Database:
         query += " ORDER BY g.created_at DESC, g.candidate_index"
         with self.connect() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_publish_history(
+        self,
+        *,
+        limit: int | None = 100,
+        account_key: str | None = None,
+        status: str | None = None,
+        days: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                r.*,
+                a.name AS account_name,
+                a.check_status AS account_check_status,
+                m.title AS material_title,
+                m.content AS material_content,
+                m.url AS material_url,
+                m.source_created_at,
+                ms.name AS source_name,
+                ms.source_type,
+                g.content AS generated_content,
+                g.publish_status AS generated_publish_status,
+                g.published_at AS generated_published_at
+            FROM material_account_runs r
+            JOIN accounts a ON a.account_key = r.account_key
+            JOIN material_items m ON m.id = r.material_item_id
+            LEFT JOIN material_sources ms ON ms.id = m.source_id
+            LEFT JOIN generated_posts g ON g.id = r.generated_id
+        """
+        clauses = []
+        params: list[Any] = []
+        if account_key:
+            clauses.append("r.account_key = ?")
+            params.append(account_key)
+        if status:
+            clauses.append("r.status = ?")
+            params.append(status)
+        if days is not None and days > 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            clauses.append("COALESCE(r.published_at, r.last_attempted_at, r.updated_at) >= ?")
+            params.append(cutoff)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += """
+            ORDER BY
+                COALESCE(r.published_at, r.last_attempted_at, r.updated_at) DESC,
+                r.id DESC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def publish_account_summaries(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    a.account_key,
+                    a.name,
+                    a.enabled,
+                    a.check_status,
+                    a.checked_at,
+                    COALESCE(SUM(CASE WHEN r.status = 'published' THEN 1 ELSE 0 END), 0) AS published_count,
+                    COALESCE(SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+                    COALESCE(SUM(CASE WHEN r.status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped_count,
+                    MAX(r.published_at) AS last_published_at,
+                    MAX(COALESCE(r.last_attempted_at, r.updated_at)) AS last_activity_at
+                FROM accounts a
+                LEFT JOIN material_account_runs r ON r.account_key = a.account_key
+                WHERE a.enabled = 1
+                GROUP BY
+                    a.account_key,
+                    a.name,
+                    a.enabled,
+                    a.check_status,
+                    a.checked_at
+                ORDER BY published_count DESC, a.created_at, a.account_key
+                """
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def get_generated(self, generated_id: int) -> dict[str, Any]:

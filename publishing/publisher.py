@@ -126,6 +126,19 @@ class PublishingService:
         self.db = db
         self.publisher = publisher
 
+    @staticmethod
+    def _decode_publish_result(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                payload = {}
+            if isinstance(payload, dict):
+                return payload
+        return {}
+
     def publish_generated(
         self,
         *,
@@ -139,6 +152,11 @@ class PublishingService:
             )
         if generated["status"] != "approved":
             raise ValueError(f"只有 approved 终稿可以发布，当前状态: {generated['status']}")
+        if generated.get("publish_status") == "published":
+            result = self._decode_publish_result(generated.get("publish_json"))
+            if not result:
+                result = {"success": True, "message": "终稿已发布，已跳过重复发布"}
+            return PublishResult(account.key, generated_id, True, result)
         try:
             result = self.publisher.publish(account=account, generated=generated)
         except Exception as exc:

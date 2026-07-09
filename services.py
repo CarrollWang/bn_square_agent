@@ -21,6 +21,8 @@ def _load_accounts_from_db(db: Database) -> tuple[AccountConfig, ...]:
             proxy_url=row.get("proxy_url") or "",
             mcp_url=row.get("mcp_url") or "",
             mcp_auth_token=row.get("mcp_auth_token") or "",
+            check_status=row.get("check_status") or "unchecked",
+            enabled=bool(row.get("enabled", 1)),
         )
         for row in db.list_accounts()
     )

@@ -1,22 +1,23 @@
 <template>
   <el-card class="page-card" shadow="never">
     <template #header>
-      <div class="toolbar">
-        <div class="toolbar-title">
-          <strong>账号管理</strong>
-          <span>保存 Binance Cookie，给每个账号配置独立发布通道和代理</span>
+        <div class="toolbar">
+          <div class="toolbar-title">
+            <strong>账号管理</strong>
+          <span>系统建议长期运行在服务器，本地只在需要更新 Cookie 时临时参与</span>
+          </div>
+          <el-button plain @click="loadAccounts">刷新</el-button>
         </div>
-        <el-button plain @click="loadAccounts">刷新</el-button>
-      </div>
-    </template>
+      </template>
 
-    <el-alert
-      title="编辑已有账号时，Cookie 和独立 MCP Token 留空会保留已保存值。代理和独立 MCP 地址留空则表示不启用该账号覆盖。"
-      type="info"
-      :closable="false"
-      show-icon
-      class="form-alert"
-    />
+      <el-alert
+        title="推荐模式：服务器长期运行，本机只在 Cookie 失效时临时更新。"
+        description="“打开登录窗口导入 Cookie”会在当前服务所在机器打开浏览器。部署到无头服务器时，建议在本机临时运行同版本导入，或者直接把 Cookie 粘贴到服务器后台。编辑已有账号时，Cookie 和独立 MCP Token 留空会保留已保存值。"
+        type="info"
+        :closable="false"
+        show-icon
+        class="form-alert"
+      />
 
     <el-form :model="form" label-width="140px" class="form-grid">
       <el-form-item label="账号标识">
@@ -31,12 +32,20 @@
           placeholder="http://user:pass@host:port 或 socks5://host:port"
         />
       </el-form-item>
-      <el-form-item label="独立 MCP 地址" class="wide">
-        <el-input v-model="form.mcp_url" placeholder="留空则沿用全局 MCP_URL" />
+      <el-form-item class="wide advanced-toggle">
+        <el-checkbox v-model="showAdvanced">高级发布通道配置</el-checkbox>
+        <span class="muted">默认沿用全局 MCP 设置，通常不需要单独填写</span>
       </el-form-item>
-      <el-form-item label="独立 MCP Token" class="wide">
-        <el-input v-model="form.mcp_auth_token" placeholder="留空则沿用已保存值或全局 Token" />
-      </el-form-item>
+      <el-collapse-transition>
+        <div v-show="showAdvanced" class="advanced-block">
+          <el-form-item label="独立 MCP 地址" class="wide">
+            <el-input v-model="form.mcp_url" placeholder="留空则沿用全局 MCP_URL" />
+          </el-form-item>
+          <el-form-item label="独立 MCP Token" class="wide">
+            <el-input v-model="form.mcp_auth_token" placeholder="留空则沿用已保存值或全局 Token" />
+          </el-form-item>
+        </div>
+      </el-collapse-transition>
       <el-form-item label="Binance Cookie" class="wide">
         <el-input
           v-model="form.cookie"
@@ -47,6 +56,16 @@
       </el-form-item>
       <el-form-item class="wide">
         <el-button type="primary" :loading="saving" @click="saveAccount">保存账号</el-button>
+        <el-button :loading="importing" @click="startCookieImport">在当前机器打开登录窗口导入 Cookie</el-button>
+        <el-button
+          v-if="cookieImportSessionId"
+          type="success"
+          :loading="finishingImport"
+          @click="finishCookieImport"
+        >
+          完成导入
+        </el-button>
+        <el-button v-if="cookieImportSessionId" plain @click="cancelCookieImport">取消导入</el-button>
         <el-button v-if="editingAccountKey" plain @click="resetForm">取消编辑</el-button>
       </el-form-item>
     </el-form>
@@ -114,6 +133,10 @@ const accounts = ref<Account[]>([]);
 const saving = ref(false);
 const editingAccountKey = ref("");
 const loadingAccountKey = ref("");
+const importing = ref(false);
+const finishingImport = ref(false);
+const cookieImportSessionId = ref("");
+const showAdvanced = ref(false);
 const form = reactive({
   account_key: "",
   name: "",
@@ -128,6 +151,10 @@ async function loadAccounts() {
 }
 
 function resetForm() {
+  if (cookieImportSessionId.value) {
+    ElMessage.warning("请先完成或取消当前 Cookie 导入")
+    return;
+  }
   editingAccountKey.value = "";
   form.account_key = "";
   form.name = "";
@@ -135,6 +162,7 @@ function resetForm() {
   form.proxy_url = "";
   form.mcp_url = "";
   form.mcp_auth_token = "";
+  showAdvanced.value = false;
 }
 
 async function saveAccount() {
@@ -156,7 +184,56 @@ async function saveAccount() {
   }
 }
 
+async function startCookieImport() {
+  if (cookieImportSessionId.value) {
+    ElMessage.warning("当前已有一个 Cookie 导入会话，请先完成或取消")
+    return;
+  }
+  const accountKey = form.account_key.trim();
+  if (!accountKey) {
+    ElMessage.warning("请先填写账号标识");
+    return;
+  }
+  importing.value = true;
+  try {
+    const result = await api.startCookieImport({
+      account_key: accountKey,
+      name: form.name.trim(),
+    });
+    cookieImportSessionId.value = result.session_id;
+    ElMessage.success(result.message);
+  } finally {
+    importing.value = false;
+  }
+}
+
+async function finishCookieImport() {
+  if (!cookieImportSessionId.value) return;
+  finishingImport.value = true;
+  try {
+    const result = await api.finishCookieImport(cookieImportSessionId.value);
+    cookieImportSessionId.value = "";
+    editingAccountKey.value = "";
+    resetForm();
+    await loadAccounts();
+    ElMessage.success(`Cookie 已导入：${result.cookie_length} 字符`);
+  } finally {
+    finishingImport.value = false;
+  }
+}
+
+async function cancelCookieImport() {
+  if (!cookieImportSessionId.value) return;
+  await api.cancelCookieImport(cookieImportSessionId.value);
+  cookieImportSessionId.value = "";
+  ElMessage.success("已取消导入");
+}
+
 async function editAccount(accountKey: string) {
+  if (cookieImportSessionId.value) {
+    ElMessage.warning("请先完成或取消当前 Cookie 导入")
+    return;
+  }
   loadingAccountKey.value = accountKey;
   try {
     const detail = await api.account(accountKey);
@@ -167,6 +244,7 @@ async function editAccount(accountKey: string) {
     form.proxy_url = detail.proxy_url || "";
     form.mcp_url = detail.mcp_url || "";
     form.mcp_auth_token = "";
+    showAdvanced.value = Boolean(detail.mcp_url || detail.mcp_auth_token_configured);
   } finally {
     loadingAccountKey.value = "";
   }
@@ -202,6 +280,14 @@ onMounted(loadAccounts);
 
 .form-grid .wide {
   grid-column: 1 / -1;
+}
+
+.advanced-toggle {
+  align-items: center;
+}
+
+.advanced-block {
+  display: contents;
 }
 
 .data-table {

@@ -90,6 +90,8 @@ class AccountConfig:
     proxy_url: str = ""
     mcp_url: str = ""
     mcp_auth_token: str = ""
+    check_status: str = "unchecked"
+    enabled: bool = True
 
 
 def _load_accounts(value: str) -> tuple[AccountConfig, ...]:

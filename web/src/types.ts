@@ -26,6 +26,19 @@ export interface AccountDetail {
   mcp_auth_token_configured: boolean;
 }
 
+export interface CookieImportStartResult {
+  ok: boolean;
+  session_id: string;
+  message: string;
+}
+
+export interface CookieImportFinishResult {
+  ok: boolean;
+  account_key: string;
+  cookie_length: number;
+  cookie_names: string[];
+}
+
 export interface MaterialSource {
   id: number;
   name: string;
@@ -48,6 +61,112 @@ export interface MaterialItem {
   tag_status?: string;
   tag_json?: string;
   created_at: string;
+}
+
+export interface PublishHistoryItem {
+  material_item_id: number;
+  account_key: string;
+  account_name: string;
+  account_check_status?: string | null;
+  status: "published" | "failed" | "skipped";
+  generated_id?: number | null;
+  attempt_count: number;
+  published_at?: string | null;
+  last_attempted_at?: string | null;
+  last_activity_at?: string | null;
+  error?: string | null;
+  publish_result?: Record<string, unknown> | string | null;
+  material_title?: string | null;
+  material_content?: string | null;
+  material_url?: string | null;
+  source_name?: string | null;
+  source_type?: SourceType | null;
+  source_created_at?: string | null;
+  generated_content?: string | null;
+  generated_publish_status?: string | null;
+  generated_published_at?: string | null;
+}
+
+export interface PublishAccountSummary {
+  account_key: string;
+  name: string;
+  enabled: boolean;
+  check_status?: string | null;
+  checked_at?: string | null;
+  published_count: number;
+  failed_count: number;
+  skipped_count: number;
+  last_published_at?: string | null;
+  last_activity_at?: string | null;
+}
+
+export interface PerformanceSummary {
+  active_accounts: number;
+  publishing_accounts: number;
+  idle_accounts: number;
+  invalid_accounts: number;
+  limited_accounts: number;
+  total_published: number;
+  total_failed: number;
+  total_skipped: number;
+  success_rate: number;
+  avg_attempt_count: number;
+}
+
+export interface PerformanceDailyPoint {
+  date: string;
+  published_count: number;
+  failed_count: number;
+  skipped_count: number;
+  total_count: number;
+}
+
+export interface PerformanceAccountMetric {
+  account_key: string;
+  name: string;
+  check_status?: string | null;
+  published_count: number;
+  failed_count: number;
+  skipped_count: number;
+  total_runs: number;
+  total_attempted: number;
+  success_rate: number;
+  avg_attempt_count: number;
+  active_days: number;
+  last_published_at?: string | null;
+  last_activity_at?: string | null;
+  top_source_name?: string | null;
+  top_source_type?: SourceType | null;
+  top_source_count: number;
+  health_label: string;
+  health_tone: "success" | "warning" | "danger" | "info";
+  issue_reason?: string | null;
+}
+
+export interface PerformanceIssue {
+  account_key: string;
+  name: string;
+  severity: "high" | "medium" | "low";
+  severity_label: string;
+  reason: string;
+}
+
+export interface PerformanceSourceSummary {
+  source_name: string;
+  source_type?: SourceType | null;
+  published_count: number;
+  failed_count: number;
+  skipped_count: number;
+  success_rate: number;
+}
+
+export interface AccountPerformanceDashboard {
+  period_days: number;
+  summary: PerformanceSummary;
+  daily: PerformanceDailyPoint[];
+  accounts: PerformanceAccountMetric[];
+  issues: PerformanceIssue[];
+  sources: PerformanceSourceSummary[];
 }
 
 export interface MonitorStatus {

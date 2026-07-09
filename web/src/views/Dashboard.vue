@@ -92,6 +92,8 @@ async function runOnce() {
     await api.runMaterialMonitor();
     await loadMonitor();
     ElMessage.success("本轮运行完成");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "运行失败");
   } finally {
     runningOnce.value = false;
   }

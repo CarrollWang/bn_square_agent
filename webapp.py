@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+import json
 from pathlib import Path
 import smtplib
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -33,6 +36,8 @@ from .storage.database import Database
 PACKAGE_DIR = Path(__file__).resolve().parent
 DIST_DIR = PACKAGE_DIR / "dist"
 SOURCE_CHECK_TIMEOUT_SECONDS = 90
+MONITOR_LOCK_NAME = "material_monitor"
+MONITOR_LOCK_LEASE_SECONDS = 30 * 60
 
 monitor_state: dict[str, Any] = {
     "running": False,
@@ -50,7 +55,95 @@ monitor_state: dict[str, Any] = {
     "last_alert_at": None,
     "last_alert_error": None,
     "last_alert_sent": False,
+    "account_queue_cursor": 0,
 }
+cookie_login_sessions: dict[str, dict[str, Any]] = {}
+
+
+def _serialize_account_run(run: Any) -> dict[str, Any]:
+    publish_result = getattr(run, "publish_result", None)
+    return {
+        "account_key": run.account_key,
+        "status": getattr(run, "status", None),
+        "generated_ids": list(getattr(run, "generated_ids", []) or []),
+        "approved_generated_id": getattr(run, "approved_generated_id", None),
+        "skipped_reason": getattr(run, "skipped_reason", None),
+        "error": getattr(run, "error", None),
+        "publish_success": publish_result.success if publish_result else None,
+        "publish_result": publish_result.result if publish_result else None,
+    }
+
+
+def _serialize_consume_result(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "material_item_id": item.get("material_item_id"),
+        "title": item.get("title"),
+        "account_key": item.get("account_key"),
+        "runs": [_serialize_account_run(run) for run in item.get("runs") or []],
+    }
+
+
+def _monitor_locked_result(settings: Settings) -> dict[str, Any]:
+    monitor_state["running"] = False
+    monitor_state["current_stage"] = "已有其他运行实例，本轮跳过"
+    monitor_state["last_error"] = None
+    monitor_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
+    monitor_state["next_run_after_seconds"] = _paused_monitor_delay(settings)
+    monitor_state["next_run_reason"] = "locked"
+    return {
+        "skipped": True,
+        "reason": "locked",
+        "expired_count": monitor_state.get("expired_count", 0),
+        "results": [],
+        "consume_results": [],
+    }
+
+
+def _acquire_pipeline_lock_or_raise(db: Database) -> str:
+    owner_id = uuid4().hex
+    locked = db.try_acquire_job_lock(
+        MONITOR_LOCK_NAME,
+        owner_id=owner_id,
+        lease_seconds=MONITOR_LOCK_LEASE_SECONDS,
+    )
+    if not locked:
+        raise HTTPException(status_code=409, detail="当前已有一轮任务在运行，请稍后再试")
+    return owner_id
+
+
+def _round_percent(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator * 100 / denominator, 1)
+
+
+def _max_iso(values: list[str | None]) -> str | None:
+    candidates = [value for value in values if value]
+    return max(candidates) if candidates else None
+
+
+def _account_health(
+    *,
+    check_status: str | None,
+    published_count: int,
+    failed_count: int,
+    skipped_count: int,
+) -> tuple[str, str]:
+    if check_status == "invalid":
+        return "异常", "danger"
+    attempts = published_count + failed_count
+    success_rate = published_count / attempts if attempts else 0.0
+    if published_count >= 5 and success_rate >= 0.8:
+        return "优秀", "success"
+    if published_count >= 1 and success_rate >= 0.6:
+        return "稳定", "success"
+    if failed_count >= max(2, published_count + 1):
+        return "观察", "warning"
+    if skipped_count >= max(3, published_count + 1):
+        return "受限", "warning"
+    if published_count == 0 and failed_count == 0 and skipped_count == 0:
+        return "空闲", "info"
+    return "观察", "warning"
 
 
 def _consume_results_have_failure(consume_results: list[dict[str, Any]]) -> bool:
@@ -185,9 +278,19 @@ def _paused_monitor_delay(settings: Settings) -> int:
     return max(10, min(settings.material_poll_interval_seconds, 60))
 
 
-async def run_material_monitor_once() -> dict[str, Any]:
+async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str, Any]:
     settings = get_settings()
     db = get_db()
+    lock_owner = uuid4().hex
+    if not db.try_acquire_job_lock(
+        MONITOR_LOCK_NAME,
+        owner_id=lock_owner,
+        lease_seconds=MONITOR_LOCK_LEASE_SECONDS,
+    ):
+        result = _monitor_locked_result(settings)
+        if fail_if_locked:
+            raise HTTPException(status_code=409, detail="当前已有一轮任务在运行，请稍后再试")
+        return result
     monitor_state["running"] = True
     monitor_state["current_stage"] = "清理过期素材"
     monitor_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
@@ -252,41 +355,26 @@ async def run_material_monitor_once() -> dict[str, Any]:
         monitor_state["current_stage"] = "等待消费素材"
         consume_results: list[dict[str, Any]] = []
         if settings.auto_consume_materials:
-            materials = db.list_material_items(
+            queue_candidates = db.list_material_items(
                 status="new",
                 tag_status="accepted",
-                limit=settings.material_consume_batch_size,
+                limit=max(settings.material_consume_batch_size * 5, 10),
             )
-            if materials:
+            if queue_candidates:
                 services = await asyncio.to_thread(build_services)
-                for material in materials:
+                queue_cursor = int(monitor_state.get("account_queue_cursor") or 0)
+                queue_runs = await asyncio.to_thread(
+                    services.operator.run_pending_material_queue,
+                    limit_per_account=1,
+                    account_offset=queue_cursor,
+                    max_total_runs=max(1, settings.material_consume_batch_size),
+                )
+                monitor_state["account_queue_cursor"] = queue_cursor + 1
+                for item in queue_runs:
                     monitor_state["current_stage"] = (
-                        f"消费素材 material#{material['id']}"
+                        f"账号 {item.get('account_key') or '-'} 消费素材 material#{item['material_item_id']}"
                     )
-                    runs = await asyncio.to_thread(
-                        services.operator.run_material_item_for_all_accounts,
-                        material["id"],
-                    )
-                    consume_results.append(
-                        {
-                            "material_item_id": material["id"],
-                            "title": material.get("title"),
-                            "runs": [
-                                {
-                                    "account_key": run.account_key,
-                                    "approved_generated_id": run.approved_generated_id,
-                                    "error": run.error,
-                                    "publish_success": run.publish_result.success
-                                    if run.publish_result
-                                    else None,
-                                    "publish_result": run.publish_result.result
-                                    if run.publish_result
-                                    else None,
-                                }
-                                for run in runs
-                            ],
-                        }
-                    )
+                    consume_results.append(_serialize_consume_result(item))
                     monitor_state["last_consume_results"] = consume_results
         monitor_state.update(
             {
@@ -307,6 +395,10 @@ async def run_material_monitor_once() -> dict[str, Any]:
         monitor_state["last_error"] = str(exc)
         raise
     finally:
+        try:
+            db.release_job_lock(MONITOR_LOCK_NAME, owner_id=lock_owner)
+        except Exception:
+            pass
         monitor_state["running"] = False
         if monitor_state.get("next_run_reason") != "paused_after_failures":
             monitor_state["current_stage"] = None
@@ -331,6 +423,9 @@ async def material_monitor_loop() -> None:
             if not latest_settings.auto_monitor_enabled:
                 delay_seconds = _paused_monitor_delay(latest_settings)
                 reason = monitor_state.get("next_run_reason") or "paused"
+            elif result.get("skipped") and result.get("reason") == "locked":
+                delay_seconds = _paused_monitor_delay(latest_settings)
+                reason = "locked"
             else:
                 delay_seconds, reason = _next_monitor_delay(settings, result)
         except Exception:
@@ -347,6 +442,16 @@ async def lifespan(app_: FastAPI):
     try:
         yield
     finally:
+        for session in list(cookie_login_sessions.values()):
+            try:
+                session["browser"].close()
+            except Exception:
+                pass
+            try:
+                session["playwright"].stop()
+            except Exception:
+                pass
+        cookie_login_sessions.clear()
         task.cancel()
         try:
             await task
@@ -365,6 +470,16 @@ class AccountPayload(BaseModel):
     proxy_url: str | None = None
     mcp_url: str | None = None
     mcp_auth_token: str | None = None
+
+
+class AccountCookieImportStartPayload(BaseModel):
+    account_key: str = Field(min_length=1)
+    name: str | None = None
+    login_url: str | None = None
+
+
+class AccountCookieImportFinishPayload(BaseModel):
+    session_id: str = Field(min_length=1)
 
 
 class RunPayload(BaseModel):
@@ -485,6 +600,8 @@ def _account_from_row(row: dict[str, Any]) -> AccountConfig:
         proxy_url=row.get("proxy_url") or "",
         mcp_url=row.get("mcp_url") or "",
         mcp_auth_token=row.get("mcp_auth_token") or "",
+        check_status=row.get("check_status") or "unchecked",
+        enabled=bool(row.get("enabled", 1)),
     )
 
 
@@ -728,6 +845,124 @@ def save_account(payload: AccountPayload) -> dict:
     return {"ok": True}
 
 
+def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str:
+    filtered = []
+    for cookie in cookies:
+        domain = (cookie.get("domain") or "").lstrip(".")
+        if not domain.endswith("binance.com"):
+            continue
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+        filtered.append((str(name), str(value)))
+    filtered.sort(key=lambda item: item[0].lower())
+    return "; ".join(f"{name}={value}" for name, value in filtered)
+
+
+@app.post("/api/accounts/import-cookie/start")
+def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
+    key = payload.account_key.strip()
+    name = (payload.name or key).strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="账号标识必填")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Playwright 不可用: {exc}") from exc
+
+    session_id = uuid4().hex
+    login_url = payload.login_url or "https://www.binance.com/zh-CN/login"
+    playwright = None
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=False)
+        context = browser.new_context(locale="zh-CN")
+        page = context.new_page()
+        page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
+    except Exception as exc:
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"打开登录窗口失败: {exc}") from exc
+
+    cookie_login_sessions[session_id] = {
+        "account_key": key,
+        "name": name,
+        "playwright": playwright,
+        "browser": browser,
+        "context": context,
+        "page": page,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "message": "登录窗口已打开。请在弹出的窗口里完成 Binance 登录后，回到本页点击完成导入。",
+    }
+
+
+@app.post("/api/accounts/import-cookie/finish")
+def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
+    session = cookie_login_sessions.pop(payload.session_id, None)
+    if not session:
+        raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
+
+    browser = session["browser"]
+    context = session["context"]
+    playwright = session["playwright"]
+    try:
+        cookies = context.cookies(["https://www.binance.com", "https://accounts.binance.com"])
+        cookie_header = _cookie_header_from_playwright_cookies(cookies)
+        if not cookie_header:
+            raise HTTPException(
+                status_code=400,
+                detail="未读取到 Binance Cookie。请确认已在弹出的窗口里完成登录。",
+            )
+        get_db().upsert_account(
+            account_key=session["account_key"],
+            name=session["name"],
+            cookie=cookie_header,
+        )
+        return {
+            "ok": True,
+            "account_key": session["account_key"],
+            "cookie_length": len(cookie_header),
+            "cookie_names": [
+                item["name"]
+                for item in BinanceAccountChecker._parse_cookie_header(cookie_header)
+            ],
+        }
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+
+
+@app.post("/api/accounts/import-cookie/cancel")
+def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
+    session = cookie_login_sessions.pop(payload.session_id, None)
+    if not session:
+        return {"ok": True}
+    try:
+        session["browser"].close()
+    except Exception:
+        pass
+    try:
+        session["playwright"].stop()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
 @app.delete("/api/accounts/{account_key}")
 def delete_account(account_key: str) -> dict:
     get_db().disable_account(account_key)
@@ -802,33 +1037,21 @@ def mcp_tools() -> dict:
 @app.post("/api/run")
 def run(payload: RunPayload) -> dict:
     services = build_services()
-    accounts = [_account_from_row(row) for row in services.db.list_accounts()]
-    if not accounts:
-        raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
-    services.operator.accounts = tuple(accounts)
-    services.operator.auto_publish = payload.auto_publish
-    runs = services.operator.generate_for_all_accounts(
-        content=payload.content,
-        title=payload.title,
-        url=payload.url,
-    )
-    return {
-        "runs": [
-            {
-                "account_key": run.account_key,
-                "generated_ids": run.generated_ids,
-                "approved_generated_id": run.approved_generated_id,
-                "error": run.error,
-                "publish_result": {
-                    "success": run.publish_result.success,
-                    "result": run.publish_result.result,
-                }
-                if run.publish_result
-                else None,
-            }
-            for run in runs
-        ]
-    }
+    owner_id = _acquire_pipeline_lock_or_raise(services.db)
+    try:
+        accounts = [_account_from_row(row) for row in services.db.list_accounts()]
+        if not accounts:
+            raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
+        services.operator.accounts = tuple(accounts)
+        services.operator.auto_publish = payload.auto_publish
+        runs = services.operator.generate_for_all_accounts(
+            content=payload.content,
+            title=payload.title,
+            url=payload.url,
+        )
+        return {"runs": [_serialize_account_run(run) for run in runs]}
+    finally:
+        services.db.release_job_lock(MONITOR_LOCK_NAME, owner_id=owner_id)
 
 
 @app.get("/api/material-sources")
@@ -857,7 +1080,7 @@ def delete_material_source(source_id: int) -> dict:
 
 @app.post("/api/material-sources/check")
 async def check_material_sources() -> dict:
-    return await run_material_monitor_once()
+    return await run_material_monitor_once(fail_if_locked=True)
 
 
 @app.post("/api/material-sources/{source_id}/check")
@@ -875,6 +1098,346 @@ def check_material_source(source_id: int) -> dict:
 @app.get("/api/material-items")
 def list_material_items(status: str | None = "new", limit: int = 50) -> list[dict]:
     return get_db().list_material_items(status=status, limit=limit)
+
+
+@app.get("/api/history/publishes")
+def list_publish_history(
+    limit: int = 100,
+    account_key: str | None = None,
+    status: str | None = None,
+) -> list[dict]:
+    rows = get_db().list_publish_history(
+        limit=max(1, min(limit, 300)),
+        account_key=account_key.strip() if account_key else None,
+        status=status.strip() if status else None,
+    )
+    result = []
+    for row in rows:
+        payload = None
+        raw_payload = row.get("publish_json")
+        if isinstance(raw_payload, str) and raw_payload.strip():
+            try:
+                payload = json.loads(raw_payload)
+            except ValueError:
+                payload = raw_payload
+        result.append(
+            {
+                "material_item_id": row["material_item_id"],
+                "account_key": row["account_key"],
+                "account_name": row.get("account_name") or row["account_key"],
+                "account_check_status": row.get("account_check_status"),
+                "status": row["status"],
+                "generated_id": row.get("generated_id"),
+                "attempt_count": int(row.get("attempt_count") or 0),
+                "published_at": row.get("published_at"),
+                "last_attempted_at": row.get("last_attempted_at"),
+                "last_activity_at": row.get("published_at")
+                or row.get("last_attempted_at")
+                or row.get("updated_at"),
+                "error": row.get("error"),
+                "publish_result": payload,
+                "material_title": row.get("material_title"),
+                "material_content": row.get("material_content"),
+                "material_url": row.get("material_url"),
+                "source_name": row.get("source_name"),
+                "source_type": row.get("source_type"),
+                "source_created_at": row.get("source_created_at"),
+                "generated_content": row.get("generated_content"),
+                "generated_publish_status": row.get("generated_publish_status"),
+                "generated_published_at": row.get("generated_published_at"),
+            }
+        )
+    return result
+
+
+@app.get("/api/history/accounts")
+def publish_account_summaries() -> list[dict]:
+    rows = get_db().publish_account_summaries()
+    return [
+        {
+            "account_key": row["account_key"],
+            "name": row["name"],
+            "enabled": bool(row["enabled"]),
+            "check_status": row.get("check_status"),
+            "checked_at": row.get("checked_at"),
+            "published_count": int(row.get("published_count") or 0),
+            "failed_count": int(row.get("failed_count") or 0),
+            "skipped_count": int(row.get("skipped_count") or 0),
+            "last_published_at": row.get("last_published_at"),
+            "last_activity_at": row.get("last_activity_at"),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/performance/accounts")
+def account_performance_dashboard(days: int = 7) -> dict:
+    window_days = max(1, min(int(days), 365))
+    db = get_db()
+    history = db.list_publish_history(limit=5000, days=window_days)
+    accounts = [_account_from_row(row) for row in db.list_accounts()]
+
+    account_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    daily_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    source_counts: dict[tuple[str, str | None], Counter[str]] = defaultdict(Counter)
+
+    total_published = 0
+    total_failed = 0
+    total_skipped = 0
+    attempt_sum = 0
+    attempt_samples = 0
+
+    for row in history:
+        account_key = str(row["account_key"])
+        account_rows[account_key].append(row)
+        status = str(row.get("status") or "")
+        event_at = (
+            row.get("published_at")
+            or row.get("last_attempted_at")
+            or row.get("updated_at")
+        )
+        if event_at:
+            daily_counts[str(event_at)[:10]][status] += 1
+        source_key = (
+            str(row.get("source_name") or row.get("source_type") or "未知来源"),
+            str(row.get("source_type") or "") or None,
+        )
+        source_counts[source_key][status] += 1
+        if status == "published":
+            total_published += 1
+        elif status == "failed":
+            total_failed += 1
+        elif status == "skipped":
+            total_skipped += 1
+        attempts = int(row.get("attempt_count") or 0)
+        if attempts > 0:
+            attempt_sum += attempts
+            attempt_samples += 1
+
+    now = datetime.now(timezone.utc).date()
+    daily = []
+    for offset in range(window_days - 1, -1, -1):
+        day = (now - timedelta(days=offset)).isoformat()
+        counts = daily_counts.get(day) or Counter()
+        published_count = int(counts.get("published", 0))
+        failed_count = int(counts.get("failed", 0))
+        skipped_count = int(counts.get("skipped", 0))
+        daily.append(
+            {
+                "date": day,
+                "published_count": published_count,
+                "failed_count": failed_count,
+                "skipped_count": skipped_count,
+                "total_count": published_count + failed_count + skipped_count,
+            }
+        )
+
+    account_metrics = []
+    issues = []
+    publishing_accounts = 0
+    invalid_accounts = 0
+    idle_accounts = 0
+    limited_accounts = 0
+
+    for account in accounts:
+        rows = account_rows.get(account.key, [])
+        published_count = sum(1 for row in rows if row.get("status") == "published")
+        failed_count = sum(1 for row in rows if row.get("status") == "failed")
+        skipped_count = sum(1 for row in rows if row.get("status") == "skipped")
+        total_runs = len(rows)
+        total_attempted = published_count + failed_count
+        success_rate = _round_percent(published_count, total_attempted)
+        avg_attempt_count = round(
+            sum(int(row.get("attempt_count") or 0) for row in rows) / total_runs,
+            2,
+        ) if total_runs else 0.0
+        active_days = len(
+            {
+                str(
+                    row.get("published_at")
+                    or row.get("last_attempted_at")
+                    or row.get("updated_at")
+                    or ""
+                )[:10]
+                for row in rows
+                if (
+                    row.get("published_at")
+                    or row.get("last_attempted_at")
+                    or row.get("updated_at")
+                )
+            }
+        )
+        last_published_at = _max_iso([row.get("published_at") for row in rows])
+        last_activity_at = _max_iso(
+            [
+                row.get("published_at")
+                or row.get("last_attempted_at")
+                or row.get("updated_at")
+                for row in rows
+            ]
+        )
+        source_counter = Counter(
+            (
+                str(row.get("source_name") or row.get("source_type") or "未知来源"),
+                str(row.get("source_type") or "") or None,
+            )
+            for row in rows
+            if row.get("status") == "published"
+        )
+        top_source_name = None
+        top_source_type = None
+        top_source_count = 0
+        if source_counter:
+            (top_source_name, top_source_type), top_source_count = source_counter.most_common(1)[0]
+
+        health_label, health_tone = _account_health(
+            check_status=account.check_status,
+            published_count=published_count,
+            failed_count=failed_count,
+            skipped_count=skipped_count,
+        )
+
+        issue: dict[str, Any] | None = None
+        if account.check_status == "invalid":
+            invalid_accounts += 1
+            issue = {
+                "account_key": account.key,
+                "name": account.name,
+                "severity": "high",
+                "severity_label": "高",
+                "reason": "账号检测失效，建议先更新 Cookie",
+            }
+        elif total_runs and published_count == 0:
+            issue = {
+                "account_key": account.key,
+                "name": account.name,
+                "severity": "medium",
+                "severity_label": "中",
+                "reason": f"近 {window_days} 天有运行但没有成功发文",
+            }
+        elif total_attempted >= 3 and success_rate < 40:
+            issue = {
+                "account_key": account.key,
+                "name": account.name,
+                "severity": "high",
+                "severity_label": "高",
+                "reason": f"近 {window_days} 天成功率只有 {success_rate}%",
+            }
+        elif skipped_count >= max(3, published_count + 1):
+            limited_accounts += 1
+            issue = {
+                "account_key": account.key,
+                "name": account.name,
+                "severity": "medium",
+                "severity_label": "中",
+                "reason": f"近 {window_days} 天被跳过 {skipped_count} 次，建议检查 Cookie / 策略限制",
+            }
+        elif total_runs == 0:
+            issue = {
+                "account_key": account.key,
+                "name": account.name,
+                "severity": "low",
+                "severity_label": "低",
+                "reason": f"近 {window_days} 天暂无活跃记录",
+            }
+
+        if published_count > 0:
+            publishing_accounts += 1
+        elif total_runs == 0:
+            idle_accounts += 1
+
+        if issue:
+            issues.append(issue)
+
+        account_metrics.append(
+            {
+                "account_key": account.key,
+                "name": account.name,
+                "check_status": account.check_status,
+                "published_count": published_count,
+                "failed_count": failed_count,
+                "skipped_count": skipped_count,
+                "total_runs": total_runs,
+                "total_attempted": total_attempted,
+                "success_rate": success_rate,
+                "avg_attempt_count": avg_attempt_count,
+                "active_days": active_days,
+                "last_published_at": last_published_at,
+                "last_activity_at": last_activity_at,
+                "top_source_name": top_source_name,
+                "top_source_type": top_source_type,
+                "top_source_count": top_source_count,
+                "health_label": health_label,
+                "health_tone": health_tone,
+                "issue_reason": issue["reason"] if issue else None,
+            }
+        )
+
+    sources = []
+    for (source_name, source_type), counts in source_counts.items():
+        published_count = int(counts.get("published", 0))
+        failed_count = int(counts.get("failed", 0))
+        skipped_count = int(counts.get("skipped", 0))
+        sources.append(
+            {
+                "source_name": source_name,
+                "source_type": source_type,
+                "published_count": published_count,
+                "failed_count": failed_count,
+                "skipped_count": skipped_count,
+                "success_rate": _round_percent(
+                    published_count,
+                    published_count + failed_count,
+                ),
+            }
+        )
+    sources.sort(
+        key=lambda item: (
+            -int(item["published_count"]),
+            -float(item["success_rate"]),
+            str(item["source_name"]),
+        )
+    )
+
+    issues.sort(
+        key=lambda item: (
+            {"high": 0, "medium": 1, "low": 2}.get(str(item["severity"]), 3),
+            str(item["account_key"]),
+        )
+    )
+    account_metrics.sort(
+        key=lambda item: (
+            -int(item["published_count"]),
+            -float(item["success_rate"]),
+            str(item["account_key"]),
+        )
+    )
+
+    return {
+        "period_days": window_days,
+        "summary": {
+            "active_accounts": len(accounts),
+            "publishing_accounts": publishing_accounts,
+            "idle_accounts": idle_accounts,
+            "invalid_accounts": invalid_accounts,
+            "limited_accounts": limited_accounts,
+            "total_published": total_published,
+            "total_failed": total_failed,
+            "total_skipped": total_skipped,
+            "success_rate": _round_percent(
+                total_published,
+                total_published + total_failed,
+            ),
+            "avg_attempt_count": round(
+                attempt_sum / attempt_samples,
+                2,
+            ) if attempt_samples else 0.0,
+        },
+        "daily": daily,
+        "accounts": account_metrics,
+        "issues": issues[:8],
+        "sources": sources[:10],
+    }
 
 
 @app.get("/api/material-monitor")
@@ -916,26 +1479,14 @@ def set_material_monitor_enabled(payload: MonitorEnabledPayload) -> dict:
 @app.post("/api/material-items/run")
 def run_material_item(payload: RunMaterialPayload) -> dict:
     services = build_services()
-    accounts = [_account_from_row(row) for row in services.db.list_accounts()]
-    if not accounts:
-        raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
-    services.operator.accounts = tuple(accounts)
-    services.operator.auto_publish = payload.auto_publish
-    runs = services.operator.run_material_item_for_all_accounts(payload.material_item_id)
-    return {
-        "runs": [
-            {
-                "account_key": run.account_key,
-                "generated_ids": run.generated_ids,
-                "approved_generated_id": run.approved_generated_id,
-                "error": run.error,
-                "publish_result": {
-                    "success": run.publish_result.success,
-                    "result": run.publish_result.result,
-                }
-                if run.publish_result
-                else None,
-            }
-            for run in runs
-        ]
-    }
+    owner_id = _acquire_pipeline_lock_or_raise(services.db)
+    try:
+        accounts = [_account_from_row(row) for row in services.db.list_accounts()]
+        if not accounts:
+            raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
+        services.operator.accounts = tuple(accounts)
+        services.operator.auto_publish = payload.auto_publish
+        runs = services.operator.run_material_item_for_all_accounts(payload.material_item_id)
+        return {"runs": [_serialize_account_run(run) for run in runs]}
+    finally:
+        services.db.release_job_lock(MONITOR_LOCK_NAME, owner_id=owner_id)
