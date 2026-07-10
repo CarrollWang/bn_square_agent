@@ -201,9 +201,12 @@ export interface Settings {
   llm_base_url: string;
   llm_model: string;
   llm_model_options: string[];
-  dashscope_api_key_configured: boolean;
-  dashscope_api_key_masked: string;
-  dashscope_embedding_model: string;
+  embedding_provider: "openai" | "dashscope";
+  embedding_api_key_configured: boolean;
+  embedding_api_key_masked: string;
+  embedding_uses_llm_credentials: boolean;
+  embedding_base_url: string;
+  embedding_model: string;
   mcp_url: string;
   mcp_publish_tool: string;
   mcp_auth_token_configured: boolean;

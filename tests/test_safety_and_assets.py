@@ -43,6 +43,32 @@ class MaterialTaggerTests(unittest.TestCase):
         self.assertEqual(tag.symbol, "BTCUSDT")
         self.assertEqual(tag.direction, "long")
 
+    def test_rejects_material_without_explicit_direction(self) -> None:
+        tag = MaterialTagger().tag(
+            title="BitFuFu 6 月产出 125 枚 BTC",
+            content="公司公布最新运营数据和比特币持仓量。",
+        )
+        self.assertFalse(tag.accepted)
+        self.assertEqual(tag.symbol, "BTCUSDT")
+        self.assertEqual(tag.direction, "unknown")
+        self.assertIn("missing_direction", tag.reasons)
+
+    def test_supports_direction_variants_and_rejects_conflicts(self) -> None:
+        short_tag = MaterialTagger().tag(
+            title="ETH 偏空",
+            content="反弹做空，继续关注上方压力。",
+        )
+        self.assertTrue(short_tag.accepted)
+        self.assertEqual(short_tag.direction, "short")
+
+        conflict_tag = MaterialTagger().tag(
+            title="BTC 多空都有机会",
+            content="多头等待突破，空头关注跌破。",
+        )
+        self.assertFalse(conflict_tag.accepted)
+        self.assertEqual(conflict_tag.direction, "unknown")
+        self.assertIn("conflicting_direction", conflict_tag.reasons)
+
 
 class StaticAssetTests(unittest.TestCase):
     def test_vite_asset_prefix_is_mounted_by_fastapi(self) -> None:

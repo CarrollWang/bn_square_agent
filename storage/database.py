@@ -17,7 +17,13 @@ ACCOUNT_SECRET_COLUMNS = frozenset(
     {"cookie", "proxy_url", "mcp_auth_token", "signature_key"}
 )
 SECRET_APP_SETTING_KEYS = frozenset(
-    {"LLM_API_KEY", "DASHSCOPE_API_KEY", "MCP_AUTH_TOKEN", "SMTP_PASSWORD"}
+    {
+        "LLM_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "EMBEDDING_API_KEY",
+        "MCP_AUTH_TOKEN",
+        "SMTP_PASSWORD",
+    }
 )
 
 
@@ -643,8 +649,36 @@ class Database:
                 (status, error, utc_now(), item_id),
             )
 
-    def pending_material_items_for_tagging(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        return self.list_material_items(status="new", tag_status="pending", limit=limit)
+    def pending_material_items_for_tagging(
+        self,
+        *,
+        limit: int = 50,
+        strategy: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not strategy:
+            return self.list_material_items(
+                status="new",
+                tag_status="pending",
+                limit=limit,
+            )
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT i.*, s.name AS source_name, s.source_type
+                FROM material_items i
+                LEFT JOIN material_sources s ON s.id = i.source_id
+                WHERE i.status = 'new'
+                    AND (
+                        i.tag_status = 'pending'
+                        OR i.tag_json IS NULL
+                        OR i.tag_json NOT LIKE ?
+                    )
+                ORDER BY i.created_at DESC, i.id DESC
+                LIMIT ?
+                """,
+                (f'%"strategy": "{strategy}"%', limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_material_account_run(
         self,
@@ -697,6 +731,10 @@ class Database:
                     ON r.material_item_id = i.id AND r.account_key = ?
                 WHERE i.status = 'new'
                     AND i.tag_status = 'accepted'
+                    AND (
+                        i.tag_json LIKE '%"direction": "long"%'
+                        OR i.tag_json LIKE '%"direction": "short"%'
+                    )
                     AND (
                         r.status IS NULL
                         OR (

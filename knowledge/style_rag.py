@@ -1,27 +1,78 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+import httpx
+from openai import OpenAI
 
 from ..core.config import Settings, add_no_proxy_host
 
 
+class OpenAICompatibleEmbeddings:
+    def __init__(self, *, api_key: str, base_url: str, model: str):
+        self.model = model
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=45.0,
+            max_retries=1,
+            http_client=httpx.Client(timeout=45.0, trust_env=False),
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        response = self.client.embeddings.create(model=self.model, input=texts)
+        return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+
+def create_embeddings(settings: Settings):
+    settings.validate_for_rag()
+    if settings.embedding_provider == "dashscope":
+        add_no_proxy_host("dashscope.aliyuncs.com")
+        from langchain_community.embeddings import DashScopeEmbeddings
+
+        return DashScopeEmbeddings(
+            model=settings.embedding_model,
+            dashscope_api_key=settings.resolved_embedding_api_key(),
+        )
+
+    base_url = settings.resolved_embedding_base_url()
+    host = urlsplit(base_url).hostname
+    if host:
+        add_no_proxy_host(host)
+    return OpenAICompatibleEmbeddings(
+        api_key=settings.resolved_embedding_api_key(),
+        base_url=base_url,
+        model=settings.embedding_model,
+    )
+
+
 class StyleRAG:
-    COLLECTION_NAME = "reference_post_summaries"
+    COLLECTION_PREFIX = "reference_post_summaries"
 
     def __init__(self, settings: Settings):
         settings.validate_for_rag()
-        add_no_proxy_host("dashscope.aliyuncs.com")
         import chromadb
-        from langchain_community.embeddings import DashScopeEmbeddings
 
         Path(settings.chroma_path).mkdir(parents=True, exist_ok=True)
         self.client = chromadb.PersistentClient(path=str(settings.chroma_path))
-        self.embeddings = DashScopeEmbeddings(
-            model=settings.dashscope_embedding_model,
-            dashscope_api_key=settings.dashscope_api_key,
+        self.embeddings = create_embeddings(settings)
+        identity = hashlib.sha256(
+            (
+                f"{settings.embedding_provider}|{settings.embedding_model}|"
+                f"{settings.resolved_embedding_base_url()}"
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        self.collection = self.client.get_or_create_collection(
+            f"{self.COLLECTION_PREFIX}_{identity}"
         )
-        self.collection = self.client.get_or_create_collection(self.COLLECTION_NAME)
 
     def rebuild(self, records: list[dict[str, Any]], account_key: str = "default") -> None:
         if not records:

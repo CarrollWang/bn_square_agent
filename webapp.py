@@ -28,10 +28,10 @@ from .ai.material_tagger import MaterialTagger
 from .core.config import (
     AccountConfig,
     Settings,
-    add_no_proxy_host,
     mask_url_credentials,
     normalize_proxy_url,
 )
+from .knowledge.style_rag import create_embeddings
 from .publishing.account_check import BinanceAccountChecker
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
@@ -387,7 +387,10 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         monitor_state["current_stage"] = "素材打标"
         tag_results: list[dict[str, Any]] = []
         tagger = MaterialTagger()
-        for material in db.pending_material_items_for_tagging(limit=100):
+        for material in db.pending_material_items_for_tagging(
+            limit=100,
+            strategy=MaterialTagger.STRATEGY,
+        ):
             try:
                 tag = tagger.tag(
                     title=material.get("title"),
@@ -639,8 +642,10 @@ class SettingsPayload(BaseModel):
     llm_api_key: str | None = Field(default=None, max_length=8_192)
     llm_base_url: str | None = Field(default=None, max_length=2_048)
     llm_model: str | None = Field(default=None, max_length=200)
-    dashscope_api_key: str | None = Field(default=None, max_length=8_192)
-    dashscope_embedding_model: str | None = Field(default=None, max_length=200)
+    embedding_provider: str | None = Field(default=None, max_length=40)
+    embedding_api_key: str | None = Field(default=None, max_length=8_192)
+    embedding_base_url: str | None = Field(default=None, max_length=2_048)
+    embedding_model: str | None = Field(default=None, max_length=200)
     mcp_url: str | None = Field(default=None, max_length=2_048)
     mcp_publish_tool: str | None = Field(default=None, max_length=200)
     mcp_auth_token: str | None = Field(default=None, max_length=8_192)
@@ -824,9 +829,16 @@ def read_settings() -> dict:
         "llm_base_url": settings.llm_base_url,
         "llm_model": settings.llm_model,
         "llm_model_options": [settings.llm_model] if settings.llm_model else [],
-        "dashscope_api_key_configured": bool(settings.dashscope_api_key),
-        "dashscope_api_key_masked": mask_secret(settings.dashscope_api_key),
-        "dashscope_embedding_model": settings.dashscope_embedding_model,
+        "embedding_provider": settings.embedding_provider,
+        "embedding_api_key_configured": bool(settings.resolved_embedding_api_key()),
+        "embedding_api_key_masked": mask_secret(settings.embedding_api_key),
+        "embedding_uses_llm_credentials": bool(
+            settings.embedding_provider == "openai"
+            and not settings.embedding_api_key
+            and settings.llm_api_key
+        ),
+        "embedding_base_url": settings.embedding_base_url,
+        "embedding_model": settings.embedding_model,
         "mcp_url": settings.mcp_url,
         "mcp_publish_tool": settings.mcp_publish_tool,
         "mcp_auth_token_configured": bool(settings.mcp_auth_token),
@@ -858,7 +870,9 @@ def save_settings(payload: SettingsPayload) -> dict:
     normal_fields = {
         "llm_base_url": "LLM_BASE_URL",
         "llm_model": "LLM_MODEL",
-        "dashscope_embedding_model": "DASHSCOPE_EMBEDDING_MODEL",
+        "embedding_provider": "EMBEDDING_PROVIDER",
+        "embedding_base_url": "EMBEDDING_BASE_URL",
+        "embedding_model": "EMBEDDING_MODEL",
         "mcp_url": "MCP_URL",
         "mcp_publish_tool": "MCP_PUBLISH_TOOL",
         "alert_email_to": "ALERT_EMAIL_TO",
@@ -868,7 +882,7 @@ def save_settings(payload: SettingsPayload) -> dict:
     }
     secret_fields = {
         "llm_api_key": "LLM_API_KEY",
-        "dashscope_api_key": "DASHSCOPE_API_KEY",
+        "embedding_api_key": "EMBEDDING_API_KEY",
         "mcp_auth_token": "MCP_AUTH_TOKEN",
         "smtp_password": "SMTP_PASSWORD",
     }
@@ -943,19 +957,14 @@ def test_embedding() -> dict:
     settings = get_settings()
     try:
         settings.validate_for_rag()
-        add_no_proxy_host("dashscope.aliyuncs.com")
-        from langchain_community.embeddings import DashScopeEmbeddings
-
-        embeddings = DashScopeEmbeddings(
-            model=settings.dashscope_embedding_model,
-            dashscope_api_key=settings.dashscope_api_key,
-        )
+        embeddings = create_embeddings(settings)
         vector = embeddings.embed_query("embedding 连接测试")
         return {
             "ok": True,
             "message": "Embedding 连接正常",
             "dimension": len(vector),
-            "model": settings.dashscope_embedding_model,
+            "provider": settings.embedding_provider,
+            "model": settings.embedding_model,
         }
     except Exception as exc:
         return {"ok": False, "message": str(exc)}

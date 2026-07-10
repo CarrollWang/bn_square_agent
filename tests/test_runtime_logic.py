@@ -93,7 +93,23 @@ class DatabaseRuntimeTests(unittest.TestCase):
             first.save_material_tag(
                 material_id,
                 tag_status="accepted",
-                tag={"symbol": "BTCUSDT"},
+                tag={"symbol": "BTCUSDT", "direction": "unknown"},
+            )
+            self.assertEqual(first.list_material_queue_for_account("test"), [])
+            self.assertEqual(
+                first.pending_material_items_for_tagging(
+                    strategy="directional_v1",
+                )[0]["id"],
+                material_id,
+            )
+            first.save_material_tag(
+                material_id,
+                tag_status="accepted",
+                tag={
+                    "symbol": "BTCUSDT",
+                    "direction": "long",
+                    "strategy": "directional_v1",
+                },
             )
             first.save_material_account_run(
                 material_id,

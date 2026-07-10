@@ -35,12 +35,23 @@
               </el-select>
             </el-space>
           </el-form-item>
-          <el-form-item label="DashScope API Key" class="wide">
-            <el-input v-model="form.dashscope_api_key" placeholder="已保存时显示加密掩码；输入新 key 可覆盖" />
-            <div class="muted">当前：{{ settings?.dashscope_api_key_masked || "未保存" }}</div>
+          <el-form-item label="Embedding 服务">
+            <el-select v-model="form.embedding_provider" style="width: 100%" @change="onEmbeddingProviderChange">
+              <el-option label="OpenAI 兼容（智谱等）" value="openai" />
+              <el-option label="阿里云百炼 DashScope" value="dashscope" />
+            </el-select>
           </el-form-item>
           <el-form-item label="Embedding Model">
-            <el-input v-model="form.dashscope_embedding_model" placeholder="text-embedding-v3" />
+            <el-input v-model="form.embedding_model" :placeholder="form.embedding_provider === 'dashscope' ? 'text-embedding-v3' : 'embedding-3'" />
+          </el-form-item>
+          <el-form-item label="Embedding API Key" class="wide">
+            <el-input v-model="form.embedding_api_key" placeholder="OpenAI 兼容模式留空可复用 LLM API Key" />
+            <div class="muted">
+              当前：{{ settings?.embedding_api_key_masked || (settings?.embedding_uses_llm_credentials ? "复用 LLM API Key" : "未保存") }}
+            </div>
+          </el-form-item>
+          <el-form-item v-if="form.embedding_provider === 'openai'" label="Embedding Base URL" class="wide">
+            <el-input v-model="form.embedding_base_url" placeholder="留空可复用 LLM Base URL；智谱示例 https://open.bigmodel.cn/api/paas/v4/" />
           </el-form-item>
         </el-form>
       </el-tab-pane>
@@ -147,8 +158,10 @@ const form = reactive<Record<string, any>>({
   llm_api_key: "",
   llm_base_url: "",
   llm_model: "",
-  dashscope_api_key: "",
-  dashscope_embedding_model: "text-embedding-v3",
+  embedding_provider: "openai",
+  embedding_api_key: "",
+  embedding_base_url: "",
+  embedding_model: "embedding-3",
   mcp_url: "",
   mcp_publish_tool: "publish_binance_square",
   mcp_auth_token: "",
@@ -180,8 +193,10 @@ function applySettings(data: Settings) {
   form.llm_api_key = data.llm_api_key_masked || "";
   form.llm_base_url = data.llm_base_url || "";
   form.llm_model = data.llm_model || "";
-  form.dashscope_api_key = data.dashscope_api_key_masked || "";
-  form.dashscope_embedding_model = data.dashscope_embedding_model || "text-embedding-v3";
+  form.embedding_provider = data.embedding_provider || "openai";
+  form.embedding_api_key = data.embedding_api_key_masked || "";
+  form.embedding_base_url = data.embedding_base_url || "";
+  form.embedding_model = data.embedding_model || (form.embedding_provider === "dashscope" ? "text-embedding-v3" : "embedding-3");
   form.mcp_url = data.mcp_url || "";
   form.mcp_publish_tool = data.mcp_publish_tool || "publish_binance_square";
   form.mcp_auth_token = data.mcp_auth_token_masked || "";
@@ -214,9 +229,11 @@ function payload() {
     llm_api_key: form.llm_api_key && !isMasked(form.llm_api_key) ? form.llm_api_key : null,
     llm_base_url: form.llm_base_url,
     llm_model: form.llm_model,
-    dashscope_api_key:
-      form.dashscope_api_key && !isMasked(form.dashscope_api_key) ? form.dashscope_api_key : null,
-    dashscope_embedding_model: form.dashscope_embedding_model,
+    embedding_provider: form.embedding_provider,
+    embedding_api_key:
+      form.embedding_api_key && !isMasked(form.embedding_api_key) ? form.embedding_api_key : null,
+    embedding_base_url: form.embedding_base_url,
+    embedding_model: form.embedding_model,
     mcp_url: form.mcp_url,
     mcp_publish_tool: form.mcp_publish_tool,
     mcp_auth_token:
@@ -286,6 +303,15 @@ async function fetchModels() {
     ElMessage.success(`已获取 ${modelOptions.value.length} 个模型`);
   } finally {
     fetchingModels.value = false;
+  }
+}
+
+function onEmbeddingProviderChange(provider: string) {
+  if (provider === "openai" && form.embedding_model === "text-embedding-v3") {
+    form.embedding_model = "embedding-3";
+  }
+  if (provider === "dashscope" && form.embedding_model === "embedding-3") {
+    form.embedding_model = "text-embedding-v3";
   }
 }
 

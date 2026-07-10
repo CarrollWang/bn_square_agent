@@ -168,8 +168,10 @@ class Settings:
     llm_api_key: str
     llm_base_url: str
     llm_model: str
-    dashscope_api_key: str
-    dashscope_embedding_model: str
+    embedding_provider: str
+    embedding_api_key: str
+    embedding_base_url: str
+    embedding_model: str
     app_secret_key: str
     secret_key_path: Path
     database_path: Path
@@ -204,14 +206,32 @@ class Settings:
     def from_env(cls) -> "Settings":
         load_dotenv()
         publish_mode = os.getenv("PUBLISH_MODE", "auto").strip().lower()
+        legacy_dashscope_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+        embedding_provider = os.getenv("EMBEDDING_PROVIDER", "").strip().lower()
+        if not embedding_provider:
+            embedding_provider = "dashscope" if legacy_dashscope_key else "openai"
+        embedding_model = (
+            os.getenv("EMBEDDING_MODEL", "").strip()
+            or os.getenv("DASHSCOPE_EMBEDDING_MODEL", "").strip()
+            or (
+                "text-embedding-v3"
+                if embedding_provider == "dashscope"
+                else "embedding-3"
+            )
+        )
         return cls(
             llm_api_key=os.getenv("LLM_API_KEY", ""),
             llm_base_url=normalize_openai_base_url(os.getenv("LLM_BASE_URL", "")),
             llm_model=os.getenv("LLM_MODEL", ""),
-            dashscope_api_key=os.getenv("DASHSCOPE_API_KEY", ""),
-            dashscope_embedding_model=os.getenv(
-                "DASHSCOPE_EMBEDDING_MODEL", "text-embedding-v3"
+            embedding_provider=embedding_provider,
+            embedding_api_key=(
+                os.getenv("EMBEDDING_API_KEY", "").strip()
+                or legacy_dashscope_key
             ),
+            embedding_base_url=normalize_openai_base_url(
+                os.getenv("EMBEDDING_BASE_URL", "")
+            ),
+            embedding_model=embedding_model,
             app_secret_key=os.getenv("APP_SECRET_KEY", "").strip(),
             secret_key_path=_resolve_project_path(
                 os.getenv("SECRET_KEY_PATH", "./data/app_secret.key")
@@ -306,8 +326,31 @@ class Settings:
             raise ValueError(f"缺少配置: {', '.join(missing)}")
 
     def validate_for_rag(self) -> None:
-        if not self.dashscope_api_key:
-            raise ValueError("缺少配置: DASHSCOPE_API_KEY")
+        if self.embedding_provider not in {"dashscope", "openai"}:
+            raise ValueError("EMBEDDING_PROVIDER 只支持 dashscope 或 openai")
+        missing = []
+        if not self.resolved_embedding_api_key():
+            missing.append("EMBEDDING_API_KEY")
+        if self.embedding_provider == "openai" and not self.resolved_embedding_base_url():
+            missing.append("EMBEDDING_BASE_URL")
+        if not self.embedding_model:
+            missing.append("EMBEDDING_MODEL")
+        if missing:
+            raise ValueError(f"缺少配置: {', '.join(missing)}")
+
+    def resolved_embedding_api_key(self) -> str:
+        if self.embedding_api_key:
+            return self.embedding_api_key
+        if self.embedding_provider == "openai":
+            return self.llm_api_key
+        return ""
+
+    def resolved_embedding_base_url(self) -> str:
+        if self.embedding_base_url:
+            return self.embedding_base_url
+        if self.embedding_provider == "openai":
+            return self.llm_base_url
+        return ""
 
     def validate_for_publish(self) -> None:
         missing = [account.key for account in self.accounts if not account.cookie]
@@ -341,10 +384,25 @@ class Settings:
                 text("LLM_BASE_URL", self.llm_base_url)
             ),
             llm_model=text("LLM_MODEL", self.llm_model),
-            dashscope_api_key=text("DASHSCOPE_API_KEY", self.dashscope_api_key),
-            dashscope_embedding_model=text(
-                "DASHSCOPE_EMBEDDING_MODEL",
-                self.dashscope_embedding_model,
+            embedding_provider=text(
+                "EMBEDDING_PROVIDER",
+                (
+                    "dashscope"
+                    if "EMBEDDING_PROVIDER" not in values
+                    and values.get("DASHSCOPE_API_KEY")
+                    else self.embedding_provider
+                ),
+            ).lower(),
+            embedding_api_key=text(
+                "EMBEDDING_API_KEY",
+                text("DASHSCOPE_API_KEY", self.embedding_api_key),
+            ),
+            embedding_base_url=normalize_openai_base_url(
+                text("EMBEDDING_BASE_URL", self.embedding_base_url)
+            ),
+            embedding_model=text(
+                "EMBEDDING_MODEL",
+                text("DASHSCOPE_EMBEDDING_MODEL", self.embedding_model),
             ),
             mcp_url=text("MCP_URL", self.mcp_url),
             mcp_publish_tool=text("MCP_PUBLISH_TOOL", self.mcp_publish_tool),
