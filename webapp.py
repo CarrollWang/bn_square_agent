@@ -105,6 +105,11 @@ def _pop_cookie_login_session(session_id: str) -> dict[str, Any] | None:
         return cookie_login_sessions.pop(session_id, None)
 
 
+def _get_cookie_login_session(session_id: str) -> dict[str, Any] | None:
+    with cookie_login_sessions_lock:
+        return cookie_login_sessions.get(session_id)
+
+
 def _serialize_account_run(run: Any) -> dict[str, Any]:
     publish_result = getattr(run, "publish_result", None)
     return {
@@ -1152,14 +1157,13 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
 
 @app.post("/api/accounts/import-cookie/finish")
 def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
-    session = _pop_cookie_login_session(payload.session_id)
+    session = _get_cookie_login_session(payload.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
 
     browser = session["browser"]
     context = session["context"]
     page = session["page"]
-    playwright = session["playwright"]
     try:
         logged_in, login_error = _binance_login_status_from_page(page)
         if not logged_in:
@@ -1167,7 +1171,8 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
                 status_code=400,
                 detail=(
                     "Binance 登录态尚未生效。请确认登录窗口已显示账号头像并能打开广场后，"
-                    f"重新导入。{f' Binance 返回：{login_error}' if login_error else ''}"
+                    f"继续登录后再次点击完成导入。"
+                    f"{f' Binance 返回：{login_error}' if login_error else ''}"
                 ),
             )
         cookies = context.cookies([BINANCE_AUTH_URL])
@@ -1200,7 +1205,7 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
             signature_key=None,
             status="valid",
         )
-        return {
+        result = {
             "ok": True,
             "account_key": session["account_key"],
             "cookie_length": len(cookie_header),
@@ -1209,15 +1214,17 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
                 for item in BinanceAccountChecker._parse_cookie_header(cookie_header)
             ],
         }
-    finally:
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            playwright.stop()
-        except Exception:
-            pass
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"验证 Binance 登录状态失败: {exc}",
+        ) from exc
+
+    _pop_cookie_login_session(payload.session_id)
+    _close_cookie_login_session(session)
+    return result
 
 
 @app.post("/api/accounts/import-cookie/cancel")

@@ -217,6 +217,12 @@ async function finishCookieImport() {
     resetForm();
     await loadAccounts();
     ElMessage.success(`Cookie 已导入：${result.cookie_length} 字符`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Cookie 导入验证失败";
+    if (message.includes("导入会话不存在或已结束")) {
+      cookieImportSessionId.value = "";
+    }
+    ElMessage.error({ message, duration: 8000, showClose: true });
   } finally {
     finishingImport.value = false;
   }
