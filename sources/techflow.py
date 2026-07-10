@@ -9,6 +9,7 @@ from urllib.parse import urljoin
 
 import httpx
 
+from ..core.url_policy import validate_techflow_url
 from .models import MaterialArticle
 
 
@@ -26,7 +27,10 @@ class TechFlowNewsletterMonitor:
     @staticmethod
     def normalize_url(url: str | None) -> str:
         value = (url or "").strip()
-        return value or TECHFLOW_DEFAULT_URL
+        return validate_techflow_url(
+            value or TECHFLOW_DEFAULT_URL,
+            label="TechFlow 素材源",
+        )
 
     @staticmethod
     def _normalize_page_text(text: str) -> str:
@@ -72,7 +76,7 @@ class TechFlowNewsletterMonitor:
         target_url = self.normalize_url(url)
         with httpx.Client(
             timeout=self.timeout_seconds,
-            follow_redirects=True,
+            follow_redirects=False,
             trust_env=False,
             headers={
                 "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -84,10 +88,31 @@ class TechFlowNewsletterMonitor:
                 ),
             },
         ) as client:
-            response = client.get(target_url)
+            response = self._get_with_safe_redirects(client, target_url)
             response.raise_for_status()
             page_text = response.text
         return self._parse_articles(page_text)
+
+    @staticmethod
+    def _get_with_safe_redirects(
+        client: httpx.Client,
+        url: str,
+        *,
+        max_redirects: int = 5,
+    ) -> httpx.Response:
+        target = validate_techflow_url(url, label="TechFlow 素材源")
+        for _ in range(max_redirects + 1):
+            response = client.get(target)
+            if not response.is_redirect:
+                return response
+            location = response.headers.get("location")
+            if not location:
+                return response
+            target = validate_techflow_url(
+                urljoin(str(response.url), location),
+                label="TechFlow 重定向地址",
+            )
+        raise ValueError("TechFlow 重定向次数过多")
 
     def _parse_articles(self, page_text: str) -> list[MaterialArticle]:
         normalized = self._normalize_page_text(page_text)

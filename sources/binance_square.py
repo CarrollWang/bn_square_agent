@@ -5,6 +5,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from ..core.url_policy import validate_binance_url
 from ..storage.database import Database
 from .models import MaterialArticle
 from .techflow import TechFlowNewsletterMonitor
@@ -25,7 +26,8 @@ class BinanceSquareMonitor:
 
     @staticmethod
     def _username_from_url(url: str) -> str:
-        path = urlparse(url).path.rstrip("/")
+        validated = validate_binance_url(url, label="BN 广场作者主页")
+        path = urlparse(validated).path.rstrip("/")
         match = re.search(r"/square/profile/([^/]+)$", path, re.IGNORECASE)
         if not match:
             raise ValueError("素材源 URL 必须是 BN 广场作者主页，例如 /square/profile/xxx")

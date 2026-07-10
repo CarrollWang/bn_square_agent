@@ -19,10 +19,22 @@ class SecretStore:
 
     @classmethod
     def from_settings(cls, settings: "Settings") -> "SecretStore":
-        inline_key = settings.app_secret_key.strip()
+        return cls.from_values(
+            app_secret_key=settings.app_secret_key,
+            secret_key_path=settings.secret_key_path,
+        )
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        app_secret_key: str,
+        secret_key_path: Path,
+    ) -> "SecretStore":
+        inline_key = app_secret_key.strip()
         if inline_key:
             return cls._from_key(inline_key.encode("utf-8"), "env:APP_SECRET_KEY")
-        key_path = settings.secret_key_path
+        key_path = secret_key_path
         key_bytes = _load_or_create_key_file(key_path)
         return cls._from_key(key_bytes, f"file:{key_path}")
 

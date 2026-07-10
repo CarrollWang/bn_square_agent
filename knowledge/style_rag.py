@@ -24,10 +24,10 @@ class StyleRAG:
         self.collection = self.client.get_or_create_collection(self.COLLECTION_NAME)
 
     def rebuild(self, records: list[dict[str, Any]], account_key: str = "default") -> None:
-        existing = self.collection.get(where={"account_key": account_key})
-        if existing.get("ids"):
-            self.collection.delete(ids=existing["ids"])
         if not records:
+            existing = self.collection.get(where={"account_key": account_key})
+            if existing.get("ids"):
+                self.collection.delete(ids=existing["ids"])
             return
         documents = [record["analysis"]["summary"] for record in records]
         vectors = self.embeddings.embed_documents(documents)
@@ -43,12 +43,21 @@ class StyleRAG:
                     "stance": analysis.get("stance", ""),
                 }
             )
+        existing = self.collection.get(where={"account_key": account_key})
         self.collection.upsert(
             ids=[f"{account_key}:{record['post_id']}" for record in records],
             documents=documents,
             embeddings=vectors,
             metadatas=metadatas,
         )
+        new_ids = {f"{account_key}:{record['post_id']}" for record in records}
+        stale_ids = [
+            item_id
+            for item_id in existing.get("ids") or []
+            if item_id not in new_ids
+        ]
+        if stale_ids:
+            self.collection.delete(ids=stale_ids)
 
     def search(
         self,

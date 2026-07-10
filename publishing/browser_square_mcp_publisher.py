@@ -102,6 +102,7 @@ class BrowserBinanceSquarePublisher:
         *,
         cookie: str,
         content: str,
+        coins: str = "",
         image_base64: str = "",
         proxy_url: str = "",
     ) -> BrowserPublishResult:
@@ -109,6 +110,7 @@ class BrowserBinanceSquarePublisher:
             return BrowserPublishResult(False, "缺少 cookie")
         if not content.strip():
             return BrowserPublishResult(False, "缺少 content")
+        content = self._ensure_coin_reference(content, coins)
 
         diagnostics = PublishDiagnostics(
             attempt_id=f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}",
@@ -702,6 +704,16 @@ class BrowserBinanceSquarePublisher:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
             handle.write(binary)
             return Path(handle.name)
+
+    @staticmethod
+    def _ensure_coin_reference(content: str, coins: str) -> str:
+        raw = coins.strip()
+        if not raw or ":" not in raw:
+            return content
+        token = raw.split(":", 1)[0].strip().upper()
+        if not token or re.search(rf"\${re.escape(token)}\b", content, re.I):
+            return content
+        return f"{content.rstrip()}\n\n${token}"
 
     @staticmethod
     def masked_proxy(proxy_url: str) -> str:

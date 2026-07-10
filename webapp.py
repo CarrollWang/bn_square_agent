@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 import json
+import ipaddress
+import logging
+import secrets
 from pathlib import Path
 import smtplib
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field
@@ -31,13 +37,18 @@ from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
 from .sources.binance_square import MaterialSourceService
 from .storage.database import Database
+from .core.url_policy import validate_binance_url, validate_techflow_url
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DIST_DIR = PACKAGE_DIR / "dist"
-SOURCE_CHECK_TIMEOUT_SECONDS = 90
 MONITOR_LOCK_NAME = "material_monitor"
 MONITOR_LOCK_LEASE_SECONDS = 30 * 60
+MONITOR_LOCK_RENEW_SECONDS = 5 * 60
+MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+COOKIE_LOGIN_SESSION_TTL_SECONDS = 15 * 60
+MAX_COOKIE_LOGIN_SESSIONS = 2
+LOGGER = logging.getLogger(__name__)
 
 monitor_state: dict[str, Any] = {
     "running": False,
@@ -58,6 +69,40 @@ monitor_state: dict[str, Any] = {
     "account_queue_cursor": 0,
 }
 cookie_login_sessions: dict[str, dict[str, Any]] = {}
+cookie_login_sessions_lock = Lock()
+
+
+def _close_cookie_login_session(session: dict[str, Any]) -> None:
+    try:
+        session["browser"].close()
+    except Exception:
+        pass
+    try:
+        session["playwright"].stop()
+    except Exception:
+        pass
+
+
+def _cleanup_expired_cookie_login_sessions() -> int:
+    now = datetime.now(timezone.utc)
+    expired: list[dict[str, Any]] = []
+    with cookie_login_sessions_lock:
+        for session_id, session in list(cookie_login_sessions.items()):
+            try:
+                created_at = datetime.fromisoformat(str(session["created_at"]))
+            except (KeyError, TypeError, ValueError):
+                created_at = datetime.min.replace(tzinfo=timezone.utc)
+            if (now - created_at).total_seconds() < COOKIE_LOGIN_SESSION_TTL_SECONDS:
+                continue
+            expired.append(cookie_login_sessions.pop(session_id))
+    for session in expired:
+        _close_cookie_login_session(session)
+    return len(expired)
+
+
+def _pop_cookie_login_session(session_id: str) -> dict[str, Any] | None:
+    with cookie_login_sessions_lock:
+        return cookie_login_sessions.pop(session_id, None)
 
 
 def _serialize_account_run(run: Any) -> dict[str, Any]:
@@ -109,6 +154,32 @@ def _acquire_pipeline_lock_or_raise(db: Database) -> str:
     if not locked:
         raise HTTPException(status_code=409, detail="当前已有一轮任务在运行，请稍后再试")
     return owner_id
+
+
+async def _renew_pipeline_lock(
+    db: Database,
+    *,
+    owner_id: str,
+    stop: asyncio.Event,
+) -> None:
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=MONITOR_LOCK_RENEW_SECONDS)
+            return
+        except asyncio.TimeoutError:
+            try:
+                renewed = await asyncio.to_thread(
+                    db.renew_job_lock,
+                    MONITOR_LOCK_NAME,
+                    owner_id=owner_id,
+                    lease_seconds=MONITOR_LOCK_LEASE_SECONDS,
+                )
+            except Exception:
+                LOGGER.exception("Failed to renew material monitor lock")
+                continue
+            if not renewed:
+                LOGGER.error("Material monitor lock ownership was lost")
+                return
 
 
 def _round_percent(numerator: int, denominator: int) -> float:
@@ -291,6 +362,14 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         if fail_if_locked:
             raise HTTPException(status_code=409, detail="当前已有一轮任务在运行，请稍后再试")
         return result
+    lock_heartbeat_stop = asyncio.Event()
+    lock_heartbeat = asyncio.create_task(
+        _renew_pipeline_lock(
+            db,
+            owner_id=lock_owner,
+            stop=lock_heartbeat_stop,
+        )
+    )
     monitor_state["running"] = True
     monitor_state["current_stage"] = "清理过期素材"
     monitor_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
@@ -301,20 +380,9 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         )
         monitor_state["expired_count"] = expired_count
         monitor_state["current_stage"] = "采集素材源"
-        try:
-            results = await asyncio.wait_for(
-                asyncio.to_thread(MaterialSourceService(db).check_all),
-                timeout=SOURCE_CHECK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            results = [
-                {
-                    "source_id": "all",
-                    "found": 0,
-                    "inserted": 0,
-                    "error": f"采集超时 {SOURCE_CHECK_TIMEOUT_SECONDS}s，已跳过本轮采集",
-                }
-            ]
+        # 每个采集器已有自己的网络超时。这里等待线程真实结束，避免 wait_for
+        # 超时后后台线程仍继续写库并与下一轮任务重叠。
+        results = await asyncio.to_thread(MaterialSourceService(db).check_all)
         monitor_state["last_results"] = results
         monitor_state["current_stage"] = "素材打标"
         tag_results: list[dict[str, Any]] = []
@@ -395,6 +463,8 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         monitor_state["last_error"] = str(exc)
         raise
     finally:
+        lock_heartbeat_stop.set()
+        await lock_heartbeat
         try:
             db.release_job_lock(MONITOR_LOCK_NAME, owner_id=lock_owner)
         except Exception:
@@ -407,6 +477,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
 
 async def material_monitor_loop() -> None:
     while True:
+        _cleanup_expired_cookie_login_sessions()
         settings = get_settings()
         if not settings.auto_monitor_enabled:
             monitor_state["running"] = False
@@ -429,6 +500,7 @@ async def material_monitor_loop() -> None:
             else:
                 delay_seconds, reason = _next_monitor_delay(settings, result)
         except Exception:
+            LOGGER.exception("Material monitor loop failed")
             delay_seconds = max(30, settings.material_failure_interval_seconds)
             reason = "error"
         monitor_state["next_run_after_seconds"] = delay_seconds
@@ -438,20 +510,16 @@ async def material_monitor_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
+    get_db()
     task = asyncio.create_task(material_monitor_loop())
     try:
         yield
     finally:
-        for session in list(cookie_login_sessions.values()):
-            try:
-                session["browser"].close()
-            except Exception:
-                pass
-            try:
-                session["playwright"].stop()
-            except Exception:
-                pass
-        cookie_login_sessions.clear()
+        with cookie_login_sessions_lock:
+            sessions = list(cookie_login_sessions.values())
+            cookie_login_sessions.clear()
+        for session in sessions:
+            _close_cookie_login_session(session)
         task.cancel()
         try:
             await task
@@ -460,72 +528,150 @@ async def lifespan(app_: FastAPI):
 
 
 app = FastAPI(title="BN Square Agent", lifespan=lifespan)
+app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
 app.mount("/static", StaticFiles(directory=DIST_DIR), name="static")
 
 
+def _basic_auth_matches(header: str, username: str, password: str) -> bool:
+    scheme, _, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    supplied_username, separator, supplied_password = decoded.partition(":")
+    if not separator:
+        return False
+    return secrets.compare_digest(
+        supplied_username.encode("utf-8"),
+        username.encode("utf-8"),
+    ) and secrets.compare_digest(
+        supplied_password.encode("utf-8"),
+        password.encode("utf-8"),
+    )
+
+
+def _is_loopback_client(host: str | None) -> bool:
+    if not host:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() in {"localhost", "testclient"}
+
+
+@app.middleware("http")
+async def protect_self_hosted_console(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                return Response(status_code=413, content="Request body too large")
+        except ValueError:
+            return Response(status_code=400, content="Invalid Content-Length")
+
+    settings = Settings.from_env()
+    username = settings.web_auth_username
+    password = settings.web_auth_password
+    if bool(username) != bool(password):
+        return Response(
+            status_code=503,
+            content="WEB_AUTH_USERNAME 和 WEB_AUTH_PASSWORD 必须同时配置",
+        )
+    if username and request.url.path != "/healthz":
+        if not _basic_auth_matches(
+            request.headers.get("authorization", ""),
+            username,
+            password,
+        ):
+            return Response(
+                status_code=401,
+                content="Authentication required",
+                headers={
+                    "WWW-Authenticate": 'Basic realm="BN Square Agent", charset="UTF-8"'
+                },
+            )
+    elif (
+        request.url.path != "/healthz"
+        and not settings.allow_insecure_public_bind
+        and not _is_loopback_client(request.client.host if request.client else None)
+    ):
+        return Response(
+            status_code=403,
+            content="非本机访问必须配置 WEB_AUTH_USERNAME / WEB_AUTH_PASSWORD",
+        )
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    return response
+
+
 class AccountPayload(BaseModel):
-    account_key: str = Field(min_length=1)
-    name: str | None = None
-    cookie: str | None = None
-    proxy_url: str | None = None
-    mcp_url: str | None = None
-    mcp_auth_token: str | None = None
+    account_key: str = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, max_length=120)
+    cookie: str | None = Field(default=None, max_length=200_000)
+    proxy_url: str | None = Field(default=None, max_length=2_048)
+    mcp_url: str | None = Field(default=None, max_length=2_048)
+    mcp_auth_token: str | None = Field(default=None, max_length=8_192)
 
 
 class AccountCookieImportStartPayload(BaseModel):
-    account_key: str = Field(min_length=1)
-    name: str | None = None
-    login_url: str | None = None
+    account_key: str = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, max_length=120)
+    login_url: str | None = Field(default=None, max_length=2_048)
 
 
 class AccountCookieImportFinishPayload(BaseModel):
-    session_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1, max_length=128)
 
 
 class RunPayload(BaseModel):
-    content: str = Field(min_length=1)
-    title: str | None = None
-    url: str | None = None
+    content: str = Field(min_length=1, max_length=50_000)
+    title: str | None = Field(default=None, max_length=500)
+    url: str | None = Field(default=None, max_length=2_048)
     auto_publish: bool = True
 
 
 class SettingsPayload(BaseModel):
-    llm_api_key: str | None = None
-    llm_base_url: str | None = None
-    llm_model: str | None = None
-    dashscope_api_key: str | None = None
-    dashscope_embedding_model: str | None = None
-    mcp_url: str | None = None
-    mcp_publish_tool: str | None = None
-    mcp_auth_token: str | None = None
+    llm_api_key: str | None = Field(default=None, max_length=8_192)
+    llm_base_url: str | None = Field(default=None, max_length=2_048)
+    llm_model: str | None = Field(default=None, max_length=200)
+    dashscope_api_key: str | None = Field(default=None, max_length=8_192)
+    dashscope_embedding_model: str | None = Field(default=None, max_length=200)
+    mcp_url: str | None = Field(default=None, max_length=2_048)
+    mcp_publish_tool: str | None = Field(default=None, max_length=200)
+    mcp_auth_token: str | None = Field(default=None, max_length=8_192)
     auto_publish: bool | None = None
     auto_monitor_enabled: bool | None = None
     auto_consume_materials: bool | None = None
-    material_poll_interval_seconds: int | None = None
-    material_success_interval_seconds: int | None = None
-    material_failure_interval_seconds: int | None = None
-    material_ttl_seconds: int | None = None
-    material_consume_batch_size: int | None = None
-    publish_failure_alert_threshold: int | None = None
+    material_poll_interval_seconds: int | None = Field(default=None, ge=10, le=86_400)
+    material_success_interval_seconds: int | None = Field(default=None, ge=10, le=86_400)
+    material_failure_interval_seconds: int | None = Field(default=None, ge=10, le=86_400)
+    material_ttl_seconds: int | None = Field(default=None, ge=60, le=604_800)
+    material_consume_batch_size: int | None = Field(default=None, ge=1, le=20)
+    publish_failure_alert_threshold: int | None = Field(default=None, ge=1, le=100)
     alert_email_enabled: bool | None = None
-    alert_email_to: str | None = None
-    smtp_host: str | None = None
-    smtp_port: int | None = None
-    smtp_username: str | None = None
-    smtp_password: str | None = None
-    smtp_from: str | None = None
+    alert_email_to: str | None = Field(default=None, max_length=1_000)
+    smtp_host: str | None = Field(default=None, max_length=253)
+    smtp_port: int | None = Field(default=None, ge=1, le=65_535)
+    smtp_username: str | None = Field(default=None, max_length=320)
+    smtp_password: str | None = Field(default=None, max_length=8_192)
+    smtp_from: str | None = Field(default=None, max_length=320)
     smtp_use_tls: bool | None = None
 
 
 class MaterialSourcePayload(BaseModel):
-    name: str = Field(min_length=1)
-    url: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=1, max_length=2_048)
     source_type: str = "binance_square"
     enabled: bool = True
 
 
 class RunMaterialPayload(BaseModel):
-    material_item_id: int
+    material_item_id: int = Field(ge=1)
     auto_publish: bool = True
 
 
@@ -608,6 +754,16 @@ def _account_from_row(row: dict[str, Any]) -> AccountConfig:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(DIST_DIR / "index.html")
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, bool]:
+    return {"ok": True}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
 
 
 @app.get("/api/accounts")
@@ -862,6 +1018,13 @@ def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str
 
 @app.post("/api/accounts/import-cookie/start")
 def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
+    _cleanup_expired_cookie_login_sessions()
+    with cookie_login_sessions_lock:
+        if len(cookie_login_sessions) >= MAX_COOKIE_LOGIN_SESSIONS:
+            raise HTTPException(
+                status_code=429,
+                detail="当前登录窗口过多，请先完成或取消已有导入会话",
+            )
     key = payload.account_key.strip()
     name = (payload.name or key).strip()
     if not key:
@@ -873,7 +1036,13 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
         raise HTTPException(status_code=500, detail=f"Playwright 不可用: {exc}") from exc
 
     session_id = uuid4().hex
-    login_url = payload.login_url or "https://www.binance.com/zh-CN/login"
+    try:
+        login_url = validate_binance_url(
+            payload.login_url or "https://www.binance.com/zh-CN/login",
+            label="登录地址",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     playwright = None
     try:
         playwright = sync_playwright().start()
@@ -881,6 +1050,7 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
         context = browser.new_context(locale="zh-CN")
         page = context.new_page()
         page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
+        validate_binance_url(page.url, label="登录页重定向地址")
     except Exception as exc:
         if playwright is not None:
             try:
@@ -889,15 +1059,16 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
                 pass
         raise HTTPException(status_code=500, detail=f"打开登录窗口失败: {exc}") from exc
 
-    cookie_login_sessions[session_id] = {
-        "account_key": key,
-        "name": name,
-        "playwright": playwright,
-        "browser": browser,
-        "context": context,
-        "page": page,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    with cookie_login_sessions_lock:
+        cookie_login_sessions[session_id] = {
+            "account_key": key,
+            "name": name,
+            "playwright": playwright,
+            "browser": browser,
+            "context": context,
+            "page": page,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
     return {
         "ok": True,
         "session_id": session_id,
@@ -907,7 +1078,7 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
 
 @app.post("/api/accounts/import-cookie/finish")
 def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
-    session = cookie_login_sessions.pop(payload.session_id, None)
+    session = _pop_cookie_login_session(payload.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
 
@@ -949,7 +1120,7 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
 
 @app.post("/api/accounts/import-cookie/cancel")
 def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
-    session = cookie_login_sessions.pop(payload.session_id, None)
+    session = _pop_cookie_login_session(payload.session_id)
     if not session:
         return {"ok": True}
     try:
@@ -987,7 +1158,7 @@ def check_account(account_key: str) -> dict:
     status = "valid" if result.valid else "invalid"
     db.update_account_check(
         account_key,
-        signature_key=None,
+        signature_key=result.signature_key,
         status=status,
         error=result.error,
     )
@@ -1063,10 +1234,18 @@ def list_material_sources() -> list[dict]:
 def save_material_source(payload: MaterialSourcePayload) -> dict:
     if payload.source_type not in {"binance_square", "techflow_newsletter"}:
         raise HTTPException(status_code=400, detail="当前只支持 BN 广场和 TechFlow 快讯素材源")
+    try:
+        source_url = (
+            validate_binance_url(payload.url, label="BN 广场素材源")
+            if payload.source_type == "binance_square"
+            else validate_techflow_url(payload.url, label="TechFlow 素材源")
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     source_id = get_db().upsert_material_source(
         name=payload.name.strip(),
         source_type=payload.source_type,
-        url=payload.url.strip(),
+        url=source_url,
         enabled=payload.enabled,
     )
     return {"ok": True, "source_id": source_id}
@@ -1086,18 +1265,29 @@ async def check_material_sources() -> dict:
 @app.post("/api/material-sources/{source_id}/check")
 def check_material_source(source_id: int) -> dict:
     db = get_db()
-    source = next(
-        (item for item in db.list_material_sources(include_disabled=True) if item["id"] == source_id),
-        None,
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="素材源不存在")
-    return MaterialSourceService(db).check_source(source)
+    owner_id = _acquire_pipeline_lock_or_raise(db)
+    try:
+        source = next(
+            (
+                item
+                for item in db.list_material_sources(include_disabled=True)
+                if item["id"] == source_id
+            ),
+            None,
+        )
+        if not source:
+            raise HTTPException(status_code=404, detail="素材源不存在")
+        return MaterialSourceService(db).check_source(source)
+    finally:
+        db.release_job_lock(MONITOR_LOCK_NAME, owner_id=owner_id)
 
 
 @app.get("/api/material-items")
 def list_material_items(status: str | None = "new", limit: int = 50) -> list[dict]:
-    return get_db().list_material_items(status=status, limit=limit)
+    return get_db().list_material_items(
+        status=status,
+        limit=max(1, min(limit, 300)),
+    )
 
 
 @app.get("/api/history/publishes")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import replace
+from functools import lru_cache
 import json
 from pathlib import Path
 import os
@@ -11,6 +12,28 @@ from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SETTING_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
+    "MATERIAL_POLL_INTERVAL_SECONDS": (10, 86_400),
+    "MATERIAL_SUCCESS_INTERVAL_SECONDS": (10, 86_400),
+    "MATERIAL_FAILURE_INTERVAL_SECONDS": (10, 86_400),
+    "MATERIAL_TTL_SECONDS": (60, 604_800),
+    "MATERIAL_CONSUME_BATCH_SIZE": (1, 20),
+    "PUBLISH_FAILURE_ALERT_THRESHOLD": (1, 100),
+    "SMTP_PORT": (1, 65_535),
+}
+
+
+def _bounded_integer(name: str, value: str | int, default: int) -> int:
+    raw = str(value).strip()
+    if not raw:
+        parsed = default
+    else:
+        try:
+            parsed = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是整数") from exc
+    minimum, maximum = SETTING_INTEGER_BOUNDS[name]
+    return max(minimum, min(parsed, maximum))
 
 
 def add_no_proxy_host(host: str) -> None:
@@ -173,6 +196,9 @@ class Settings:
     smtp_password: str
     smtp_from: str
     smtp_use_tls: bool
+    web_auth_username: str
+    web_auth_password: str
+    allow_insecure_public_bind: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -206,25 +232,39 @@ class Settings:
             auto_publish=os.getenv("AUTO_PUBLISH", "1").strip().lower()
             not in {"0", "false", "no", "off"}
             and publish_mode != "manual",
-            material_poll_interval_seconds=int(
-                os.getenv("MATERIAL_POLL_INTERVAL_SECONDS", "300")
+            material_poll_interval_seconds=_bounded_integer(
+                "MATERIAL_POLL_INTERVAL_SECONDS",
+                os.getenv("MATERIAL_POLL_INTERVAL_SECONDS", "300"),
+                300,
             ),
-            material_success_interval_seconds=int(
-                os.getenv("MATERIAL_SUCCESS_INTERVAL_SECONDS", "600")
+            material_success_interval_seconds=_bounded_integer(
+                "MATERIAL_SUCCESS_INTERVAL_SECONDS",
+                os.getenv("MATERIAL_SUCCESS_INTERVAL_SECONDS", "600"),
+                600,
             ),
-            material_failure_interval_seconds=int(
-                os.getenv("MATERIAL_FAILURE_INTERVAL_SECONDS", "120")
+            material_failure_interval_seconds=_bounded_integer(
+                "MATERIAL_FAILURE_INTERVAL_SECONDS",
+                os.getenv("MATERIAL_FAILURE_INTERVAL_SECONDS", "120"),
+                120,
             ),
-            material_ttl_seconds=int(os.getenv("MATERIAL_TTL_SECONDS", "7200")),
+            material_ttl_seconds=_bounded_integer(
+                "MATERIAL_TTL_SECONDS",
+                os.getenv("MATERIAL_TTL_SECONDS", "7200"),
+                7200,
+            ),
             auto_consume_materials=os.getenv("AUTO_CONSUME_MATERIALS", "1")
             .strip()
             .lower()
             not in {"0", "false", "no", "off"},
-            material_consume_batch_size=max(
-                1, int(os.getenv("MATERIAL_CONSUME_BATCH_SIZE", "1"))
+            material_consume_batch_size=_bounded_integer(
+                "MATERIAL_CONSUME_BATCH_SIZE",
+                os.getenv("MATERIAL_CONSUME_BATCH_SIZE", "1"),
+                1,
             ),
-            publish_failure_alert_threshold=max(
-                1, int(os.getenv("PUBLISH_FAILURE_ALERT_THRESHOLD", "5"))
+            publish_failure_alert_threshold=_bounded_integer(
+                "PUBLISH_FAILURE_ALERT_THRESHOLD",
+                os.getenv("PUBLISH_FAILURE_ALERT_THRESHOLD", "5"),
+                5,
             ),
             alert_email_enabled=os.getenv("ALERT_EMAIL_ENABLED", "0")
             .strip()
@@ -232,11 +272,23 @@ class Settings:
             not in {"0", "false", "no", "off"},
             alert_email_to=os.getenv("ALERT_EMAIL_TO", "").strip(),
             smtp_host=os.getenv("SMTP_HOST", "").strip(),
-            smtp_port=int(os.getenv("SMTP_PORT", "587")),
+            smtp_port=_bounded_integer(
+                "SMTP_PORT",
+                os.getenv("SMTP_PORT", "587"),
+                587,
+            ),
             smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
             smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
             smtp_from=os.getenv("SMTP_FROM", "").strip(),
             smtp_use_tls=os.getenv("SMTP_USE_TLS", "1").strip().lower()
+            not in {"0", "false", "no", "off"},
+            web_auth_username=os.getenv("WEB_AUTH_USERNAME", "").strip(),
+            web_auth_password=os.getenv("WEB_AUTH_PASSWORD", "").strip(),
+            allow_insecure_public_bind=os.getenv(
+                "ALLOW_INSECURE_PUBLIC_BIND", "0"
+            )
+            .strip()
+            .lower()
             not in {"0", "false", "no", "off"},
         )
 
@@ -274,7 +326,7 @@ class Settings:
             value = values.get(name)
             if value is None or not value.strip():
                 return current
-            return int(value)
+            return _bounded_integer(name, value, current)
 
         def boolean(name: str, current: bool) -> bool:
             value = values.get(name)
@@ -341,13 +393,29 @@ class Settings:
         )
 
     def build_database(self):
-        from ..storage.database import Database
-        from .secret_store import SecretStore
-
-        return Database(
-            self.database_path,
-            secret_store=SecretStore.from_settings(self),
+        return _build_database_cached(
+            str(self.database_path),
+            self.app_secret_key,
+            str(self.secret_key_path),
         )
+
+
+@lru_cache(maxsize=4)
+def _build_database_cached(
+    database_path: str,
+    app_secret_key: str,
+    secret_key_path: str,
+):
+    from ..storage.database import Database
+    from .secret_store import SecretStore
+
+    return Database(
+        Path(database_path),
+        secret_store=SecretStore.from_values(
+            app_secret_key=app_secret_key,
+            secret_key_path=Path(secret_key_path),
+        ),
+    )
 
 
 def _resolve_project_path(value: str) -> Path:

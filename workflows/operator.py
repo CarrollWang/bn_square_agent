@@ -161,6 +161,17 @@ class MultiAccountOperator:
                     generated_id=run.approved_generated_id,
                 )
                 run.status = "published" if run.publish_result.success else "failed"
+                if not run.publish_result.success:
+                    result = run.publish_result.result
+                    detail = str(
+                        result.get("error")
+                        or result.get("message")
+                        or "发布失败"
+                    )
+                    if result.get("outcome") == "unknown":
+                        run.error = f"publish_outcome_unknown: {detail}"
+                    else:
+                        run.error = detail
             else:
                 run.status = "generated"
         except Exception as exc:
@@ -223,6 +234,8 @@ class MultiAccountOperator:
             )
             return
         if run.status == "already_published":
+            return
+        if run.status == "generated":
             return
         self.db.save_material_account_run(
             material_item_id,

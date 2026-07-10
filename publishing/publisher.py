@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any
 
+import httpx
+
 from ..core.config import AccountConfig, Settings
 from ..storage.database import Database
 from .chart_image import ChartImageService
@@ -160,9 +162,16 @@ class PublishingService:
         try:
             result = self.publisher.publish(account=account, generated=generated)
         except Exception as exc:
-            result = {"error": str(exc)}
+            outcome = (
+                "unknown"
+                if isinstance(exc, httpx.TransportError)
+                else "failed"
+            )
+            result = {"success": False, "outcome": outcome, "error": str(exc)}
             self.db.mark_published(generated_id, result=result, success=False)
             return PublishResult(account.key, generated_id, False, result)
+        if "outcome" not in result:
+            result["outcome"] = "published" if self._is_publish_success(result) else "failed"
         success = self._is_publish_success(result)
         self.db.mark_published(generated_id, result=result, success=success)
         return PublishResult(account.key, generated_id, success, result)

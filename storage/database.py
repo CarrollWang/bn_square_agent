@@ -374,6 +374,25 @@ class Database:
                 (job_name, owner_id),
             )
 
+    def renew_job_lock(
+        self,
+        job_name: str,
+        *,
+        owner_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        expires_at = int(time.time()) + max(1, lease_seconds)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE job_locks
+                SET expires_at = ?, updated_at = ?
+                WHERE job_name = ? AND owner_id = ?
+                """,
+                (expires_at, utc_now(), job_name, owner_id),
+            )
+            return cursor.rowcount == 1
+
     def _ensure_material_items_source_fk(self, connection: sqlite3.Connection) -> None:
         foreign_keys = connection.execute(
             "PRAGMA foreign_key_list(material_items)"
@@ -678,7 +697,13 @@ class Database:
                     ON r.material_item_id = i.id AND r.account_key = ?
                 WHERE i.status = 'new'
                     AND i.tag_status = 'accepted'
-                    AND (r.status IS NULL OR r.status = 'failed')
+                    AND (
+                        r.status IS NULL
+                        OR (
+                            r.status = 'failed'
+                            AND COALESCE(r.error, '') NOT LIKE 'publish_outcome_unknown:%'
+                        )
+                    )
                 ORDER BY
                     COALESCE(i.source_created_at, i.created_at) ASC,
                     i.id ASC

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Sequence
 
 from .core.config import Settings
 from .publishing.mcp_client import RemoteMCPClient
+
+
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _is_public_bind(host: str) -> bool:
+    return host.strip().lower() not in LOOPBACK_HOSTS
 
 
 def _resolve_mcp_target(settings: Settings) -> tuple[str, str, str | None]:
@@ -47,6 +55,10 @@ def check_config(_: argparse.Namespace) -> int:
     print(f"- LLM_BASE_URL: {'已配置' if settings.llm_base_url else '缺失'}")
     print(f"- LLM_MODEL: {'已配置' if settings.llm_model else '缺失'}")
     print(f"- DASHSCOPE_API_KEY: {'已配置' if settings.dashscope_api_key else '缺失'}")
+    print(
+        "- WEB_AUTH: "
+        f"{'已配置' if settings.web_auth_username and settings.web_auth_password else '未配置'}"
+    )
     return 0
 
 
@@ -98,6 +110,19 @@ def run_content(args: argparse.Namespace) -> int:
 def serve(args: argparse.Namespace) -> int:
     import uvicorn
 
+    settings = Settings.from_env()
+    web_auth_ready = bool(
+        settings.web_auth_username and settings.web_auth_password
+    )
+    if (
+        _is_public_bind(args.host)
+        and not web_auth_ready
+        and not settings.allow_insecure_public_bind
+    ):
+        raise SystemExit(
+            "拒绝在未启用认证时监听公网地址。请配置 WEB_AUTH_USERNAME / "
+            "WEB_AUTH_PASSWORD，或仅监听 127.0.0.1。"
+        )
     uvicorn.run(
         "bn_square_agent.webapp:app",
         host=args.host,
@@ -110,6 +135,18 @@ def serve(args: argparse.Namespace) -> int:
 def serve_mcp(args: argparse.Namespace) -> int:
     import uvicorn
 
+    auth_token = os.getenv("MCP_SERVER_AUTH_TOKEN", "").strip()
+    allow_insecure = os.getenv("ALLOW_INSECURE_PUBLIC_BIND", "0").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if _is_public_bind(args.host) and not auth_token and not allow_insecure:
+        raise SystemExit(
+            "拒绝在未启用认证时公开 MCP。请配置 MCP_SERVER_AUTH_TOKEN，"
+            "或仅监听 127.0.0.1。"
+        )
     uvicorn.run(
         "bn_square_agent.publishing.self_hosted_mcp:app",
         host=args.host,

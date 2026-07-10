@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+import ipaddress
 import json
 import os
 from pathlib import Path
+import re
+import secrets
 import uuid
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -15,11 +19,39 @@ from .browser_square_mcp_publisher import BrowserBinanceSquarePublisher
 
 TOOL_NAME = "publish_binance_square"
 PROTOCOL_VERSION = "2025-06-18"
+MAX_COOKIE_LENGTH = 200_000
+MAX_CONTENT_LENGTH = 50_000
+MAX_IMAGE_BASE64_LENGTH = 18 * 1024 * 1024
+MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+COINS_PATTERN = re.compile(r"^[A-Z0-9]{2,20}:(?:future|spot)$", re.IGNORECASE)
+
+
+def _bounded_env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是整数") from exc
+    return max(minimum, min(value, maximum))
+
+
+def _resolve_debug_dir(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parents[1] / path
 
 
 @dataclass(frozen=True)
 class SelfHostedMCPSettings:
     auth_token: str
+    allow_insecure_public_bind: bool
     default_proxy_url: str
     debug_dir: Path
     timeout_ms: int
@@ -31,14 +63,33 @@ class SelfHostedMCPSettings:
         default_proxy = os.getenv("MCP_SERVER_DEFAULT_PROXY", "").strip()
         return cls(
             auth_token=os.getenv("MCP_SERVER_AUTH_TOKEN", "").strip(),
+            allow_insecure_public_bind=os.getenv(
+                "ALLOW_INSECURE_PUBLIC_BIND", "0"
+            )
+            .strip()
+            .lower()
+            not in {"0", "false", "no", "off"},
             default_proxy_url=normalize_proxy_url(default_proxy) if default_proxy else "",
-            debug_dir=Path(os.getenv("MCP_SERVER_DEBUG_DIR", "./data/mcp_debug")),
-            timeout_ms=max(10_000, int(os.getenv("MCP_SERVER_TIMEOUT_MS", "90000"))),
-            render_wait_ms=max(
-                500, int(os.getenv("MCP_SERVER_RENDER_WAIT_MS", "2000"))
+            debug_dir=_resolve_debug_dir(
+                os.getenv("MCP_SERVER_DEBUG_DIR", "./data/mcp_debug")
             ),
-            publish_wait_ms=max(
-                3_000, int(os.getenv("MCP_SERVER_PUBLISH_WAIT_MS", "12000"))
+            timeout_ms=_bounded_env_int(
+                "MCP_SERVER_TIMEOUT_MS",
+                90_000,
+                minimum=10_000,
+                maximum=300_000,
+            ),
+            render_wait_ms=_bounded_env_int(
+                "MCP_SERVER_RENDER_WAIT_MS",
+                2_000,
+                minimum=500,
+                maximum=30_000,
+            ),
+            publish_wait_ms=_bounded_env_int(
+                "MCP_SERVER_PUBLISH_WAIT_MS",
+                12_000,
+                minimum=3_000,
+                maximum=120_000,
             ),
         )
 
@@ -96,7 +147,8 @@ def _tool_definition() -> dict[str, object]:
                 },
                 "coins": {
                     "type": "string",
-                    "description": "可选，形如 BTC:future 的附加参数",
+                    "description": "可选，形如 BTC:future；自建浏览器发布器会确保正文包含对应 cashtag",
+                    "maxLength": 32,
                 },
                 "image_base64": {
                     "type": "string",
@@ -108,16 +160,38 @@ def _tool_definition() -> dict[str, object]:
                 },
             },
             "required": ["cookie", "content"],
-            "additionalProperties": True,
+            "additionalProperties": False,
         },
     }
 
 
-def _check_auth(auth_header: str | None, settings: SelfHostedMCPSettings) -> None:
+def _is_loopback_client(host: str | None) -> bool:
+    if not host:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() in {"localhost", "testclient"}
+
+
+def _check_auth(
+    auth_header: str | None,
+    settings: SelfHostedMCPSettings,
+    *,
+    client_host: str | None,
+) -> None:
     if not settings.auth_token:
-        return
+        if settings.allow_insecure_public_bind or _is_loopback_client(client_host):
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="Public MCP access requires MCP_SERVER_AUTH_TOKEN",
+        )
     expected = f"Bearer {settings.auth_token}"
-    if auth_header != expected:
+    if not auth_header or not secrets.compare_digest(
+        auth_header.encode("utf-8"),
+        expected.encode("utf-8"),
+    ):
         raise HTTPException(status_code=401, detail="MCP server auth failed")
 
 
@@ -178,8 +252,24 @@ async def handle_mcp(
     mcp_session_id: str | None = Header(None, alias="Mcp-Session-Id"),
 ) -> JSONResponse:
     settings = SelfHostedMCPSettings.from_env()
-    _check_auth(authorization, settings)
-    payload = await request.json()
+    _check_auth(
+        authorization,
+        settings,
+        client_host=request.client.host if request.client else None,
+    )
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="MCP request body too large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="MCP 请求必须是合法 JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="MCP 请求必须是 JSON 对象")
     method = str(payload.get("method") or "")
     request_id = payload.get("id")
     session_id = mcp_session_id or str(uuid.uuid4())
@@ -216,8 +306,22 @@ async def handle_mcp(
 
     if method == "tools/call":
         params = payload.get("params") or {}
+        if not isinstance(params, dict):
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                "params 必须是 JSON 对象",
+                session_id=session_id,
+            )
         tool_name = str(params.get("name") or "")
         arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                "arguments 必须是 JSON 对象",
+                session_id=session_id,
+            )
         if tool_name != TOOL_NAME:
             return _jsonrpc_error(
                 request_id,
@@ -230,16 +334,56 @@ async def handle_mcp(
         coins = str(arguments.get("coins") or "")
         image_base64 = str(arguments.get("image_base64") or "")
         proxy_url = str(arguments.get("proxy_url") or "").strip()
-        effective_proxy = proxy_url or settings.default_proxy_url
+        if len(cookie) > MAX_COOKIE_LENGTH:
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                "cookie 过长",
+                session_id=session_id,
+            )
+        if len(content) > MAX_CONTENT_LENGTH:
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                "content 过长",
+                session_id=session_id,
+            )
+        if len(image_base64) > MAX_IMAGE_BASE64_LENGTH:
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                "image_base64 过大",
+                session_id=session_id,
+            )
+        if coins and not COINS_PATTERN.fullmatch(coins):
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                "coins 格式必须类似 BTC:future",
+                session_id=session_id,
+            )
+        try:
+            effective_proxy = normalize_proxy_url(
+                proxy_url or settings.default_proxy_url
+            ) if (proxy_url or settings.default_proxy_url) else ""
+        except ValueError as exc:
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                str(exc),
+                session_id=session_id,
+            )
         publisher = BrowserBinanceSquarePublisher(
             timeout_ms=settings.timeout_ms,
             render_wait_ms=settings.render_wait_ms,
             publish_wait_ms=settings.publish_wait_ms,
             debug_dir=settings.debug_dir,
         )
-        result = publisher.publish(
+        result = await asyncio.to_thread(
+            publisher.publish,
             cookie=cookie,
             content=content,
+            coins=coins,
             image_base64=image_base64,
             proxy_url=effective_proxy,
         )

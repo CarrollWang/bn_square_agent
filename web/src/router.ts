@@ -1,21 +1,38 @@
 import { createRouter, createWebHashHistory } from "vue-router";
 
-import Accounts from "@/views/Accounts.vue";
-import Dashboard from "@/views/Dashboard.vue";
-import History from "@/views/History.vue";
-import Performance from "@/views/Performance.vue";
-import Settings from "@/views/Settings.vue";
-import Sources from "@/views/Sources.vue";
-
 export const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: "/", redirect: "/dashboard" },
-    { path: "/dashboard", name: "dashboard", component: Dashboard },
-    { path: "/accounts", name: "accounts", component: Accounts },
-    { path: "/performance", name: "performance", component: Performance },
-    { path: "/history", name: "history", component: History },
-    { path: "/sources", name: "sources", component: Sources },
-    { path: "/settings", name: "settings", component: Settings },
+    {
+      path: "/dashboard",
+      name: "dashboard",
+      component: () => import("@/views/Dashboard.vue"),
+    },
+    {
+      path: "/accounts",
+      name: "accounts",
+      component: () => import("@/views/Accounts.vue"),
+    },
+    {
+      path: "/performance",
+      name: "performance",
+      component: () => import("@/views/Performance.vue"),
+    },
+    {
+      path: "/history",
+      name: "history",
+      component: () => import("@/views/History.vue"),
+    },
+    {
+      path: "/sources",
+      name: "sources",
+      component: () => import("@/views/Sources.vue"),
+    },
+    {
+      path: "/settings",
+      name: "settings",
+      component: () => import("@/views/Settings.vue"),
+    },
   ],
 });
