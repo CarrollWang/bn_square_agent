@@ -249,7 +249,7 @@ onMounted(loadDashboard);
   display: flex;
   flex-wrap: wrap;
   gap: 14px;
-  color: #475569;
+  color: var(--text-muted);
   font-size: 12px;
 }
 
@@ -262,15 +262,15 @@ onMounted(loadDashboard);
 }
 
 .published {
-  background: #0f9f6e;
+  background: var(--success);
 }
 
 .failed {
-  background: #dc2626;
+  background: var(--danger);
 }
 
 .skipped {
-  background: #d97706;
+  background: var(--warning);
 }
 
 .trend-chart {
@@ -292,10 +292,14 @@ onMounted(loadDashboard);
   width: 100%;
   height: 160px;
   padding: 0 2px;
-  border-radius: 10px;
-  background:
-    linear-gradient(to top, rgba(226, 232, 240, 0.65), rgba(255, 255, 255, 0.2)),
-    linear-gradient(to right, rgba(15, 23, 42, 0.02), rgba(15, 23, 42, 0));
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: repeating-linear-gradient(
+    to top,
+    transparent 0,
+    transparent 39px,
+    rgba(127, 137, 152, 0.1) 40px
+  );
 }
 
 .trend-stack {
@@ -305,7 +309,7 @@ onMounted(loadDashboard);
   min-height: 8px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(226, 232, 240, 0.85);
+  background: #2a3341;
 }
 
 .trend-segment {
@@ -313,13 +317,13 @@ onMounted(loadDashboard);
 }
 
 .trend-count {
-  color: #0f172a;
+  color: var(--text);
   font-size: 12px;
   font-weight: 600;
 }
 
 .trend-label {
-  color: #64748b;
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -330,9 +334,15 @@ onMounted(loadDashboard);
 
 .issue-item {
   padding: 12px;
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
-  background: linear-gradient(180deg, #ffffff, #f8fafc);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.issue-item:hover {
+  border-color: #3a4659;
+  background: var(--surface-hover);
 }
 
 .issue-head {
@@ -343,13 +353,13 @@ onMounted(loadDashboard);
 }
 
 .issue-head strong {
-  color: #0f172a;
+  color: var(--text);
 }
 
 .issue-reason,
 .issue-inline {
   margin-top: 6px;
-  color: #475569;
+  color: var(--text-muted);
   line-height: 1.5;
 }
 

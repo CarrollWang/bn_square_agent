@@ -293,4 +293,14 @@ onMounted(loadAccounts);
 .data-table {
   margin-top: 14px;
 }
+
+@media (max-width: 760px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .form-grid .wide {
+    grid-column: auto;
+  }
+}
 </style>

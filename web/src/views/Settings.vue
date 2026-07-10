@@ -318,6 +318,16 @@ onMounted(loadSettings);
 .settings-actions {
   margin-top: 18px;
   padding-top: 16px;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--border-soft);
+}
+
+@media (max-width: 760px) {
+  .settings-form {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-form .wide {
+    grid-column: auto;
+  }
 }
 </style>

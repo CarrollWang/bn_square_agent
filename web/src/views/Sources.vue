@@ -261,10 +261,20 @@ onMounted(refresh);
   max-width: 820px;
   margin: 6px 0 0;
   overflow: hidden;
-  color: #475569;
+  color: var(--text-muted);
   font-size: 13px;
   line-height: 1.5;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+@media (max-width: 760px) {
+  .source-form {
+    grid-template-columns: 1fr;
+  }
+
+  .source-form .wide {
+    grid-column: auto;
+  }
 }
 </style>

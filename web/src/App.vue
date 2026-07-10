@@ -1,17 +1,20 @@
 <template>
   <el-config-provider :locale="zhCn">
     <el-container class="app-shell">
-      <el-aside width="232px" class="app-sidebar">
+      <el-aside width="224px" class="app-sidebar">
         <div class="brand">
-          <strong>BN Square Agent</strong>
-          <span>自动运营控制台</span>
+          <div class="brand-mark">BN</div>
+          <div class="brand-copy">
+            <strong>BN Square Agent</strong>
+            <span>自动运营控制台</span>
+          </div>
         </div>
         <el-menu
           :default-active="activeMenu"
           class="side-menu"
-          background-color="#101827"
-          text-color="#cbd5e1"
-          active-text-color="#ffffff"
+          background-color="#131821"
+          text-color="#b8c0cc"
+          active-text-color="#6b96ff"
           router
         >
           <el-menu-item index="/dashboard">
@@ -58,7 +61,7 @@
             <h1>{{ pageTitle }}</h1>
             <p>多账号采集、改写、配图、发布自动运营台</p>
           </div>
-          <el-tag type="success" effect="plain">MCP 发布通道</el-tag>
+          <div class="channel-status">MCP 发布通道</div>
         </el-header>
         <el-main class="app-main">
           <router-view />

@@ -235,14 +235,14 @@ onMounted(refreshAll);
 }
 
 .cell-title {
-  color: #0f172a;
+  color: var(--text);
   font-weight: 600;
 }
 
 .material-snippet,
 .result-text {
   margin-top: 6px;
-  color: #475569;
+  color: var(--text-muted);
   line-height: 1.5;
 }
 </style>
