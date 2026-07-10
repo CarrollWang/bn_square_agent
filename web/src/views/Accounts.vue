@@ -135,7 +135,8 @@ const editingAccountKey = ref("");
 const loadingAccountKey = ref("");
 const importing = ref(false);
 const finishingImport = ref(false);
-const cookieImportSessionId = ref("");
+const COOKIE_IMPORT_SESSION_KEY = "bn_square_cookie_import_session";
+const cookieImportSessionId = ref(sessionStorage.getItem(COOKIE_IMPORT_SESSION_KEY) || "");
 const showAdvanced = ref(false);
 const form = reactive({
   account_key: "",
@@ -145,6 +146,15 @@ const form = reactive({
   mcp_url: "",
   mcp_auth_token: "",
 });
+
+function setCookieImportSessionId(sessionId: string) {
+  cookieImportSessionId.value = sessionId;
+  if (sessionId) {
+    sessionStorage.setItem(COOKIE_IMPORT_SESSION_KEY, sessionId);
+  } else {
+    sessionStorage.removeItem(COOKIE_IMPORT_SESSION_KEY);
+  }
+}
 
 async function loadAccounts() {
   accounts.value = await api.accounts();
@@ -200,7 +210,7 @@ async function startCookieImport() {
       account_key: accountKey,
       name: form.name.trim(),
     });
-    cookieImportSessionId.value = result.session_id;
+    setCookieImportSessionId(result.session_id);
     ElMessage.success(result.message);
   } finally {
     importing.value = false;
@@ -212,7 +222,7 @@ async function finishCookieImport() {
   finishingImport.value = true;
   try {
     const result = await api.finishCookieImport(cookieImportSessionId.value);
-    cookieImportSessionId.value = "";
+    setCookieImportSessionId("");
     editingAccountKey.value = "";
     resetForm();
     await loadAccounts();
@@ -220,7 +230,7 @@ async function finishCookieImport() {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Cookie 导入验证失败";
     if (message.includes("导入会话不存在或已结束")) {
-      cookieImportSessionId.value = "";
+      setCookieImportSessionId("");
     }
     ElMessage.error({ message, duration: 8000, showClose: true });
   } finally {
@@ -231,7 +241,7 @@ async function finishCookieImport() {
 async function cancelCookieImport() {
   if (!cookieImportSessionId.value) return;
   await api.cancelCookieImport(cookieImportSessionId.value);
-  cookieImportSessionId.value = "";
+  setCookieImportSessionId("");
   ElMessage.success("已取消导入");
 }
 

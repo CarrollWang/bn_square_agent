@@ -7,12 +7,15 @@ from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+import hashlib
 import json
 import ipaddress
 import logging
 import secrets
+import shutil
 from pathlib import Path
 import smtplib
+import tempfile
 from threading import Lock
 from typing import Any
 from uuid import uuid4
@@ -32,7 +35,11 @@ from .core.config import (
     normalize_proxy_url,
 )
 from .knowledge.style_rag import create_embeddings
-from .publishing.account_check import BINANCE_BASE_URL, BinanceAccountChecker
+from .publishing.account_check import (
+    BINANCE_AUTH_PATH,
+    BINANCE_BASE_URL,
+    BinanceAccountChecker,
+)
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
 from .sources.binance_square import MaterialSourceService
@@ -72,7 +79,15 @@ cookie_login_sessions: dict[str, dict[str, Any]] = {}
 cookie_login_sessions_lock = Lock()
 
 
-def _close_cookie_login_session(session: dict[str, Any]) -> None:
+def _close_cookie_login_session(
+    session: dict[str, Any],
+    *,
+    cleanup_profile: bool = True,
+) -> None:
+    try:
+        session["context"].close()
+    except Exception:
+        pass
     try:
         session["browser"].close()
     except Exception:
@@ -81,6 +96,16 @@ def _close_cookie_login_session(session: dict[str, Any]) -> None:
         session["playwright"].stop()
     except Exception:
         pass
+    profile_dir = session.get("profile_dir")
+    if cleanup_profile and profile_dir:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def _cookie_import_profile_dir(account_key: str) -> Path:
+    digest = hashlib.sha256(account_key.encode("utf-8")).hexdigest()[:12]
+    profile_dir = Path(tempfile.gettempdir()) / f"bn-square-cookie-import-{digest}"
+    profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return profile_dir
 
 
 def _cleanup_expired_cookie_login_sessions() -> int:
@@ -527,7 +552,7 @@ async def lifespan(app_: FastAPI):
             sessions = list(cookie_login_sessions.values())
             cookie_login_sessions.clear()
         for session in sessions:
-            _close_cookie_login_session(session)
+            _close_cookie_login_session(session, cleanup_profile=False)
         task.cancel()
         try:
             await task
@@ -1015,7 +1040,6 @@ def save_account(payload: AccountPayload) -> dict:
     return {"ok": True}
 
 
-BINANCE_AUTH_PATH = "/bapi/accounts/v1/public/authcenter/auth"
 BINANCE_AUTH_URL = f"{BINANCE_BASE_URL}{BINANCE_AUTH_PATH}"
 
 
@@ -1059,26 +1083,15 @@ def _binance_login_status_from_page(page: Any) -> tuple[bool, str | None]:
         timeout=60_000,
     )
     validate_binance_url(page.url, label="登录状态检查地址")
-    result = page.evaluate(
-        """async () => {
-            try {
-                const response = await fetch('/bapi/accounts/v1/public/authcenter/auth', {
-                    method: 'POST',
-                    credentials: 'include'
-                });
-                const payload = await response.json();
-                return {
-                    success: Boolean(payload && payload.success),
-                    message: payload && payload.message ? String(payload.message) : null
-                };
-            } catch (error) {
-                return {success: false, message: String(error)};
-            }
-        }"""
-    )
-    if not isinstance(result, dict):
-        return False, "Binance 登录状态返回异常"
-    return bool(result.get("success")), str(result.get("message") or "") or None
+    result = BinanceAccountChecker.probe_page_session(page)
+    if not result.valid:
+        attempts = result.raw.get("attempts") if isinstance(result.raw, dict) else None
+        LOGGER.warning(
+            "Binance page session probe failed: error=%s attempts=%s",
+            result.error or "unknown",
+            attempts or [],
+        )
+    return result.valid, result.error
 
 
 def _validate_exported_binance_cookie(
@@ -1098,16 +1111,32 @@ def _validate_exported_binance_cookie(
 @app.post("/api/accounts/import-cookie/start")
 def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
     _cleanup_expired_cookie_login_sessions()
+    key = payload.account_key.strip()
+    name = (payload.name or key).strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="账号标识必填")
+
     with cookie_login_sessions_lock:
+        existing_session = next(
+            (
+                (session_id, session)
+                for session_id, session in cookie_login_sessions.items()
+                if session.get("account_key") == key
+            ),
+            None,
+        )
+        if existing_session:
+            session_id, _ = existing_session
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "message": "已恢复当前账号的登录窗口，请完成登录后点击完成导入。",
+            }
         if len(cookie_login_sessions) >= MAX_COOKIE_LOGIN_SESSIONS:
             raise HTTPException(
                 status_code=429,
                 detail="当前登录窗口过多，请先完成或取消已有导入会话",
             )
-    key = payload.account_key.strip()
-    name = (payload.name or key).strip()
-    if not key:
-        raise HTTPException(status_code=400, detail="账号标识必填")
 
     try:
         from playwright.sync_api import sync_playwright
@@ -1123,19 +1152,46 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     playwright = None
+    browser = None
+    context = None
+    profile_dir = _cookie_import_profile_dir(key)
+    for singleton_file in profile_dir.glob("Singleton*"):
+        try:
+            singleton_file.unlink()
+        except OSError:
+            pass
     try:
         playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(headless=False)
-        context = browser.new_context(locale="zh-CN")
-        page = context.new_page()
+        context = playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=False,
+            locale="zh-CN",
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
+        )
+        browser = context.browser
+        if browser is None:
+            raise RuntimeError("无法获取浏览器实例")
+        page = context.pages[0] if context.pages else context.new_page()
         page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
         validate_binance_url(page.url, label="登录页重定向地址")
     except Exception as exc:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
         if playwright is not None:
             try:
                 playwright.stop()
             except Exception:
                 pass
+        shutil.rmtree(profile_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"打开登录窗口失败: {exc}") from exc
 
     with cookie_login_sessions_lock:
@@ -1146,6 +1202,7 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
             "browser": browser,
             "context": context,
             "page": page,
+            "profile_dir": profile_dir,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     return {
@@ -1167,6 +1224,11 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
     try:
         logged_in, login_error = _binance_login_status_from_page(page)
         if not logged_in:
+            LOGGER.warning(
+                "Cookie import login probe failed for account=%s: %s",
+                session["account_key"],
+                login_error or "unknown",
+            )
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -1187,6 +1249,11 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
             cookie_header,
         )
         if not reusable:
+            LOGGER.warning(
+                "Cookie import reuse probe failed for account=%s: %s",
+                session["account_key"],
+                export_error or "unknown",
+            )
             raise HTTPException(
                 status_code=400,
                 detail=(

@@ -20,7 +20,6 @@ from .account_check import BINANCE_BASE_URL, BinanceAccountChecker
 
 LOGGER = logging.getLogger(__name__)
 SQUARE_HOME_URL = f"{BINANCE_BASE_URL}/zh-CN/square"
-LOGIN_CHECK_API = "/bapi/accounts/v1/public/authcenter/auth"
 EDITOR_SELECTORS = (
     "textarea",
     "[contenteditable='true']",
@@ -248,18 +247,9 @@ class BrowserBinanceSquarePublisher:
         page.on("response", handle_response)
 
     def _ensure_logged_in(self, page) -> None:
-        payload = page.evaluate(
-            """async (api) => {
-                const response = await fetch(api, {
-                    method: 'POST',
-                    credentials: 'include'
-                });
-                return await response.json();
-            }""",
-            LOGIN_CHECK_API,
-        )
-        if not payload.get("success"):
-            raise RuntimeError(payload.get("message") or "Cookie 未登录或已失效")
+        result = BinanceAccountChecker.probe_page_session(page)
+        if not result.valid:
+            raise RuntimeError(result.error or "Cookie 未登录或已失效")
 
     def _open_compose_surface(self, page) -> None:
         if self._has_editor(page):

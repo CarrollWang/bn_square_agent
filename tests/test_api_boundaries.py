@@ -5,7 +5,16 @@ import re
 import unittest
 from unittest.mock import patch
 
+from bn_square_agent.publishing.account_check import BinanceAccountChecker
 from bn_square_agent.webapp import _cookie_header_from_playwright_cookies
+
+
+class FakePage:
+    def __init__(self, result):
+        self.result = result
+
+    def evaluate(self, _script, _argument):
+        return self.result
 
 
 class WebApiBoundaryTests(unittest.TestCase):
@@ -64,6 +73,62 @@ class WebApiBoundaryTests(unittest.TestCase):
         self.assertNotIn("account", header)
         self.assertNotIn("wrong_path", header)
         self.assertEqual(header.count("p20t="), 1)
+
+    def test_page_session_probe_accepts_private_square_identity(self) -> None:
+        result = BinanceAccountChecker.probe_page_session(
+            FakePage(
+                {
+                    "valid": True,
+                    "signature_key": "square-user-1",
+                    "source": "/bapi/composite/v3/private/pgc/user/client",
+                    "attempts": [],
+                }
+            )
+        )
+        self.assertTrue(result.valid)
+        self.assertEqual(result.signature_key, "square-user-1")
+
+    def test_page_session_probe_preserves_login_error(self) -> None:
+        result = BinanceAccountChecker.probe_page_session(
+            FakePage(
+                {
+                    "valid": False,
+                    "error": "Please login first",
+                    "attempts": [],
+                }
+            )
+        )
+        self.assertFalse(result.valid)
+        self.assertEqual(result.error, "Please login first")
+
+    def test_account_headers_reuse_binance_csrf_cookie(self) -> None:
+        headers = BinanceAccountChecker._headers("cr00=csrf-token; session=abc")
+        self.assertEqual(headers["csrftoken"], "csrf-token")
+
+    def test_cookie_login_session_cleanup_removes_temporary_profile(self) -> None:
+        from bn_square_agent.webapp import (
+            _close_cookie_login_session,
+            _cookie_import_profile_dir,
+        )
+
+        class Closable:
+            def close(self):
+                return None
+
+        class PlaywrightHandle:
+            def stop(self):
+                return None
+
+        profile_dir = _cookie_import_profile_dir("cleanup-test-account")
+        _close_cookie_login_session(
+            {
+                "context": Closable(),
+                "browser": Closable(),
+                "playwright": PlaywrightHandle(),
+                "profile_dir": profile_dir,
+            }
+        )
+        self.assertFalse(profile_dir.exists())
 
 
 class McpBoundaryTests(unittest.TestCase):
