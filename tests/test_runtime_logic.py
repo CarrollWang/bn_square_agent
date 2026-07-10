@@ -74,12 +74,28 @@ class DatabaseRuntimeTests(unittest.TestCase):
                 name="Test",
                 cookie="session=secret-cookie",
             )
+            first.update_account_check(
+                "test",
+                signature_key="old-signature",
+                status="invalid",
+                error="expired",
+            )
+            first.upsert_account(
+                account_key="test",
+                name="Test",
+                cookie="session=fresh-cookie",
+            )
+            refreshed = first.list_accounts()[0]
+            self.assertEqual(refreshed["check_status"], "unchecked")
+            self.assertIsNone(refreshed["checked_at"])
+            self.assertIsNone(refreshed["check_error"])
+            self.assertIsNone(refreshed["signature_key"])
             with sqlite3.connect(settings.database_path) as connection:
                 stored = connection.execute(
                     "SELECT cookie FROM accounts WHERE account_key = 'test'"
                 ).fetchone()[0]
             self.assertTrue(stored.startswith("enc:v1:"))
-            self.assertEqual(first.list_accounts()[0]["cookie"], "session=secret-cookie")
+            self.assertEqual(first.list_accounts()[0]["cookie"], "session=fresh-cookie")
 
             source_id = first.upsert_material_source(
                 name="Source",

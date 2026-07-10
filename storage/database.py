@@ -911,6 +911,22 @@ class Database:
                         WHEN ? IS NULL THEN accounts.mcp_auth_token
                         ELSE excluded.mcp_auth_token
                     END,
+                    signature_key = CASE
+                        WHEN ? IS NULL THEN accounts.signature_key
+                        ELSE NULL
+                    END,
+                    check_status = CASE
+                        WHEN ? IS NULL THEN accounts.check_status
+                        ELSE 'unchecked'
+                    END,
+                    checked_at = CASE
+                        WHEN ? IS NULL THEN accounts.checked_at
+                        ELSE NULL
+                    END,
+                    check_error = CASE
+                        WHEN ? IS NULL THEN accounts.check_error
+                        ELSE NULL
+                    END,
                     enabled = 1
                 """,
                 (
@@ -925,6 +941,10 @@ class Database:
                     encrypted_proxy_url,
                     mcp_url,
                     encrypted_mcp_auth_token,
+                    encrypted_cookie,
+                    encrypted_cookie,
+                    encrypted_cookie,
+                    encrypted_cookie,
                 ),
             )
 

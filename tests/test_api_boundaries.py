@@ -5,6 +5,8 @@ import re
 import unittest
 from unittest.mock import patch
 
+from bn_square_agent.webapp import _cookie_header_from_playwright_cookies
+
 
 class WebApiBoundaryTests(unittest.TestCase):
     @classmethod
@@ -46,6 +48,22 @@ class WebApiBoundaryTests(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_cookie_export_filters_domains_and_deduplicates_names(self) -> None:
+        cookies = [
+            {"name": "p20t", "value": "global", "domain": ".binance.com", "path": "/"},
+            {"name": "p20t", "value": "account", "domain": "accounts.binance.com", "path": "/"},
+            {"name": "p20t", "value": "www", "domain": "www.binance.com", "path": "/"},
+            {"name": "shared", "value": "yes", "domain": ".binance.com", "path": "/"},
+            {"name": "wrong_path", "value": "no", "domain": ".binance.com", "path": "/zh-CN"},
+            {"name": "other", "value": "no", "domain": ".example.com", "path": "/"},
+        ]
+        header = _cookie_header_from_playwright_cookies(cookies)
+        self.assertIn("p20t=www", header)
+        self.assertIn("shared=yes", header)
+        self.assertNotIn("account", header)
+        self.assertNotIn("wrong_path", header)
+        self.assertEqual(header.count("p20t="), 1)
 
 
 class McpBoundaryTests(unittest.TestCase):

@@ -32,7 +32,7 @@ from .core.config import (
     normalize_proxy_url,
 )
 from .knowledge.style_rag import create_embeddings
-from .publishing.account_check import BinanceAccountChecker
+from .publishing.account_check import BINANCE_BASE_URL, BinanceAccountChecker
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
 from .sources.binance_square import MaterialSourceService
@@ -1010,19 +1010,84 @@ def save_account(payload: AccountPayload) -> dict:
     return {"ok": True}
 
 
+BINANCE_AUTH_PATH = "/bapi/accounts/v1/public/authcenter/auth"
+BINANCE_AUTH_URL = f"{BINANCE_BASE_URL}{BINANCE_AUTH_PATH}"
+
+
 def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str:
-    filtered = []
+    target_host = "www.binance.com"
+    now = datetime.now(timezone.utc).timestamp()
+    selected: dict[str, tuple[tuple[int, int], str]] = {}
     for cookie in cookies:
-        domain = (cookie.get("domain") or "").lstrip(".")
-        if not domain.endswith("binance.com"):
+        raw_domain = str(cookie.get("domain") or "").strip().lower()
+        domain = raw_domain.lstrip(".")
+        domain_matches = domain == target_host or (
+            raw_domain.startswith(".")
+            and (target_host == domain or target_host.endswith(f".{domain}"))
+        )
+        if not domain_matches:
             continue
-        name = cookie.get("name")
+        path = str(cookie.get("path") or "/")
+        if not BINANCE_AUTH_PATH.startswith(path):
+            continue
+        expires = float(cookie.get("expires") or -1)
+        if expires > 0 and expires <= now:
+            continue
+        name = str(cookie.get("name") or "")
         value = cookie.get("value")
         if not name or value is None:
             continue
-        filtered.append((str(name), str(value)))
-    filtered.sort(key=lambda item: item[0].lower())
-    return "; ".join(f"{name}={value}" for name, value in filtered)
+        score = (len(path), 1 if domain == target_host else 0)
+        current = selected.get(name)
+        if current is None or score > current[0]:
+            selected[name] = (score, str(value))
+    return "; ".join(
+        f"{name}={selected[name][1]}"
+        for name in sorted(selected, key=str.lower)
+    )
+
+
+def _binance_login_status_from_page(page: Any) -> tuple[bool, str | None]:
+    page.goto(
+        f"{BINANCE_BASE_URL}/zh-CN/square",
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+    validate_binance_url(page.url, label="登录状态检查地址")
+    result = page.evaluate(
+        """async () => {
+            try {
+                const response = await fetch('/bapi/accounts/v1/public/authcenter/auth', {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                const payload = await response.json();
+                return {
+                    success: Boolean(payload && payload.success),
+                    message: payload && payload.message ? String(payload.message) : null
+                };
+            } catch (error) {
+                return {success: false, message: String(error)};
+            }
+        }"""
+    )
+    if not isinstance(result, dict):
+        return False, "Binance 登录状态返回异常"
+    return bool(result.get("success")), str(result.get("message") or "") or None
+
+
+def _validate_exported_binance_cookie(
+    browser: Any,
+    cookie_header: str,
+) -> tuple[bool, str | None]:
+    validation_context = browser.new_context(locale="zh-CN")
+    try:
+        parsed = BinanceAccountChecker._parse_cookie_header(cookie_header)
+        if parsed:
+            validation_context.add_cookies(parsed)
+        return _binance_login_status_from_page(validation_context.new_page())
+    finally:
+        validation_context.close()
 
 
 @app.post("/api/accounts/import-cookie/start")
@@ -1093,19 +1158,47 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
 
     browser = session["browser"]
     context = session["context"]
+    page = session["page"]
     playwright = session["playwright"]
     try:
-        cookies = context.cookies(["https://www.binance.com", "https://accounts.binance.com"])
+        logged_in, login_error = _binance_login_status_from_page(page)
+        if not logged_in:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Binance 登录态尚未生效。请确认登录窗口已显示账号头像并能打开广场后，"
+                    f"重新导入。{f' Binance 返回：{login_error}' if login_error else ''}"
+                ),
+            )
+        cookies = context.cookies([BINANCE_AUTH_URL])
         cookie_header = _cookie_header_from_playwright_cookies(cookies)
         if not cookie_header:
             raise HTTPException(
                 status_code=400,
                 detail="未读取到 Binance Cookie。请确认已在弹出的窗口里完成登录。",
             )
-        get_db().upsert_account(
+        reusable, export_error = _validate_exported_binance_cookie(
+            browser,
+            cookie_header,
+        )
+        if not reusable:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "登录窗口已登录，但导出的 Cookie 无法复用，请重新登录后再试。"
+                    f"{f' Binance 返回：{export_error}' if export_error else ''}"
+                ),
+            )
+        db = get_db()
+        db.upsert_account(
             account_key=session["account_key"],
             name=session["name"],
             cookie=cookie_header,
+        )
+        db.update_account_check(
+            session["account_key"],
+            signature_key=None,
+            status="valid",
         )
         return {
             "ok": True,
