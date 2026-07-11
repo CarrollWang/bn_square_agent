@@ -4,15 +4,15 @@
         <div class="toolbar">
           <div class="toolbar-title">
             <strong>账号管理</strong>
-          <span>系统建议长期运行在服务器，本地只在需要更新 Cookie 时临时参与</span>
+          <span>当前推荐由 Mac 长期运行，登录、Cookie、发布环境保持在同一台设备</span>
           </div>
           <el-button plain @click="loadAccounts">刷新</el-button>
         </div>
       </template>
 
       <el-alert
-        title="推荐模式：服务器长期运行，本机只在 Cookie 失效时临时更新。"
-        description="“打开登录窗口导入 Cookie”会在当前服务所在机器打开浏览器。部署到无头服务器时，建议在本机临时运行同版本导入，或者直接把 Cookie 粘贴到服务器后台。编辑已有账号时，Cookie 和独立 MCP Token 留空会保留已保存值。"
+        title="推荐模式：Mac 长期运行，直接在当前设备完成 Binance 登录。"
+        description="“打开登录窗口导入 Cookie”会在运行服务的 Mac 上打开浏览器，完成后 Cookie 会加密保存到当前设备的本地数据库，无需再搬运到云服务器。编辑已有账号时，Cookie 和独立 MCP Token 留空会保留已保存值。"
         type="info"
         :closable="false"
         show-icon
@@ -88,7 +88,7 @@
     <div v-if="importedCookie" class="cookie-copy-panel">
       <el-alert
         title="Cookie 已在本机提取完成"
-        description="请复制下方 Cookie，再粘贴到服务器部署的账号管理页面。它只临时保存在当前页面内存中，刷新页面后会清空。"
+        description="Cookie 已加密保存到当前设备的本地数据库。下方明文只用于必要时手工迁移，刷新页面后会清空。"
         type="success"
         :closable="false"
         show-icon
@@ -103,7 +103,7 @@
       <div class="cookie-copy-actions">
         <el-button type="primary" @click="copyImportedCookie">复制 Cookie</el-button>
         <el-button plain @click="clearImportedCookie">清除临时 Cookie</el-button>
-        <span class="muted">目标：服务器网页 → 账号管理 → Binance Cookie</span>
+        <span class="muted">一般无需复制；仅在手工迁移账号时使用</span>
       </div>
     </div>
 
@@ -216,7 +216,7 @@ async function writeImportedCookieToClipboard() {
 async function copyImportedCookie() {
   const copied = await writeImportedCookieToClipboard();
   if (copied) {
-    ElMessage.success("Cookie 已复制，可粘贴到服务器网页");
+    ElMessage.success("Cookie 已复制，可用于手工迁移");
   } else {
     ElMessage.warning("浏览器未允许自动复制，请在文本框中按 Ctrl+A、Ctrl+C 手动复制");
   }
@@ -305,8 +305,8 @@ async function finishCookieImport() {
     const copied = await writeImportedCookieToClipboard();
     ElMessage.success(
       copied
-        ? `Cookie 已导入并复制：${result.cookie_length} 字符，请粘贴到服务器网页`
-        : `Cookie 已导入：${result.cookie_length} 字符，请在下方文本框手动复制`,
+        ? `Cookie 已导入并保存到当前设备，同时已复制：${result.cookie_length} 字符`
+        : `Cookie 已导入并保存到当前设备：${result.cookie_length} 字符`,
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Cookie 导入验证失败";

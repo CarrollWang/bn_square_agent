@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import re
+from threading import get_ident
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from bn_square_agent.publishing.account_check import BinanceAccountChecker
 from bn_square_agent.webapp import (
@@ -85,7 +87,7 @@ class WebApiBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    def test_cookie_export_filters_domains_and_deduplicates_names(self) -> None:
+    def test_cookie_export_preserves_all_binance_cookies_in_browser_order(self) -> None:
         cookies = [
             {"name": "p20t", "value": "global", "domain": ".binance.com", "path": "/"},
             {"name": "p20t", "value": "account", "domain": "accounts.binance.com", "path": "/"},
@@ -93,13 +95,19 @@ class WebApiBoundaryTests(unittest.TestCase):
             {"name": "shared", "value": "yes", "domain": ".binance.com", "path": "/"},
             {"name": "wrong_path", "value": "no", "domain": ".binance.com", "path": "/zh-CN"},
             {"name": "other", "value": "no", "domain": ".example.com", "path": "/"},
+            {"name": "lookalike", "value": "no", "domain": ".notbinance.com", "path": "/"},
         ]
         header = _cookie_header_from_playwright_cookies(cookies)
+        self.assertIn("p20t=global", header)
+        self.assertIn("p20t=account", header)
         self.assertIn("p20t=www", header)
         self.assertIn("shared=yes", header)
-        self.assertNotIn("account", header)
-        self.assertNotIn("wrong_path", header)
-        self.assertEqual(header.count("p20t="), 1)
+        self.assertIn("wrong_path=no", header)
+        self.assertNotIn("other=no", header)
+        self.assertNotIn("lookalike=no", header)
+        self.assertEqual(header.count("p20t="), 3)
+        self.assertLess(header.index("p20t=global"), header.index("p20t=account"))
+        self.assertLess(header.index("p20t=account"), header.index("p20t=www"))
 
     def test_page_session_probe_accepts_private_square_identity(self) -> None:
         result = BinanceAccountChecker.probe_page_session(
@@ -196,6 +204,70 @@ class WebApiBoundaryTests(unittest.TestCase):
             {"server": "socks5://127.0.0.1:18789"},
         )
 
+    def test_cookie_login_operations_share_one_worker_thread(self) -> None:
+        from bn_square_agent.webapp import _run_cookie_login_operation
+
+        async def capture_worker_threads() -> tuple[int, int]:
+            first = await _run_cookie_login_operation(get_ident)
+            second = await _run_cookie_login_operation(get_ident)
+            return first, second
+
+        first, second = asyncio.run(capture_worker_threads())
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, get_ident())
+
+    def test_cookie_import_finish_extracts_without_extra_login_probe(self) -> None:
+        from bn_square_agent.webapp import (
+            AccountCookieImportFinishPayload,
+            cookie_login_sessions,
+            cookie_login_sessions_lock,
+            finish_account_cookie_import,
+        )
+
+        class Context:
+            def cookies(self, _urls=None):
+                return [
+                    {
+                        "name": "session",
+                        "value": "test-value",
+                        "domain": "www.binance.com",
+                        "path": "/",
+                        "expires": -1,
+                    }
+                ]
+
+            def close(self):
+                return None
+
+        class Browser:
+            def close(self):
+                return None
+
+        class PlaywrightHandle:
+            def stop(self):
+                return None
+
+        session_id = "finish-without-probe"
+        with cookie_login_sessions_lock:
+            cookie_login_sessions[session_id] = {
+                "account_key": "test-account",
+                "name": "Test Account",
+                "context": Context(),
+                "browser": Browser(),
+                "playwright": PlaywrightHandle(),
+                "profile_dir": None,
+            }
+
+        db = MagicMock()
+        with patch("bn_square_agent.webapp.get_db", return_value=db):
+            result = finish_account_cookie_import(
+                AccountCookieImportFinishPayload(session_id=session_id)
+            )
+
+        self.assertTrue(result["ok"])
+        db.upsert_account.assert_called_once()
+        db.update_account_check.assert_not_called()
+
     def test_cookie_import_is_disabled_without_a_graphical_session(self) -> None:
         from fastapi import HTTPException
         from bn_square_agent.webapp import (
@@ -217,6 +289,19 @@ class WebApiBoundaryTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail, reason)
+
+    def test_cookie_import_is_available_on_macos(self) -> None:
+        from bn_square_agent.webapp import _cookie_import_browser_capability
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("bn_square_agent.webapp.os.name", "posix"),
+            patch("bn_square_agent.webapp.sys.platform", "darwin"),
+        ):
+            available, reason = _cookie_import_browser_capability()
+
+        self.assertTrue(available)
+        self.assertEqual(reason, "")
 
 
 class McpBoundaryTests(unittest.TestCase):

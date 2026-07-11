@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -14,6 +15,7 @@ import logging
 import os
 import secrets
 import shutil
+import sys
 from pathlib import Path
 import smtplib
 import tempfile
@@ -79,6 +81,22 @@ monitor_state: dict[str, Any] = {
 }
 cookie_login_sessions: dict[str, dict[str, Any]] = {}
 cookie_login_sessions_lock = Lock()
+cookie_login_executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="bn-square-cookie-login",
+)
+
+
+async def _run_cookie_login_operation(operation: Any, *args: Any) -> Any:
+    """Run all sync Playwright operations on one persistent worker thread.
+
+    Playwright's sync API is thread-affine. FastAPI executes separate sync
+    requests on arbitrary worker threads, so a browser created by the start
+    request cannot safely be reused by the finish or cancel request unless all
+    related operations are routed through the same executor thread.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(cookie_login_executor, operation, *args)
 
 
 def _cookie_import_browser_capability() -> tuple[bool, str]:
@@ -89,15 +107,20 @@ def _cookie_import_browser_capability() -> tuple[bool, str]:
             return True, ""
         return (
             False,
-            "当前服务已禁用弹窗导入。请在 Windows 本机运行同版本服务导入，"
+            "当前服务已禁用弹窗导入。请在具备图形桌面的本机运行同版本服务导入，"
             "或直接粘贴 Cookie。SSH 隧道只转发网页，不会把服务器浏览器窗口转到本机。",
         )
-    if os.name == "nt" or os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"):
+    if (
+        os.name == "nt"
+        or sys.platform == "darwin"
+        or os.getenv("DISPLAY")
+        or os.getenv("WAYLAND_DISPLAY")
+    ):
         return True, ""
     return (
         False,
         "当前服务运行在无图形界面的服务器上，无法打开可交互登录窗口。"
-        "请在 Windows 本机运行同版本服务导入，或直接粘贴 Cookie。",
+        "请在 Windows 或 macOS 本机运行同版本服务导入，或直接粘贴 Cookie。",
     )
 
 
@@ -134,6 +157,14 @@ def _close_cookie_login_session(
     profile_dir = session.get("profile_dir")
     if cleanup_profile and profile_dir:
         shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def _close_all_cookie_login_sessions(cleanup_profile: bool = True) -> None:
+    with cookie_login_sessions_lock:
+        sessions = list(cookie_login_sessions.values())
+        cookie_login_sessions.clear()
+    for session in sessions:
+        _close_cookie_login_session(session, cleanup_profile=cleanup_profile)
 
 
 def _cookie_import_profile_dir(account_key: str) -> Path:
@@ -547,7 +578,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
 
 async def material_monitor_loop() -> None:
     while True:
-        _cleanup_expired_cookie_login_sessions()
+        await _run_cookie_login_operation(_cleanup_expired_cookie_login_sessions)
         settings = get_settings()
         if not settings.auto_monitor_enabled:
             monitor_state["running"] = False
@@ -585,11 +616,10 @@ async def lifespan(app_: FastAPI):
     try:
         yield
     finally:
-        with cookie_login_sessions_lock:
-            sessions = list(cookie_login_sessions.values())
-            cookie_login_sessions.clear()
-        for session in sessions:
-            _close_cookie_login_session(session, cleanup_profile=False)
+        await _run_cookie_login_operation(
+            _close_all_cookie_login_sessions,
+            False,
+        )
         task.cancel()
         try:
             await task
@@ -1087,36 +1117,17 @@ BINANCE_AUTH_URL = f"{BINANCE_BASE_URL}{BINANCE_AUTH_PATH}"
 
 
 def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str:
-    target_host = "www.binance.com"
-    now = datetime.now(timezone.utc).timestamp()
-    selected: dict[str, tuple[tuple[int, int], str]] = {}
+    selected: list[tuple[str, str]] = []
     for cookie in cookies:
-        raw_domain = str(cookie.get("domain") or "").strip().lower()
-        domain = raw_domain.lstrip(".")
-        domain_matches = domain == target_host or (
-            raw_domain.startswith(".")
-            and (target_host == domain or target_host.endswith(f".{domain}"))
-        )
-        if not domain_matches:
-            continue
-        path = str(cookie.get("path") or "/")
-        if not BINANCE_AUTH_PATH.startswith(path):
-            continue
-        expires = float(cookie.get("expires") or -1)
-        if expires > 0 and expires <= now:
+        domain = str(cookie.get("domain") or "").strip().lower().lstrip(".")
+        if domain != "binance.com" and not domain.endswith(".binance.com"):
             continue
         name = str(cookie.get("name") or "")
         value = cookie.get("value")
         if not name or value is None:
             continue
-        score = (len(path), 1 if domain == target_host else 0)
-        current = selected.get(name)
-        if current is None or score > current[0]:
-            selected[name] = (score, str(value))
-    return "; ".join(
-        f"{name}={selected[name][1]}"
-        for name in sorted(selected, key=str.lower)
-    )
+        selected.append((name, str(value)))
+    return "; ".join(f"{name}={value}" for name, value in selected)
 
 
 def _is_transient_page_navigation_error(exc: Exception) -> bool:
@@ -1194,7 +1205,6 @@ def _validate_exported_binance_cookie(
         validation_context.close()
 
 
-@app.post("/api/accounts/import-cookie/start")
 def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
     browser_available, browser_reason = _cookie_import_browser_capability()
     if not browser_available:
@@ -1321,70 +1331,29 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
     }
 
 
-@app.post("/api/accounts/import-cookie/finish")
 def finish_account_cookie_import(
     payload: AccountCookieImportFinishPayload,
-    response: Response,
 ) -> dict:
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Pragma"] = "no-cache"
     session = _get_cookie_login_session(payload.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
 
-    browser = session["browser"]
     context = session["context"]
-    page = session["page"]
     try:
-        logged_in, login_error = _binance_login_status_from_page(page)
-        if not logged_in:
-            LOGGER.warning(
-                "Cookie import login probe failed for account=%s: %s",
-                session["account_key"],
-                login_error or "unknown",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Binance 登录态尚未生效。请确认登录窗口已显示账号头像并能打开广场后，"
-                    f"继续登录后再次点击完成导入。"
-                    f"{f' Binance 返回：{login_error}' if login_error else ''}"
-                ),
-            )
-        cookies = context.cookies([BINANCE_AUTH_URL])
+        cookies = context.cookies(
+            ["https://www.binance.com", "https://accounts.binance.com"]
+        )
         cookie_header = _cookie_header_from_playwright_cookies(cookies)
         if not cookie_header:
             raise HTTPException(
                 status_code=400,
                 detail="未读取到 Binance Cookie。请确认已在弹出的窗口里完成登录。",
             )
-        reusable, export_error = _validate_exported_binance_cookie(
-            browser,
-            cookie_header,
-        )
-        if not reusable:
-            LOGGER.warning(
-                "Cookie import reuse probe failed for account=%s: %s",
-                session["account_key"],
-                export_error or "unknown",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "登录窗口已登录，但导出的 Cookie 无法复用，请重新登录后再试。"
-                    f"{f' Binance 返回：{export_error}' if export_error else ''}"
-                ),
-            )
         db = get_db()
         db.upsert_account(
             account_key=session["account_key"],
             name=session["name"],
             cookie=cookie_header,
-        )
-        db.update_account_check(
-            session["account_key"],
-            signature_key=None,
-            status="valid",
         )
         result = {
             "ok": True,
@@ -1401,7 +1370,7 @@ def finish_account_cookie_import(
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"验证 Binance 登录状态失败: {exc}",
+            detail=f"提取 Binance Cookie 失败: {exc}",
         ) from exc
 
     _pop_cookie_login_session(payload.session_id)
@@ -1409,7 +1378,6 @@ def finish_account_cookie_import(
     return result
 
 
-@app.post("/api/accounts/import-cookie/cancel")
 def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
     session = _pop_cookie_login_session(payload.session_id)
     if not session:
@@ -1423,6 +1391,30 @@ def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
     except Exception:
         pass
     return {"ok": True}
+
+
+@app.post("/api/accounts/import-cookie/start")
+async def start_account_cookie_import_route(
+    payload: AccountCookieImportStartPayload,
+) -> dict:
+    return await _run_cookie_login_operation(start_account_cookie_import, payload)
+
+
+@app.post("/api/accounts/import-cookie/finish")
+async def finish_account_cookie_import_route(
+    payload: AccountCookieImportFinishPayload,
+    response: Response,
+) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return await _run_cookie_login_operation(finish_account_cookie_import, payload)
+
+
+@app.post("/api/accounts/import-cookie/cancel")
+async def cancel_account_cookie_import_route(
+    payload: AccountCookieImportFinishPayload,
+) -> dict:
+    return await _run_cookie_login_operation(cancel_account_cookie_import, payload)
 
 
 @app.delete("/api/accounts/{account_key}")
