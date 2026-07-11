@@ -224,6 +224,13 @@ npm --prefix bn_square_agent/web run build
 
 LLM 和 Embedding 有独立测试按钮，方便分别确认连接是否正常。
 
+Cookie 弹窗导入只适用于运行 Web 服务的本机具有图形桌面的场景。SSH `-L`
+只转发 HTTP，不会把服务器 Chromium 窗口带回 Windows；systemd / 无图形服务器应配置
+`COOKIE_LOGIN_BROWSER_ENABLED=0`，后台会禁用按钮并保留手动粘贴 Cookie。Windows
+本机导入时，“独立代理”会同时传给登录浏览器，可填写
+`http://host:port` 或 `socks5://host:port`；留空时可通过
+`COOKIE_LOGIN_PROXY_URL` 配置本地登录浏览器的默认代理。
+
 ## 自动运行流程
 
 1. 在账号管理里添加 Binance Cookie。

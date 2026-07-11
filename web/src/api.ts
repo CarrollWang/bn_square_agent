@@ -52,6 +52,7 @@ export const api = {
     account_key: string;
     name?: string;
     login_url?: string;
+    proxy_url?: string;
   }) =>
     requestJson<CookieImportStartResult>("/api/accounts/import-cookie/start", {
       method: "POST",

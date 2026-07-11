@@ -6,7 +6,10 @@ import unittest
 from unittest.mock import patch
 
 from bn_square_agent.publishing.account_check import BinanceAccountChecker
-from bn_square_agent.webapp import _cookie_header_from_playwright_cookies
+from bn_square_agent.webapp import (
+    _cookie_header_from_playwright_cookies,
+    _cookie_import_launch_options,
+)
 
 
 class FakePage:
@@ -129,6 +132,35 @@ class WebApiBoundaryTests(unittest.TestCase):
             }
         )
         self.assertFalse(profile_dir.exists())
+
+    def test_cookie_import_launch_options_include_proxy(self) -> None:
+        options = _cookie_import_launch_options("socks5://127.0.0.1:18789")
+        self.assertEqual(
+            options["proxy"],
+            {"server": "socks5://127.0.0.1:18789"},
+        )
+
+    def test_cookie_import_is_disabled_without_a_graphical_session(self) -> None:
+        from fastapi import HTTPException
+        from bn_square_agent.webapp import (
+            AccountCookieImportStartPayload,
+            start_account_cookie_import,
+        )
+
+        reason = "当前服务运行在无图形界面的服务器上"
+        with patch(
+            "bn_square_agent.webapp._cookie_import_browser_capability",
+            return_value=(False, reason),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                start_account_cookie_import(
+                    AccountCookieImportStartPayload(
+                        account_key="server-account",
+                        name="Server",
+                    )
+                )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, reason)
 
 
 class McpBoundaryTests(unittest.TestCase):

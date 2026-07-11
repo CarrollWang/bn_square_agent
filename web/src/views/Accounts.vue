@@ -18,6 +18,15 @@
         show-icon
         class="form-alert"
       />
+      <el-alert
+        v-if="!cookieImportBrowserAvailable"
+        title="当前页面不能弹出登录窗口"
+        :description="cookieImportBrowserReason"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="form-alert"
+      />
 
     <el-form :model="form" label-width="140px" class="form-grid">
       <el-form-item label="账号标识">
@@ -56,7 +65,13 @@
       </el-form-item>
       <el-form-item class="wide">
         <el-button type="primary" :loading="saving" @click="saveAccount">保存账号</el-button>
-        <el-button :loading="importing" @click="startCookieImport">在当前机器打开登录窗口导入 Cookie</el-button>
+        <el-button
+          :loading="importing"
+          :disabled="!cookieImportBrowserAvailable"
+          @click="startCookieImport"
+        >
+          在当前机器打开登录窗口导入 Cookie
+        </el-button>
         <el-button
           v-if="cookieImportSessionId"
           type="success"
@@ -135,6 +150,8 @@ const editingAccountKey = ref("");
 const loadingAccountKey = ref("");
 const importing = ref(false);
 const finishingImport = ref(false);
+const cookieImportBrowserAvailable = ref(true);
+const cookieImportBrowserReason = ref("");
 const COOKIE_IMPORT_SESSION_KEY = "bn_square_cookie_import_session";
 const cookieImportSessionId = ref(sessionStorage.getItem(COOKIE_IMPORT_SESSION_KEY) || "");
 const showAdvanced = ref(false);
@@ -157,7 +174,10 @@ function setCookieImportSessionId(sessionId: string) {
 }
 
 async function loadAccounts() {
-  accounts.value = await api.accounts();
+  const [accountItems, settings] = await Promise.all([api.accounts(), api.settings()]);
+  accounts.value = accountItems;
+  cookieImportBrowserAvailable.value = settings.cookie_import_browser_available;
+  cookieImportBrowserReason.value = settings.cookie_import_browser_reason || "";
 }
 
 function resetForm() {
@@ -195,6 +215,10 @@ async function saveAccount() {
 }
 
 async function startCookieImport() {
+  if (!cookieImportBrowserAvailable.value) {
+    ElMessage.warning(cookieImportBrowserReason.value || "当前服务无法打开登录窗口");
+    return;
+  }
   if (cookieImportSessionId.value) {
     ElMessage.warning("当前已有一个 Cookie 导入会话，请先完成或取消")
     return;
@@ -209,9 +233,13 @@ async function startCookieImport() {
     const result = await api.startCookieImport({
       account_key: accountKey,
       name: form.name.trim(),
+      proxy_url: form.proxy_url.trim() || undefined,
     });
     setCookieImportSessionId(result.session_id);
     ElMessage.success(result.message);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "打开登录窗口失败";
+    ElMessage.error({ message, duration: 10000, showClose: true });
   } finally {
     importing.value = false;
   }

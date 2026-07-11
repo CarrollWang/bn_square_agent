@@ -11,6 +11,7 @@ import hashlib
 import json
 import ipaddress
 import logging
+import os
 import secrets
 import shutil
 from pathlib import Path
@@ -33,6 +34,7 @@ from .core.config import (
     Settings,
     mask_url_credentials,
     normalize_proxy_url,
+    playwright_proxy_settings,
 )
 from .knowledge.style_rag import create_embeddings
 from .publishing.account_check import (
@@ -77,6 +79,39 @@ monitor_state: dict[str, Any] = {
 }
 cookie_login_sessions: dict[str, dict[str, Any]] = {}
 cookie_login_sessions_lock = Lock()
+
+
+def _cookie_import_browser_capability() -> tuple[bool, str]:
+    configured = os.getenv("COOKIE_LOGIN_BROWSER_ENABLED", "").strip().lower()
+    if configured:
+        enabled = configured not in {"0", "false", "no", "off"}
+        if enabled:
+            return True, ""
+        return (
+            False,
+            "当前服务已禁用弹窗导入。请在 Windows 本机运行同版本服务导入，"
+            "或直接粘贴 Cookie。SSH 隧道只转发网页，不会把服务器浏览器窗口转到本机。",
+        )
+    if os.name == "nt" or os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"):
+        return True, ""
+    return (
+        False,
+        "当前服务运行在无图形界面的服务器上，无法打开可交互登录窗口。"
+        "请在 Windows 本机运行同版本服务导入，或直接粘贴 Cookie。",
+    )
+
+
+def _cookie_import_launch_options(proxy_url: str = "") -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "headless": False,
+        "locale": "zh-CN",
+        "args": ["--disable-blink-features=AutomationControlled"],
+        "ignore_default_args": ["--enable-automation"],
+    }
+    proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
+    if proxy:
+        options["proxy"] = proxy
+    return options
 
 
 def _close_cookie_login_session(
@@ -657,6 +692,7 @@ class AccountCookieImportStartPayload(BaseModel):
     account_key: str = Field(min_length=1, max_length=64)
     name: str | None = Field(default=None, max_length=120)
     login_url: str | None = Field(default=None, max_length=2_048)
+    proxy_url: str | None = Field(default=None, max_length=2_048)
 
 
 class AccountCookieImportFinishPayload(BaseModel):
@@ -855,6 +891,9 @@ def read_account(account_key: str) -> dict:
 @app.get("/api/settings")
 def read_settings() -> dict:
     settings = get_settings()
+    cookie_import_browser_available, cookie_import_browser_reason = (
+        _cookie_import_browser_capability()
+    )
     return {
         "llm_api_key_configured": bool(settings.llm_api_key),
         "llm_api_key_masked": mask_secret(settings.llm_api_key),
@@ -893,6 +932,8 @@ def read_settings() -> dict:
         "smtp_password_masked": mask_secret(settings.smtp_password),
         "smtp_from": settings.smtp_from,
         "smtp_use_tls": settings.smtp_use_tls,
+        "cookie_import_browser_available": cookie_import_browser_available,
+        "cookie_import_browser_reason": cookie_import_browser_reason,
     }
 
 
@@ -1112,6 +1153,9 @@ def _validate_exported_binance_cookie(
 
 @app.post("/api/accounts/import-cookie/start")
 def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
+    browser_available, browser_reason = _cookie_import_browser_capability()
+    if not browser_available:
+        raise HTTPException(status_code=409, detail=browser_reason)
     _cleanup_expired_cookie_login_sessions()
     key = payload.account_key.strip()
     name = (payload.name or key).strip()
@@ -1153,6 +1197,19 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        requested_proxy_url = (
+            payload.proxy_url.strip()
+            if payload.proxy_url and payload.proxy_url.strip()
+            else os.getenv("COOKIE_LOGIN_PROXY_URL", "").strip()
+        )
+        proxy_url = (
+            normalize_proxy_url(requested_proxy_url)
+            if requested_proxy_url
+            else ""
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     playwright = None
     browser = None
     context = None
@@ -1166,10 +1223,7 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
         playwright = sync_playwright().start()
         context = playwright.chromium.launch_persistent_context(
             str(profile_dir),
-            headless=False,
-            locale="zh-CN",
-            args=["--disable-blink-features=AutomationControlled"],
-            ignore_default_args=["--enable-automation"],
+            **_cookie_import_launch_options(proxy_url),
         )
         browser = context.browser
         if browser is None:
@@ -1194,7 +1248,17 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
             except Exception:
                 pass
         shutil.rmtree(profile_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"打开登录窗口失败: {exc}") from exc
+        detail = f"打开登录窗口失败: {exc}"
+        if any(
+            marker in str(exc)
+            for marker in (
+                "ERR_CONNECTION_RESET",
+                "ERR_CONNECTION_CLOSED",
+                "ERR_PROXY_CONNECTION_FAILED",
+            )
+        ):
+            detail += "。请在本机页面的“独立代理”填写可用的 HTTP/SOCKS5 代理后重试。"
+        raise HTTPException(status_code=500, detail=detail) from exc
 
     with cookie_login_sessions_lock:
         cookie_login_sessions[session_id] = {

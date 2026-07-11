@@ -229,4 +229,6 @@ export interface Settings {
   smtp_password_masked: string;
   smtp_from: string;
   smtp_use_tls: boolean;
+  cookie_import_browser_available: boolean;
+  cookie_import_browser_reason: string;
 }
