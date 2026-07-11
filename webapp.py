@@ -413,7 +413,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
                 queue_cursor = int(monitor_state.get("account_queue_cursor") or 0)
                 queue_runs = await asyncio.to_thread(
                     services.operator.run_pending_material_queue,
-                    limit_per_account=1,
+                    limit_per_account=max(1, settings.material_consume_batch_size),
                     account_offset=queue_cursor,
                     max_total_runs=max(1, settings.material_consume_batch_size),
                 )

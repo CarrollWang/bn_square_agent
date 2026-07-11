@@ -411,20 +411,38 @@ class MultiAccountOperator:
             ordered_accounts = ordered_accounts[shift:] + ordered_accounts[:shift]
         reserved_material_ids: set[int] = set()
         consume_results: list[dict[str, Any]] = []
-        for account in ordered_accounts:
-            if max_total_runs is not None and len(consume_results) >= max_total_runs:
-                break
-            if not self._account_requires_material_run(account):
-                continue
-            queue = self.db.list_material_queue_for_account(
-                account.key,
-                limit=max(limit_per_account * 5, 10),
+        eligible_accounts = [
+            account
+            for account in ordered_accounts
+            if self._account_requires_material_run(account)
+        ]
+        queues = {
+            account.key: iter(
+                self.db.list_material_queue_for_account(
+                    account.key,
+                    limit=max(limit_per_account * 5, 10),
+                )
             )
-            processed = 0
-            for material in queue:
-                material_id = int(material["id"])
-                if material_id in reserved_material_ids:
+            for account in eligible_accounts
+        }
+        processed_by_account = {account.key: 0 for account in eligible_accounts}
+
+        while eligible_accounts:
+            made_progress = False
+            for account in eligible_accounts:
+                if max_total_runs is not None and len(consume_results) >= max_total_runs:
+                    return consume_results
+                if processed_by_account[account.key] >= limit_per_account:
                     continue
+
+                queue = queues[account.key]
+                material = next(queue, None)
+                while material is not None and int(material["id"]) in reserved_material_ids:
+                    material = next(queue, None)
+                if material is None:
+                    continue
+
+                material_id = int(material["id"])
                 run = self.run_material_item_for_account(material_id, account.key)
                 consume_results.append(
                     {
@@ -435,9 +453,9 @@ class MultiAccountOperator:
                     }
                 )
                 reserved_material_ids.add(material_id)
-                processed += 1
-                if max_total_runs is not None and len(consume_results) >= max_total_runs:
-                    break
-                if processed >= limit_per_account:
-                    break
+                processed_by_account[account.key] += 1
+                made_progress = True
+
+            if not made_progress:
+                break
         return consume_results

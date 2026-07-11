@@ -267,8 +267,8 @@ class Settings:
             ),
             material_success_interval_seconds=_bounded_integer(
                 "MATERIAL_SUCCESS_INTERVAL_SECONDS",
-                os.getenv("MATERIAL_SUCCESS_INTERVAL_SECONDS", "600"),
-                600,
+                os.getenv("MATERIAL_SUCCESS_INTERVAL_SECONDS", "3600"),
+                3600,
             ),
             material_failure_interval_seconds=_bounded_integer(
                 "MATERIAL_FAILURE_INTERVAL_SECONDS",
@@ -286,8 +286,8 @@ class Settings:
             not in {"0", "false", "no", "off"},
             material_consume_batch_size=_bounded_integer(
                 "MATERIAL_CONSUME_BATCH_SIZE",
-                os.getenv("MATERIAL_CONSUME_BATCH_SIZE", "1"),
-                1,
+                os.getenv("MATERIAL_CONSUME_BATCH_SIZE", "5"),
+                5,
             ),
             publish_failure_alert_threshold=_bounded_integer(
                 "PUBLISH_FAILURE_ALERT_THRESHOLD",

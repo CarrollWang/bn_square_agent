@@ -20,7 +20,7 @@ from bn_square_agent.publishing.self_hosted_mcp import (
     _publish,
 )
 from bn_square_agent.storage.database import Database, PublishRateLimitError
-from bn_square_agent.workflows.operator import MultiAccountOperator
+from bn_square_agent.workflows.operator import AccountContentRun, MultiAccountOperator
 
 
 class PublisherLogicTests(unittest.TestCase):
@@ -431,6 +431,66 @@ class DatabaseRuntimeTests(unittest.TestCase):
                 database.list_accounts()[0]["square_openapi_key"],
                 "square-fresh-key",
             )
+
+
+class OperatorBatchTests(unittest.TestCase):
+    @staticmethod
+    def _operator(accounts: tuple[AccountConfig, ...]) -> MultiAccountOperator:
+        operator = object.__new__(MultiAccountOperator)
+        operator.accounts = accounts
+        operator.db = MagicMock()
+        operator._account_requires_material_run = MagicMock(return_value=True)
+        operator.run_material_item_for_account = MagicMock(
+            side_effect=lambda material_id, account_key: AccountContentRun(
+                account_key=account_key,
+                status="published",
+            )
+        )
+        return operator
+
+    def test_single_account_can_consume_five_materials_per_round(self) -> None:
+        account = AccountConfig(
+            key="main",
+            name="Main",
+            square_openapi_key="secret",
+        )
+        operator = self._operator((account,))
+        operator.db.list_material_queue_for_account.return_value = [
+            {"id": index, "title": f"material-{index}"}
+            for index in range(1, 7)
+        ]
+
+        result = operator.run_pending_material_queue(
+            limit_per_account=5,
+            max_total_runs=5,
+        )
+
+        self.assertEqual([item["material_item_id"] for item in result], [1, 2, 3, 4, 5])
+        self.assertEqual(operator.run_material_item_for_account.call_count, 5)
+
+    def test_multiple_accounts_receive_materials_round_robin(self) -> None:
+        accounts = (
+            AccountConfig(key="a", name="A", square_openapi_key="a-key"),
+            AccountConfig(key="b", name="B", square_openapi_key="b-key"),
+        )
+        operator = self._operator(accounts)
+        materials = [
+            {"id": index, "title": f"material-{index}"}
+            for index in range(1, 7)
+        ]
+        operator.db.list_material_queue_for_account.side_effect = (
+            lambda account_key, limit: list(materials)
+        )
+
+        result = operator.run_pending_material_queue(
+            limit_per_account=5,
+            max_total_runs=5,
+        )
+
+        self.assertEqual(
+            [(item["account_key"], item["material_item_id"]) for item in result],
+            [("a", 1), ("b", 2), ("a", 3), ("b", 4), ("a", 5)],
+        )
 
 
 if __name__ == "__main__":

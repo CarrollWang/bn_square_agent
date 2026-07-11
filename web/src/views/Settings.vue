@@ -175,10 +175,10 @@ const form = reactive<Record<string, any>>({
   auto_publish: true,
   auto_consume_materials: true,
   material_poll_interval_seconds: 300,
-  material_success_interval_seconds: 600,
+  material_success_interval_seconds: 3600,
   material_failure_interval_seconds: 120,
   material_ttl_seconds: 7200,
-  material_consume_batch_size: 1,
+  material_consume_batch_size: 5,
   publish_failure_alert_threshold: 5,
   max_posts_per_account_per_hour: 5,
   max_posts_per_account_per_day: 80,
@@ -212,10 +212,10 @@ function applySettings(data: Settings) {
   form.auto_publish = Boolean(data.auto_publish);
   form.auto_consume_materials = Boolean(data.auto_consume_materials);
   form.material_poll_interval_seconds = data.material_poll_interval_seconds || 300;
-  form.material_success_interval_seconds = data.material_success_interval_seconds || 600;
+  form.material_success_interval_seconds = data.material_success_interval_seconds || 3600;
   form.material_failure_interval_seconds = data.material_failure_interval_seconds || 120;
   form.material_ttl_seconds = data.material_ttl_seconds || 7200;
-  form.material_consume_batch_size = data.material_consume_batch_size || 1;
+  form.material_consume_batch_size = data.material_consume_batch_size || 5;
   form.publish_failure_alert_threshold = data.publish_failure_alert_threshold || 5;
   form.max_posts_per_account_per_hour = data.max_posts_per_account_per_hour || 5;
   form.max_posts_per_account_per_day = data.max_posts_per_account_per_day || 80;
