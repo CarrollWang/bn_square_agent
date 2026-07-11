@@ -207,6 +207,8 @@ export interface Settings {
   material_ttl_seconds: number;
   material_consume_batch_size: number;
   publish_failure_alert_threshold: number;
+  max_posts_per_account_per_hour: number;
+  max_posts_per_account_per_day: number;
   alert_email_enabled: boolean;
   alert_email_to: string;
   smtp_host: string;

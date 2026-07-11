@@ -13,6 +13,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ..core.config import Settings as AgentSettings
+from ..storage.database import Database, PublishRateLimitError
 from .binance_square_openapi import (
     BinanceSquareOpenAPIClient,
     BinanceSquareOpenAPIError,
@@ -166,8 +167,12 @@ def _check_auth(
         raise HTTPException(status_code=401, detail="MCP server auth failed")
 
 
-def _load_account(account_key: str) -> dict[str, object]:
-    database = AgentSettings.from_env().build_database()
+def _load_account_context(
+    account_key: str,
+) -> tuple[Database, AgentSettings, dict[str, object]]:
+    base_settings = AgentSettings.from_env()
+    database = base_settings.build_database()
+    effective_settings = base_settings.with_overrides(database.get_app_settings())
     account = next(
         (
             row
@@ -180,7 +185,7 @@ def _load_account(account_key: str) -> dict[str, object]:
         raise KeyError(f"账号不存在或已禁用: {account_key}")
     if not str(account.get("square_openapi_key") or "").strip():
         raise ValueError(f"账号 {account_key} 缺少 Binance Square OpenAPI Key")
-    return account
+    return database, effective_settings, account
 
 
 def _ensure_trading_component(content: str, coins: str) -> str:
@@ -225,19 +230,45 @@ def _publish(
     coins: str,
     image_base64: str,
 ) -> dict[str, object]:
-    account = _load_account(account_key)
+    database, agent_settings, account = _load_account_context(account_key)
+    publish_content = _ensure_trading_component(content, coins)
+    if len(publish_content) > MAX_CONTENT_LENGTH:
+        raise ValueError("补充交易组件后 content 过长")
     client = BinanceSquareOpenAPIClient(
         str(account["square_openapi_key"]),
         proxy_url=str(account.get("proxy_url") or ""),
         timeout_seconds=settings.timeout_seconds,
     )
-    publish_content = _ensure_trading_component(content, coins)
-    if len(publish_content) > MAX_CONTENT_LENGTH:
-        raise ValueError("补充交易组件后 content 过长")
-    return client.publish_text(
-        publish_content,
-        image_base64=image_base64,
-    ).as_dict()
+    reservation_id = database.reserve_publish_slot(
+        account_key,
+        hourly_limit=agent_settings.max_posts_per_account_per_hour,
+        daily_limit=agent_settings.max_posts_per_account_per_day,
+    )
+    try:
+        result = client.publish_text(
+            publish_content,
+            image_base64=image_base64,
+        )
+    except (BinanceSquareOpenAPIError, ValueError):
+        database.finalize_publish_slot(reservation_id, status="failed")
+        raise
+    except Exception:
+        database.finalize_publish_slot(reservation_id, status="unknown")
+        raise
+
+    rate_status = (
+        "published"
+        if result.success
+        else "unknown"
+        if result.outcome == "unknown"
+        else "failed"
+    )
+    database.finalize_publish_slot(
+        reservation_id,
+        status=rate_status,
+        post_id=result.post_id,
+    )
+    return result.as_dict()
 
 
 def _build_publish_payload(
@@ -399,6 +430,14 @@ async def handle_mcp(
                 coins=coins,
                 image_base64=image_base64,
             )
+        except PublishRateLimitError as exc:
+            result = {
+                "success": False,
+                "outcome": "rate_limited",
+                "message": str(exc),
+                "post_id": None,
+                "post_url": None,
+            }
         except (KeyError, ValueError) as exc:
             result = {
                 "success": False,

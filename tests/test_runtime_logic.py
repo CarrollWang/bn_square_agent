@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,10 +11,15 @@ from bn_square_agent.core.config import AccountConfig, Settings
 from bn_square_agent.core.secret_store import SecretStore
 from bn_square_agent.publishing.binance_square_openapi import (
     BinanceSquareOpenAPIClient,
+    BinanceSquarePublishResult,
 )
 from bn_square_agent.publishing.chart_image import ChartTarget
-from bn_square_agent.publishing.self_hosted_mcp import _ensure_trading_component
-from bn_square_agent.storage.database import Database
+from bn_square_agent.publishing.self_hosted_mcp import (
+    SelfHostedMCPSettings,
+    _ensure_trading_component,
+    _publish,
+)
+from bn_square_agent.storage.database import Database, PublishRateLimitError
 from bn_square_agent.workflows.operator import MultiAccountOperator
 
 
@@ -143,6 +149,75 @@ class PublisherLogicTests(unittest.TestCase):
         self.assertEqual(result.post_id, "123")
         self.assertEqual(result.post_url, "https://www.binance.com/square/post/123")
 
+    def test_self_hosted_mcp_reserves_and_finalizes_account_quota(self) -> None:
+        database = MagicMock()
+        database.reserve_publish_slot.return_value = "slot-1"
+        effective_settings = MagicMock()
+        effective_settings.max_posts_per_account_per_hour = 5
+        effective_settings.max_posts_per_account_per_day = 80
+        account = {"square_openapi_key": "secret", "proxy_url": ""}
+        client = MagicMock()
+        client.publish_text.return_value = BinanceSquarePublishResult(
+            success=True,
+            outcome="published",
+            message="ok",
+            post_id="123",
+            post_url="https://www.binance.com/square/post/123",
+        )
+        with (
+            patch(
+                "bn_square_agent.publishing.self_hosted_mcp._load_account_context",
+                return_value=(database, effective_settings, account),
+            ),
+            patch(
+                "bn_square_agent.publishing.self_hosted_mcp.BinanceSquareOpenAPIClient",
+                return_value=client,
+            ),
+        ):
+            result = _publish(
+                SelfHostedMCPSettings(
+                    auth_token="token",
+                    allow_insecure_public_bind=False,
+                    timeout_seconds=90,
+                ),
+                content="关注 ETH 升级。",
+                account_key="main",
+                coins="ETH:future",
+                image_base64="",
+            )
+
+        database.reserve_publish_slot.assert_called_once_with(
+            "main",
+            hourly_limit=5,
+            daily_limit=80,
+        )
+        database.finalize_publish_slot.assert_called_once_with(
+            "slot-1",
+            status="published",
+            post_id="123",
+        )
+        client.publish_text.assert_called_once_with(
+            "关注 ETH 升级。\n\n{future}(ETHUSDT)",
+            image_base64="",
+        )
+        self.assertTrue(result["success"])
+
+    def test_publishing_service_preserves_rate_limited_outcome(self) -> None:
+        from bn_square_agent.publishing.publisher import PublishingService
+
+        result = {
+            "success": False,
+            "structuredContent": {
+                "success": False,
+                "outcome": "rate_limited",
+                "message": "账号 main 已达到滚动 1 小时发布上限 5 篇",
+            },
+        }
+        self.assertEqual(
+            PublishingService._publish_outcome(result),
+            "rate_limited",
+        )
+
 
 class SourceRuntimeTests(unittest.TestCase):
     def test_techflow_redirect_cannot_escape_allowed_domain(self) -> None:
@@ -162,6 +237,137 @@ class SourceRuntimeTests(unittest.TestCase):
 
 
 class DatabaseRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _database(root: Path) -> Database:
+        store = SecretStore.from_values(
+            app_secret_key="",
+            secret_key_path=root / "secret.key",
+        )
+        database = Database(root / "test.db", secret_store=store)
+        database.upsert_account(
+            account_key="main",
+            name="Main",
+            square_openapi_key="square-secret-key",
+        )
+        return database
+
+    def test_publish_rate_limit_blocks_sixth_post_in_rolling_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = self._database(Path(temp_dir))
+            now = datetime(2026, 7, 12, tzinfo=timezone.utc)
+            for index in range(5):
+                slot = database.reserve_publish_slot(
+                    "main",
+                    hourly_limit=5,
+                    daily_limit=80,
+                    now=now + timedelta(minutes=index),
+                )
+                database.finalize_publish_slot(slot, status="published")
+            with self.assertRaisesRegex(PublishRateLimitError, "1 小时"):
+                database.reserve_publish_slot(
+                    "main",
+                    hourly_limit=5,
+                    daily_limit=80,
+                    now=now + timedelta(minutes=5),
+                )
+
+    def test_publish_rate_limit_blocks_eighty_first_post_in_rolling_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = self._database(Path(temp_dir))
+            now = datetime(2026, 7, 12, tzinfo=timezone.utc)
+            for index in range(80):
+                event_at = now + timedelta(minutes=index * 15)
+                slot = database.reserve_publish_slot(
+                    "main",
+                    hourly_limit=5,
+                    daily_limit=80,
+                    now=event_at,
+                )
+                database.finalize_publish_slot(slot, status="published")
+            with self.assertRaisesRegex(PublishRateLimitError, "24 小时"):
+                database.reserve_publish_slot(
+                    "main",
+                    hourly_limit=5,
+                    daily_limit=80,
+                    now=now + timedelta(minutes=80 * 15),
+                )
+
+    def test_failed_publish_does_not_consume_quota_but_unknown_does(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = self._database(Path(temp_dir))
+            now = datetime(2026, 7, 12, tzinfo=timezone.utc)
+            failed_slot = database.reserve_publish_slot(
+                "main",
+                hourly_limit=1,
+                daily_limit=1,
+                now=now,
+            )
+            database.finalize_publish_slot(failed_slot, status="failed")
+            unknown_slot = database.reserve_publish_slot(
+                "main",
+                hourly_limit=1,
+                daily_limit=1,
+                now=now + timedelta(minutes=1),
+            )
+            database.finalize_publish_slot(unknown_slot, status="unknown")
+            with self.assertRaises(PublishRateLimitError):
+                database.reserve_publish_slot(
+                    "main",
+                    hourly_limit=1,
+                    daily_limit=1,
+                    now=now + timedelta(minutes=2),
+                )
+
+    def test_rate_limit_migration_bootstraps_existing_published_posts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = self._database(root)
+            published_at = datetime(2026, 7, 12, tzinfo=timezone.utc)
+            with database.connect() as connection:
+                source_id = connection.execute(
+                    """
+                    INSERT INTO source_posts (
+                        account_key, author, title, content, url,
+                        source_created_at, role, hash, analysis_status, created_at
+                    ) VALUES ('main', NULL, 'title', 'source', NULL, NULL,
+                        'material', 'bootstrap-source', 'not_required', ?)
+                    """,
+                    (published_at.isoformat(),),
+                ).lastrowid
+                connection.execute(
+                    """
+                    INSERT INTO generated_posts (
+                        source_post_id, candidate_index, original_content,
+                        content, status, review_json, rewrite_count,
+                        created_at, updated_at, account_key, publish_status,
+                        publish_json, published_at
+                    ) VALUES (?, 0, 'source', 'post', 'approved', NULL, 0,
+                        ?, ?, 'main', 'published', NULL, ?)
+                    """,
+                    (
+                        source_id,
+                        published_at.isoformat(),
+                        published_at.isoformat(),
+                        published_at.isoformat(),
+                    ),
+                )
+                connection.execute("DROP TABLE publish_rate_events")
+
+            reloaded = Database(
+                root / "test.db",
+                secret_store=SecretStore.from_values(
+                    app_secret_key="",
+                    secret_key_path=root / "secret.key",
+                ),
+            )
+            with self.assertRaises(PublishRateLimitError):
+                reloaded.reserve_publish_slot(
+                    "main",
+                    hourly_limit=1,
+                    daily_limit=1,
+                    now=published_at + timedelta(minutes=1),
+                )
+
     def test_editorial_queue_does_not_require_long_or_short_direction(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

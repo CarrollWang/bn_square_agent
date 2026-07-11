@@ -171,7 +171,10 @@ class MultiAccountOperator:
                         or result.get("message")
                         or "发布失败"
                     )
-                    if result.get("outcome") == "unknown":
+                    if result.get("outcome") == "rate_limited":
+                        run.status = "rate_limited"
+                        run.error = f"publish_rate_limited: {detail}"
+                    elif result.get("outcome") == "unknown":
                         run.error = f"publish_outcome_unknown: {detail}"
                     else:
                         run.error = detail
@@ -239,6 +242,19 @@ class MultiAccountOperator:
         if run.status == "already_published":
             return
         if run.status == "generated":
+            return
+        if run.status == "rate_limited":
+            self.db.save_material_account_run(
+                material_item_id,
+                account_key=run.account_key,
+                status="failed",
+                generated_id=run.approved_generated_id,
+                publish_result=(
+                    run.publish_result.result if run.publish_result else None
+                ),
+                error=run.error,
+                increment_attempts=False,
+            )
             return
         self.db.save_material_account_run(
             material_item_id,

@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Iterator
+from uuid import uuid4
 
 from ..core.secret_store import SecretStore
 from ..models.schemas import ContentReview, PostAnalysis, StyleProfile
@@ -30,6 +31,10 @@ SECRET_APP_SETTING_KEYS = frozenset(
         "SMTP_PASSWORD",
     }
 )
+
+
+class PublishRateLimitError(ValueError):
+    pass
 
 
 def utc_now() -> str:
@@ -125,6 +130,12 @@ class Database:
         }
 
     def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        publish_rate_table_existed = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'publish_rate_events'
+            """
+        ).fetchone() is not None
         source_columns = self._columns(connection, "source_posts")
         if "account_key" not in source_columns:
             connection.execute(
@@ -234,6 +245,19 @@ class Database:
                 FOREIGN KEY(generated_id) REFERENCES generated_posts(id)
             );
 
+            CREATE TABLE IF NOT EXISTS publish_rate_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reservation_id TEXT NOT NULL UNIQUE,
+                account_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('reserved', 'published', 'unknown', 'failed')
+                ),
+                post_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(account_key) REFERENCES accounts(account_key)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_material_items_status_tag_created
                 ON material_items(status, tag_status, created_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_generated_posts_account_status_created
@@ -242,6 +266,8 @@ class Database:
                 ON generated_posts(publish_status, published_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_material_account_runs_material_status
                 ON material_account_runs(material_item_id, status, account_key);
+            CREATE INDEX IF NOT EXISTS idx_publish_rate_events_account_created
+                ON publish_rate_events(account_key, created_at DESC, status);
             """
         )
         account_columns = self._columns(connection, "accounts")
@@ -271,6 +297,26 @@ class Database:
             connection.execute("ALTER TABLE accounts ADD COLUMN checked_at TEXT")
         if "check_error" not in account_columns:
             connection.execute("ALTER TABLE accounts ADD COLUMN check_error TEXT")
+        if not publish_rate_table_existed:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO publish_rate_events (
+                    reservation_id, account_key, status, post_id,
+                    created_at, updated_at
+                )
+                SELECT
+                    'bootstrap-generated-' || g.id,
+                    g.account_key,
+                    'published',
+                    NULL,
+                    g.published_at,
+                    g.published_at
+                FROM generated_posts g
+                JOIN accounts a ON a.account_key = g.account_key
+                WHERE g.publish_status = 'published'
+                    AND g.published_at IS NOT NULL
+                """
+            )
         material_columns = self._columns(connection, "material_items")
         self._ensure_material_source_types(connection)
         self._ensure_material_items_source_fk(connection)
@@ -403,6 +449,108 @@ class Database:
                 (expires_at, utc_now(), job_name, owner_id),
             )
             return cursor.rowcount == 1
+
+    def reserve_publish_slot(
+        self,
+        account_key: str,
+        *,
+        hourly_limit: int,
+        daily_limit: int,
+        now: datetime | None = None,
+    ) -> str:
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+        hour_start = (current - timedelta(hours=1)).isoformat()
+        day_start = (current - timedelta(hours=24)).isoformat()
+        stale_start = (current - timedelta(minutes=10)).isoformat()
+        reservation_id = uuid4().hex
+        counted_statuses = ("reserved", "published", "unknown")
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # A process may die after the OpenAPI request but before finalizing
+            # the reservation. Count stale in-flight requests as unknown rather
+            # than freeing the slot and risking a duplicate burst.
+            connection.execute(
+                """
+                UPDATE publish_rate_events
+                SET status = 'unknown', updated_at = ?
+                WHERE status = 'reserved' AND created_at < ?
+                """,
+                (current.isoformat(), stale_start),
+            )
+            hour_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM publish_rate_events
+                    WHERE account_key = ?
+                        AND status IN (?, ?, ?)
+                        AND created_at >= ?
+                    """,
+                    (account_key, *counted_statuses, hour_start),
+                ).fetchone()[0]
+            )
+            if hour_count >= hourly_limit:
+                raise PublishRateLimitError(
+                    f"账号 {account_key} 已达到滚动 1 小时发布上限 {hourly_limit} 篇"
+                )
+
+            day_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM publish_rate_events
+                    WHERE account_key = ?
+                        AND status IN (?, ?, ?)
+                        AND created_at >= ?
+                    """,
+                    (account_key, *counted_statuses, day_start),
+                ).fetchone()[0]
+            )
+            if day_count >= daily_limit:
+                raise PublishRateLimitError(
+                    f"账号 {account_key} 已达到滚动 24 小时发布上限 {daily_limit} 篇"
+                )
+
+            connection.execute(
+                """
+                INSERT INTO publish_rate_events (
+                    reservation_id, account_key, status, post_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'reserved', NULL, ?, ?)
+                """,
+                (
+                    reservation_id,
+                    account_key,
+                    current.isoformat(),
+                    current.isoformat(),
+                ),
+            )
+        return reservation_id
+
+    def finalize_publish_slot(
+        self,
+        reservation_id: str,
+        *,
+        status: str,
+        post_id: str | None = None,
+    ) -> None:
+        if status not in {"published", "unknown", "failed"}:
+            raise ValueError(f"发布额度状态无效: {status}")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE publish_rate_events
+                SET status = ?, post_id = ?, updated_at = ?
+                WHERE reservation_id = ? AND status = 'reserved'
+                """,
+                (status, post_id, utc_now(), reservation_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"发布额度预约不存在或已结束: {reservation_id}")
 
     def _ensure_material_items_source_fk(self, connection: sqlite3.Connection) -> None:
         foreign_keys = connection.execute(

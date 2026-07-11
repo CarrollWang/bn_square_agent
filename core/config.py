@@ -19,6 +19,8 @@ SETTING_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
     "MATERIAL_TTL_SECONDS": (60, 604_800),
     "MATERIAL_CONSUME_BATCH_SIZE": (1, 20),
     "PUBLISH_FAILURE_ALERT_THRESHOLD": (1, 100),
+    "MAX_POSTS_PER_ACCOUNT_PER_HOUR": (1, 5),
+    "MAX_POSTS_PER_ACCOUNT_PER_DAY": (1, 80),
     "SMTP_PORT": (1, 65_535),
 }
 
@@ -194,6 +196,8 @@ class Settings:
     auto_consume_materials: bool
     material_consume_batch_size: int
     publish_failure_alert_threshold: int
+    max_posts_per_account_per_hour: int
+    max_posts_per_account_per_day: int
     alert_email_enabled: bool
     alert_email_to: str
     smtp_host: str
@@ -289,6 +293,16 @@ class Settings:
                 "PUBLISH_FAILURE_ALERT_THRESHOLD",
                 os.getenv("PUBLISH_FAILURE_ALERT_THRESHOLD", "5"),
                 5,
+            ),
+            max_posts_per_account_per_hour=_bounded_integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_HOUR",
+                os.getenv("MAX_POSTS_PER_ACCOUNT_PER_HOUR", "5"),
+                5,
+            ),
+            max_posts_per_account_per_day=_bounded_integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_DAY",
+                os.getenv("MAX_POSTS_PER_ACCOUNT_PER_DAY", "80"),
+                80,
             ),
             alert_email_enabled=os.getenv("ALERT_EMAIL_ENABLED", "0")
             .strip()
@@ -444,6 +458,14 @@ class Settings:
             publish_failure_alert_threshold=integer(
                 "PUBLISH_FAILURE_ALERT_THRESHOLD",
                 self.publish_failure_alert_threshold,
+            ),
+            max_posts_per_account_per_hour=integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_HOUR",
+                self.max_posts_per_account_per_hour,
+            ),
+            max_posts_per_account_per_day=integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_DAY",
+                self.max_posts_per_account_per_day,
             ),
             alert_email_enabled=boolean(
                 "ALERT_EMAIL_ENABLED",

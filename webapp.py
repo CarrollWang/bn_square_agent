@@ -181,6 +181,8 @@ def _account_health(
 def _consume_results_have_failure(consume_results: list[dict[str, Any]]) -> bool:
     for item in consume_results:
         for run in item.get("runs") or []:
+            if (run.get("publish_result") or {}).get("outcome") == "rate_limited":
+                continue
             if run.get("error") or run.get("publish_success") is False:
                 return True
     return False
@@ -194,6 +196,14 @@ def _consume_results_have_success(consume_results: list[dict[str, Any]]) -> bool
     return False
 
 
+def _consume_results_have_rate_limit(consume_results: list[dict[str, Any]]) -> bool:
+    for item in consume_results:
+        for run in item.get("runs") or []:
+            if (run.get("publish_result") or {}).get("outcome") == "rate_limited":
+                return True
+    return False
+
+
 def _consume_results_failure_count(consume_results: list[dict[str, Any]]) -> int:
     count = 0
     for item in consume_results:
@@ -201,6 +211,8 @@ def _consume_results_failure_count(consume_results: list[dict[str, Any]]) -> int
         if not runs and item.get("error"):
             count += 1
         for run in runs:
+            if (run.get("publish_result") or {}).get("outcome") == "rate_limited":
+                continue
             if run.get("error") or run.get("publish_success") is False:
                 count += 1
     return count
@@ -299,6 +311,8 @@ def _next_monitor_delay(settings: Settings, result: dict[str, Any]) -> tuple[int
     source_results = result.get("results") or []
     if _consume_results_have_failure(consume_results):
         return max(30, settings.material_failure_interval_seconds), "publish_failed"
+    if _consume_results_have_rate_limit(consume_results):
+        return 60 * 60, "rate_limited"
     if consume_results:
         return max(30, settings.material_success_interval_seconds), "published"
     if any(item.get("error") for item in source_results):
@@ -605,6 +619,8 @@ class SettingsPayload(BaseModel):
     material_ttl_seconds: int | None = Field(default=None, ge=60, le=604_800)
     material_consume_batch_size: int | None = Field(default=None, ge=1, le=20)
     publish_failure_alert_threshold: int | None = Field(default=None, ge=1, le=100)
+    max_posts_per_account_per_hour: int | None = Field(default=None, ge=1, le=5)
+    max_posts_per_account_per_day: int | None = Field(default=None, ge=1, le=80)
     alert_email_enabled: bool | None = None
     alert_email_to: str | None = Field(default=None, max_length=1_000)
     smtp_host: str | None = Field(default=None, max_length=253)
@@ -830,6 +846,8 @@ def read_settings() -> dict:
         "material_ttl_seconds": settings.material_ttl_seconds,
         "material_consume_batch_size": settings.material_consume_batch_size,
         "publish_failure_alert_threshold": settings.publish_failure_alert_threshold,
+        "max_posts_per_account_per_hour": settings.max_posts_per_account_per_hour,
+        "max_posts_per_account_per_day": settings.max_posts_per_account_per_day,
         "alert_email_enabled": settings.alert_email_enabled,
         "alert_email_to": settings.alert_email_to,
         "smtp_host": settings.smtp_host,
@@ -878,6 +896,8 @@ def save_settings(payload: SettingsPayload) -> dict:
         "material_ttl_seconds": "MATERIAL_TTL_SECONDS",
         "material_consume_batch_size": "MATERIAL_CONSUME_BATCH_SIZE",
         "publish_failure_alert_threshold": "PUBLISH_FAILURE_ALERT_THRESHOLD",
+        "max_posts_per_account_per_hour": "MAX_POSTS_PER_ACCOUNT_PER_HOUR",
+        "max_posts_per_account_per_day": "MAX_POSTS_PER_ACCOUNT_PER_DAY",
         "smtp_port": "SMTP_PORT",
     }
     data = payload.model_dump()
@@ -1506,6 +1526,8 @@ def material_monitor_status() -> dict:
         "auto_monitor_enabled": settings.auto_monitor_enabled,
         "consume_batch_size": settings.material_consume_batch_size,
         "publish_failure_alert_threshold": settings.publish_failure_alert_threshold,
+        "max_posts_per_account_per_hour": settings.max_posts_per_account_per_hour,
+        "max_posts_per_account_per_day": settings.max_posts_per_account_per_day,
         "alert_email_enabled": settings.alert_email_enabled,
         "alert_email_configured": bool(
             settings.alert_email_to

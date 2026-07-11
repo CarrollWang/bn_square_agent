@@ -6,7 +6,13 @@ import re
 import unittest
 
 from bn_square_agent.publishing.self_hosted_mcp import _tool_definition
-from bn_square_agent.webapp import _basic_auth_matches, publish_evidence
+from bn_square_agent.webapp import (
+    _basic_auth_matches,
+    _consume_results_failure_count,
+    _consume_results_have_failure,
+    _next_monitor_delay,
+    publish_evidence,
+)
 
 
 class WebBoundaryTests(unittest.TestCase):
@@ -38,6 +44,38 @@ class WebBoundaryTests(unittest.TestCase):
         self.assertEqual(
             post_url,
             "https://www.binance.com/zh-CN/square/post/343615300021041",
+        )
+
+    def test_rate_limit_is_not_counted_as_publish_failure(self) -> None:
+        consume_results = [
+            {
+                "runs": [
+                    {
+                        "error": "publish_rate_limited: hourly limit",
+                        "publish_success": False,
+                        "publish_result": {"outcome": "rate_limited"},
+                    }
+                ]
+            }
+        ]
+        self.assertFalse(_consume_results_have_failure(consume_results))
+        self.assertEqual(_consume_results_failure_count(consume_results), 0)
+
+        settings = type(
+            "SettingsStub",
+            (),
+            {
+                "material_failure_interval_seconds": 900,
+                "material_success_interval_seconds": 7200,
+                "material_poll_interval_seconds": 900,
+            },
+        )()
+        self.assertEqual(
+            _next_monitor_delay(
+                settings,
+                {"consume_results": consume_results, "results": []},
+            ),
+            (3600, "rate_limited"),
         )
 
 

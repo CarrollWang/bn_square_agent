@@ -171,10 +171,34 @@ class PublishingService:
             self.db.mark_published(generated_id, result=result, success=False)
             return PublishResult(account.key, generated_id, False, result)
         if "outcome" not in result:
-            result["outcome"] = "published" if self._is_publish_success(result) else "failed"
+            result["outcome"] = self._publish_outcome(result) or (
+                "published" if self._is_publish_success(result) else "failed"
+            )
         success = self._is_publish_success(result)
         self.db.mark_published(generated_id, result=result, success=success)
         return PublishResult(account.key, generated_id, success, result)
+
+    @staticmethod
+    def _publish_outcome(result: dict[str, Any]) -> str | None:
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict) and structured.get("outcome"):
+            return str(structured["outcome"])
+
+        content = result.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    continue
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("outcome"):
+                    return str(payload["outcome"])
+        return None
 
     @staticmethod
     def _is_publish_success(result: dict[str, Any]) -> bool:
