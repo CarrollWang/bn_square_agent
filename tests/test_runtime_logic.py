@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from bn_square_agent.ai.material_tagger import MaterialTagger
 from bn_square_agent.core.config import AccountConfig, Settings
 from bn_square_agent.core.secret_store import SecretStore
 from bn_square_agent.publishing.binance_square_openapi import (
@@ -88,6 +89,37 @@ class SourceRuntimeTests(unittest.TestCase):
 
 
 class DatabaseRuntimeTests(unittest.TestCase):
+    def test_editorial_queue_does_not_require_long_or_short_direction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = SecretStore.from_values(
+                app_secret_key="",
+                secret_key_path=root / "secret.key",
+            )
+            database = Database(root / "test.db", secret_store=store)
+            source_id = database.upsert_material_source(
+                name="TechFlow",
+                source_type="techflow_newsletter",
+                url="https://www.techflowpost.com/newsletter?is_hot=1",
+            )
+            item_id, _ = database.add_material_item(
+                source_id=source_id,
+                title="BTC 矿企公布月度产量",
+                content="矿企公布最新比特币产量和持仓数据，但没有给出任何多空判断。",
+            )
+            tag = MaterialTagger().tag(
+                title="BTC 矿企公布月度产量",
+                content="矿企公布最新比特币产量和持仓数据，但没有给出任何多空判断。",
+            )
+            database.save_material_tag(
+                item_id,
+                tag_status="accepted",
+                tag=tag.to_dict(),
+            )
+
+            queue = database.list_material_queue_for_account("main", limit=10)
+            self.assertEqual([item["id"] for item in queue], [item_id])
+
     def test_openapi_key_remains_encrypted_and_can_be_rotated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

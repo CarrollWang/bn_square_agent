@@ -24,6 +24,7 @@ class ContentState(TypedDict, total=False):
     content: str
     title: str | None
     url: str | None
+    source_name: str | None
     profile: StyleProfile
     similar_analyses: list[dict[str, Any]]
     candidates: list[Candidate]
@@ -38,14 +39,15 @@ def default_style_profile(account_key: str) -> StyleProfile:
     return StyleProfile.model_construct(
         persona=f"{account_key} auto operator",
         risk_level="中",
-        favorite_topics=["加密市场", "合约走势", "热点代币"],
+        favorite_topics=["加密市场", "行业事件", "AI 与 Web3"],
         favorite_words=["关注", "可能", "继续", "位置", "风险"],
-        opening_style="直接点出代币和方向，开头给出明确观点。",
+        opening_style="直接点出关键事实或代币观点，开头不给空泛铺垫。",
         tone="短句、直接、有运营感，但避免承诺收益。",
         beliefs=[
             "只基于素材已有信息改写，不新增未经素材支持的事实。",
             "观点可以明确，但预测必须保留不确定表达。",
-            "优先保留代币、方向、关键事件和风险提示。",
+            "优先保留主体、关键事实、来源、明确方向和风险提示。",
+            "素材没有交易方向时不自行制造多空结论。",
         ],
         structure_patterns=[
             "先说结论，再解释素材中的触发点。",
@@ -105,6 +107,17 @@ def build_content_graph(
     *,
     max_rewrites: int = 2,
 ):
+    def material_context(state: ContentState) -> str:
+        parts = []
+        if state.get("source_name"):
+            parts.append(f"来源：{state['source_name']}")
+        if state.get("title"):
+            parts.append(f"标题：{state['title']}")
+        parts.append(f"正文：{state['content']}")
+        if state.get("url"):
+            parts.append(f"原文链接：{state['url']}")
+        return "\n".join(parts)
+
     def prepare(state: ContentState) -> ContentState:
         account_key = state.get("account_key", "default")
         profile = db.get_profile(account_key) or default_style_profile(account_key)
@@ -138,7 +151,7 @@ def build_content_graph(
 
     def generate(state: ContentState) -> ContentState:
         candidates = writer.generate(
-            material=state["content"],
+            material=material_context(state),
             profile=state["profile"],
             similar_analyses=state["similar_analyses"],
         )
@@ -156,7 +169,7 @@ def build_content_graph(
         reviews = {}
         for candidate in state["candidates"]:
             reviews[candidate.candidate_index] = reviewer.review(
-                material=state["content"],
+                material=material_context(state),
                 profile=state["profile"],
                 similar_analyses=state["similar_analyses"],
                 candidate=candidate,
@@ -178,7 +191,7 @@ def build_content_graph(
             review = state["reviews"][candidate.candidate_index]
             if not review.passed and counts[candidate.candidate_index] < max_rewrites:
                 candidate = writer.rewrite(
-                    material=state["content"],
+                    material=material_context(state),
                     profile=state["profile"],
                     candidate=candidate,
                     review=review,

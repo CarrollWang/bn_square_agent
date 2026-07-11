@@ -126,6 +126,7 @@ class MultiAccountOperator:
         content: str,
         title: str | None,
         url: str | None,
+        source_name: str | None,
         future_symbol: str | None,
     ) -> AccountContentRun:
         run = AccountContentRun(account_key=account.key)
@@ -141,6 +142,7 @@ class MultiAccountOperator:
                     "content": content,
                     "title": title,
                     "url": url,
+                    "source_name": source_name,
                 }
             )
             run.generated_ids = state.get("generated_ids", [])
@@ -304,6 +306,7 @@ class MultiAccountOperator:
         content: str,
         title: str | None = None,
         url: str | None = None,
+        source_name: str | None = None,
         future_symbol: str | None = None,
     ) -> list[AccountContentRun]:
         runs = []
@@ -314,6 +317,7 @@ class MultiAccountOperator:
                     content=content,
                     title=title,
                     url=url,
+                    source_name=source_name,
                     future_symbol=future_symbol,
                 )
             )
@@ -341,6 +345,7 @@ class MultiAccountOperator:
                 content=item["content"],
                 title=item.get("title"),
                 url=item.get("url"),
+                source_name=item.get("source_name"),
                 future_symbol=symbol,
             )
             self._save_material_run(material_item_id, run)
@@ -364,6 +369,7 @@ class MultiAccountOperator:
             content=item["content"],
             title=item.get("title"),
             url=item.get("url"),
+            source_name=item.get("source_name"),
             future_symbol=symbol,
         )
         self._save_material_run(material_item_id, run)

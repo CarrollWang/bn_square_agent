@@ -43,17 +43,18 @@ class MaterialTaggerTests(unittest.TestCase):
         self.assertEqual(tag.symbol, "BTCUSDT")
         self.assertEqual(tag.direction, "long")
 
-    def test_rejects_material_without_explicit_direction(self) -> None:
+    def test_accepts_crypto_news_without_inventing_direction(self) -> None:
         tag = MaterialTagger().tag(
             title="BitFuFu 6 月产出 125 枚 BTC",
             content="公司公布最新运营数据和比特币持仓量。",
         )
-        self.assertFalse(tag.accepted)
+        self.assertTrue(tag.accepted)
         self.assertEqual(tag.symbol, "BTCUSDT")
         self.assertEqual(tag.direction, "unknown")
-        self.assertIn("missing_direction", tag.reasons)
+        self.assertIn("direction_not_explicit", tag.reasons)
+        self.assertIn("crypto", tag.topics)
 
-    def test_supports_direction_variants_and_rejects_conflicts(self) -> None:
+    def test_supports_direction_variants_without_requiring_direction(self) -> None:
         short_tag = MaterialTagger().tag(
             title="ETH 偏空",
             content="反弹做空，继续关注上方压力。",
@@ -63,11 +64,26 @@ class MaterialTaggerTests(unittest.TestCase):
 
         conflict_tag = MaterialTagger().tag(
             title="BTC 多空都有机会",
-            content="多头等待突破，空头关注跌破。",
+            content="多头等待关键位置突破，空头关注支撑跌破，目前行情还没有选择明确方向。",
         )
-        self.assertFalse(conflict_tag.accepted)
+        self.assertTrue(conflict_tag.accepted)
         self.assertEqual(conflict_tag.direction, "unknown")
         self.assertIn("conflicting_direction", conflict_tag.reasons)
+
+    def test_accepts_ai_news_and_rejects_unrelated_market_news(self) -> None:
+        ai_tag = MaterialTagger().tag(
+            title="a16z 联创加入美联储 AI 工作组",
+            content="工作组将研究人工智能对生产力与就业的影响。",
+        )
+        self.assertTrue(ai_tag.accepted)
+        self.assertIn("ai", ai_tag.topics)
+
+        unrelated = MaterialTagger().tag(
+            title="交易员加仓标普 500 空单",
+            content="该仓位累计亏损达到 2200 万美元，市场仍在观察后续变化。",
+        )
+        self.assertFalse(unrelated.accepted)
+        self.assertIn("missing_relevant_topic", unrelated.reasons)
 
 
 class StaticAssetTests(unittest.TestCase):

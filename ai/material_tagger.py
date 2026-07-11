@@ -31,6 +31,7 @@ class MaterialTag:
     token: str | None
     symbol: str | None
     direction: str
+    topics: list[str]
     has_chart_symbol: bool
     reasons: list[str]
     strategy: str
@@ -40,36 +41,103 @@ class MaterialTag:
 
 
 class MaterialTagger:
-    STRATEGY = "directional_v1"
+    STRATEGY = "editorial_v2"
+    MIN_EDITORIAL_LENGTH = 24
+
+    CRYPTO_PATTERNS = (
+        "加密",
+        "区块链",
+        "链上",
+        "币安",
+        "交易所",
+        "代币",
+        "稳定币",
+        "钱包",
+        "主网",
+        "矿工",
+        "矿池",
+        "挖矿",
+        "巨鲸",
+        "空投",
+        "合约",
+        "现货",
+        "去中心化",
+        "web3",
+        "defi",
+        "dex",
+        "binance",
+        "ethereum",
+        "bitcoin",
+        "solana",
+    )
+    AI_PATTERNS = (
+        "人工智能",
+        "大模型",
+        "智能体",
+        "生成式 ai",
+        "openai",
+        "anthropic",
+        "chatgpt",
+        "claude",
+        "gemini",
+        "deepseek",
+        "智谱",
+    )
 
     def tag(self, *, title: str | None, content: str) -> MaterialTag:
         text = f"{title or ''}\n{content}".strip()
         token, symbol = self._extract_token(text)
         direction, has_conflict = self._extract_direction(text)
+        topics = self._extract_topics(text, token=token)
         reasons: list[str] = []
 
         if not text:
             reasons.append("empty_content")
-        if not token:
-            reasons.append("missing_token")
+        if not topics:
+            reasons.append("missing_relevant_topic")
+        compact_length = len(re.sub(r"\s+", "", text))
+        directional_brief = bool(
+            token and direction in {"long", "short"} and compact_length >= 12
+        )
+        if compact_length < self.MIN_EDITORIAL_LENGTH and not directional_brief:
+            reasons.append("content_too_short")
         if has_conflict:
             reasons.append("conflicting_direction")
         elif direction == "unknown":
-            reasons.append("missing_direction")
+            reasons.append("direction_not_explicit")
 
-        accepted = bool(text and token and direction in {"long", "short"})
+        accepted = bool(
+            text
+            and topics
+            and (compact_length >= self.MIN_EDITORIAL_LENGTH or directional_brief)
+        )
         if accepted:
-            reasons.append("ready_for_directional_consume")
+            reasons.append("ready_for_editorial_consume")
 
         return MaterialTag(
             accepted=accepted,
             token=token,
             symbol=symbol,
             direction=direction,
+            topics=topics,
             has_chart_symbol=bool(symbol),
             reasons=reasons,
             strategy=self.STRATEGY,
         )
+
+    def _extract_topics(self, text: str, *, token: str | None) -> list[str]:
+        lowered = text.lower()
+        topics: list[str] = []
+        if token or any(pattern in lowered for pattern in self.CRYPTO_PATTERNS):
+            topics.append("crypto")
+        has_ai = any(pattern in lowered for pattern in self.AI_PATTERNS) or bool(
+            re.search(r"(?<![A-Za-z])AI(?![A-Za-z])", text, re.I)
+            or re.search(r"(?<![A-Za-z])LLM(?![A-Za-z])", text, re.I)
+            or re.search(r"(?<![A-Za-z])Agent(?:s)?(?![A-Za-z])", text, re.I)
+        )
+        if has_ai:
+            topics.append("ai")
+        return topics
 
     def _extract_token(self, text: str) -> tuple[str | None, str | None]:
         for match in TOKEN_RE.finditer(text):

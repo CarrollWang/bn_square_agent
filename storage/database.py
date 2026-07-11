@@ -737,10 +737,6 @@ class Database:
                 WHERE i.status = 'new'
                     AND i.tag_status = 'accepted'
                     AND (
-                        i.tag_json LIKE '%"direction": "long"%'
-                        OR i.tag_json LIKE '%"direction": "short"%'
-                    )
-                    AND (
                         r.status IS NULL
                         OR (
                             r.status = 'failed'
