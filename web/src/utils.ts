@@ -89,13 +89,38 @@ export function formatMonitorLogs(status?: MonitorStatus | null) {
   lines.push("");
   lines.push("打标日志：");
   if ((status.last_tag_results || []).length) {
+    const tagResults = status.last_tag_results || [];
+    const acceptedCount = tagResults.filter((item: any) => item.tag_status === "accepted").length;
+    const rejectedCount = tagResults.filter((item: any) => item.tag_status === "rejected").length;
+    const failedCount = tagResults.filter((item: any) => item.tag_status === "failed").length;
+    lines.push(
+      `- 本轮处理 ${tagResults.length} 条：通过 ${acceptedCount}，拒绝 ${rejectedCount}，失败 ${failedCount}`,
+    );
     for (const item of status.last_tag_results.slice(0, 12)) {
       const tag = item.tag || {};
       const symbol = tag.symbol || tag.token || "-";
-      lines.push(`- material#${item.material_item_id}: ${item.tag_status} ${symbol} ${tag.direction || ""}`);
+      const title = shortText(item.title, 42);
+      if (item.tag_status === "failed") {
+        lines.push(`- material#${item.material_item_id}: 失败；原因=${item.error || "unknown"}；标题=${title}`);
+        continue;
+      }
+      const reasons = (tag.reasons || []).join(", ") || "-";
+      lines.push(
+        `- material#${item.material_item_id}: ${item.tag_status === "accepted" ? "通过" : "拒绝"}；` +
+          `原因=${reasons}；币种=${symbol}；方向=${tag.direction || "unknown"}；标题=${title}`,
+      );
     }
   } else {
-    lines.push("- 本轮无新增待打标素材");
+    const insertedCount = (status.last_results || []).reduce(
+      (total: number, item: any) => total + Number(item.inserted || 0),
+      0,
+    );
+    lines.push("- 本轮处理 0 条：通过 0，拒绝 0，失败 0");
+    lines.push(
+      insertedCount > 0
+        ? `- 新采集 ${insertedCount} 条，但当前无待打标素材`
+        : "- 本轮未新增素材，待打标队列为空",
+    );
   }
 
   lines.push("");

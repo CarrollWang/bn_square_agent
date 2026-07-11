@@ -435,6 +435,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
                 tag_results.append(
                     {
                         "material_item_id": material["id"],
+                        "title": material.get("title"),
                         "tag_status": tag_status,
                         "tag": tag.to_dict(),
                     }
@@ -448,6 +449,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
                 tag_results.append(
                     {
                         "material_item_id": material["id"],
+                        "title": material.get("title"),
                         "tag_status": "failed",
                         "error": str(exc),
                     }

@@ -90,7 +90,13 @@ class TechFlowNewsletterMonitor:
         ) as client:
             response = self._get_with_safe_redirects(client, target_url)
             response.raise_for_status()
-            page_text = response.text
+            # TechFlow serves UTF-8 HTML but its response headers are not
+            # always explicit enough for httpx to infer the charset. Using
+            # response.text can therefore decode Chinese content as mojibake,
+            # which then prevents the material tagger from recognizing tokens
+            # and trading directions. The site content is consistently UTF-8,
+            # so decode the response bytes explicitly.
+            page_text = response.content.decode("utf-8")
         return self._parse_articles(page_text)
 
     @staticmethod

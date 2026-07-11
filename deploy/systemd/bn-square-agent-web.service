@@ -1,0 +1,24 @@
+[Unit]
+Description=BN Square Agent web console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bn-square
+Group=bn-square
+WorkingDirectory=/opt/bn-square-agent
+EnvironmentFile=/etc/bn-square-agent/env
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/bn-square-agent/ms-playwright
+ExecStart=/opt/bn-square-agent/.venv/bin/python -B run.py serve --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/bn-square-agent/data /opt/bn-square-agent/chroma_db
+
+[Install]
+WantedBy=multi-user.target
