@@ -47,6 +47,16 @@ sudo editor /etc/bn-square-agent/env
 Generate the shared MCP token with `openssl rand -hex 32`. Use the same value for
 `MCP_SERVER_AUTH_TOKEN` and `MCP_AUTH_TOKEN`.
 
+When using GLM Coding Plan, use the subscription-specific API key and the OpenAI
+compatible Coding Plan endpoint:
+
+```text
+LLM_BASE_URL=https://open.bigmodel.cn/api/coding/paas/v4
+```
+
+The ordinary MaaS endpoint `/api/paas/v4` uses the standard account balance and
+does not consume Coding Plan quota.
+
 ## 4. Install and start services
 
 ```bash
