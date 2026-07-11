@@ -318,6 +318,7 @@ class BinanceAccountChecker:
         self,
         account_key: str,
         *,
+        cookie: str = "",
         proxy_url: str = "",
     ) -> AccountCheckResult:
         try:
@@ -339,6 +340,9 @@ class BinanceAccountChecker:
                     str(profile_dir),
                     **launch_args,
                 )
+                parsed = self._parse_cookie_header(cookie)
+                if parsed:
+                    context.add_cookies(parsed)
                 page = context.pages[0] if context.pages else context.new_page()
                 page.goto(
                     f"{BINANCE_BASE_URL}/zh-CN/square",

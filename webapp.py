@@ -1431,6 +1431,7 @@ def check_account(account_key: str) -> dict:
     checker = BinanceAccountChecker()
     result = checker.check_profile(
         account_key,
+        cookie=account["cookie"],
         proxy_url=account.get("proxy_url") or "",
     )
     if not result.valid:
