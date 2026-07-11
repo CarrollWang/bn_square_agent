@@ -14,9 +14,8 @@ import os
 import secrets
 from pathlib import Path
 import smtplib
-from threading import Lock
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -32,15 +31,8 @@ from .core.config import (
     Settings,
     mask_url_credentials,
     normalize_proxy_url,
-    playwright_proxy_settings,
 )
 from .knowledge.style_rag import create_embeddings
-from .publishing.account_check import (
-    BINANCE_AUTH_PATH,
-    BINANCE_BASE_URL,
-    BinanceAccountChecker,
-)
-from .publishing.browser_profile import browser_profile_dir
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
 from .sources.binance_square import MaterialSourceService
@@ -54,8 +46,6 @@ MONITOR_LOCK_NAME = "material_monitor"
 MONITOR_LOCK_LEASE_SECONDS = 30 * 60
 MONITOR_LOCK_RENEW_SECONDS = 5 * 60
 MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
-COOKIE_LOGIN_SESSION_TTL_SECONDS = 15 * 60
-MAX_COOKIE_LOGIN_SESSIONS = 2
 LOGGER = logging.getLogger(__name__)
 
 monitor_state: dict[str, Any] = {
@@ -76,86 +66,6 @@ monitor_state: dict[str, Any] = {
     "last_alert_sent": False,
     "account_queue_cursor": 0,
 }
-cookie_login_sessions: dict[str, dict[str, Any]] = {}
-cookie_login_sessions_lock = Lock()
-async def _run_cookie_login_operation(operation: Any, *args: Any) -> Any:
-    """Run blocking MCP control calls without blocking FastAPI's event loop."""
-    return await asyncio.to_thread(operation, *args)
-
-
-def _cookie_import_browser_capability() -> tuple[bool, str]:
-    configured = os.getenv("COOKIE_LOGIN_BROWSER_ENABLED", "").strip().lower()
-    if configured in {"0", "false", "no", "off"}:
-        return False, "当前服务已禁用 MCP 常驻浏览器登录"
-    try:
-        settings = get_settings()
-    except Exception as exc:
-        return False, f"无法读取 MCP 配置: {exc}"
-    if not settings.mcp_url:
-        return False, "请先配置自建 MCP_URL，登录浏览器由 MCP 服务持有"
-    return True, ""
-
-
-def _cookie_import_launch_options(proxy_url: str = "") -> dict[str, Any]:
-    options: dict[str, Any] = {
-        "headless": False,
-        "locale": "zh-CN",
-        "args": ["--disable-blink-features=AutomationControlled"],
-        "ignore_default_args": ["--enable-automation"],
-    }
-    proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
-    if proxy:
-        options["proxy"] = proxy
-    return options
-
-
-def _close_cookie_login_session(
-    session: dict[str, Any],
-    *,
-    cleanup_profile: bool = False,
-) -> None:
-    # Browser ownership moved to the self-hosted MCP process. The Web process
-    # keeps only routing metadata and must never close a confirmed live session.
-    _ = session, cleanup_profile
-
-
-def _close_all_cookie_login_sessions(cleanup_profile: bool = False) -> None:
-    with cookie_login_sessions_lock:
-        cookie_login_sessions.clear()
-    _ = cleanup_profile
-
-
-def _cookie_import_profile_dir(account_key: str) -> Path:
-    return browser_profile_dir(account_key)
-
-
-def _cleanup_expired_cookie_login_sessions() -> int:
-    now = datetime.now(timezone.utc)
-    expired_ids: list[str] = []
-    with cookie_login_sessions_lock:
-        for session_id, session in list(cookie_login_sessions.items()):
-            try:
-                created_at = datetime.fromisoformat(str(session["created_at"]))
-            except (KeyError, TypeError, ValueError):
-                created_at = datetime.min.replace(tzinfo=timezone.utc)
-            if (now - created_at).total_seconds() < COOKIE_LOGIN_SESSION_TTL_SECONDS:
-                continue
-            expired_ids.append(session_id)
-        for session_id in expired_ids:
-            cookie_login_sessions.pop(session_id, None)
-    return len(expired_ids)
-
-
-def _pop_cookie_login_session(session_id: str) -> dict[str, Any] | None:
-    with cookie_login_sessions_lock:
-        return cookie_login_sessions.pop(session_id, None)
-
-
-def _get_cookie_login_session(session_id: str) -> dict[str, Any] | None:
-    with cookie_login_sessions_lock:
-        return cookie_login_sessions.get(session_id)
-
-
 def _serialize_account_run(run: Any) -> dict[str, Any]:
     publish_result = getattr(run, "publish_result", None)
     return {
@@ -251,8 +161,8 @@ def _account_health(
     failed_count: int,
     skipped_count: int,
 ) -> tuple[str, str]:
-    if check_status == "invalid":
-        return "异常", "danger"
+    if check_status in {"invalid", "missing"}:
+        return "配置缺失", "danger"
     attempts = published_count + failed_count
     success_rate = published_count / attempts if attempts else 0.0
     if published_count >= 5 and success_rate >= 0.8:
@@ -533,7 +443,6 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
 
 async def material_monitor_loop() -> None:
     while True:
-        await _run_cookie_login_operation(_cleanup_expired_cookie_login_sessions)
         settings = get_settings()
         if not settings.auto_monitor_enabled:
             monitor_state["running"] = False
@@ -571,10 +480,6 @@ async def lifespan(app_: FastAPI):
     try:
         yield
     finally:
-        await _run_cookie_login_operation(
-            _close_all_cookie_login_sessions,
-            False,
-        )
         task.cancel()
         try:
             await task
@@ -667,21 +572,10 @@ async def protect_self_hosted_console(request: Request, call_next):
 class AccountPayload(BaseModel):
     account_key: str = Field(min_length=1, max_length=64)
     name: str | None = Field(default=None, max_length=120)
-    cookie: str | None = Field(default=None, max_length=200_000)
+    square_openapi_key: str | None = Field(default=None, max_length=8_192)
     proxy_url: str | None = Field(default=None, max_length=2_048)
     mcp_url: str | None = Field(default=None, max_length=2_048)
     mcp_auth_token: str | None = Field(default=None, max_length=8_192)
-
-
-class AccountCookieImportStartPayload(BaseModel):
-    account_key: str = Field(min_length=1, max_length=64)
-    name: str | None = Field(default=None, max_length=120)
-    login_url: str | None = Field(default=None, max_length=2_048)
-    proxy_url: str | None = Field(default=None, max_length=2_048)
-
-
-class AccountCookieImportFinishPayload(BaseModel):
-    session_id: str = Field(min_length=1, max_length=128)
 
 
 class RunPayload(BaseModel):
@@ -796,67 +690,11 @@ def get_db() -> Database:
     return Settings.from_env().build_database()
 
 
-def _mcp_control_base_url(mcp_url: str) -> str:
-    parsed = urlsplit(mcp_url.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("MCP_URL 必须是合法的 HTTP/HTTPS 地址")
-    path = parsed.path.rstrip("/")
-    if path.endswith("/mcp"):
-        path = path[:-4]
-    return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
-
-
-def _mcp_control_target(account_key: str = "") -> tuple[str, str]:
-    settings = get_settings()
-    mcp_url = settings.mcp_url
-    auth_token = settings.mcp_auth_token
-    if account_key:
-        account = next(
-            (
-                row
-                for row in get_db().list_accounts(include_disabled=True)
-                if row["account_key"] == account_key
-            ),
-            None,
-        )
-        if account:
-            mcp_url = account.get("mcp_url") or mcp_url
-            auth_token = account.get("mcp_auth_token") or auth_token
-    if not mcp_url:
-        raise ValueError("未配置自建 MCP_URL")
-    return _mcp_control_base_url(mcp_url), auth_token
-
-
-def _mcp_control_request(
-    method: str,
-    path: str,
-    *,
-    base_url: str,
-    auth_token: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-    with httpx.Client(timeout=120, trust_env=False) as client:
-        response = client.request(
-            method,
-            f"{base_url}{path}",
-            headers=headers,
-            json=payload,
-        )
-    data = response.json() if response.content else {}
-    if response.is_error:
-        detail = data.get("detail") if isinstance(data, dict) else None
-        raise RuntimeError(str(detail or response.reason_phrase))
-    if not isinstance(data, dict):
-        raise RuntimeError("MCP 浏览器控制接口返回格式错误")
-    return data
-
-
 def _account_from_row(row: dict[str, Any]) -> AccountConfig:
     return AccountConfig(
         key=row["account_key"],
         name=row["name"],
-        cookie=row.get("cookie") or "",
+        square_openapi_key=row.get("square_openapi_key") or "",
         proxy_url=row.get("proxy_url") or "",
         mcp_url=row.get("mcp_url") or "",
         mcp_auth_token=row.get("mcp_auth_token") or "",
@@ -888,12 +726,7 @@ def list_accounts() -> list[dict]:
             "account_key": row["account_key"],
             "name": row["name"],
             "enabled": bool(row["enabled"]),
-            "cookie_saved": bool(row["cookie"]),
-            "cookie_length": len(row["cookie"] or ""),
-            "cookie_names": [
-                item["name"]
-                for item in BinanceAccountChecker._parse_cookie_header(row["cookie"] or "")
-            ],
+            "square_openapi_key_configured": bool(row.get("square_openapi_key")),
             "check_status": row.get("check_status"),
             "checked_at": row.get("checked_at"),
             "check_error": row.get("check_error"),
@@ -922,7 +755,7 @@ def read_account(account_key: str) -> dict:
     return {
         "account_key": account["account_key"],
         "name": account["name"],
-        "cookie_saved": bool(account.get("cookie")),
+        "square_openapi_key_configured": bool(account.get("square_openapi_key")),
         "proxy_url": account.get("proxy_url") or "",
         "mcp_url": account.get("mcp_url") or "",
         "mcp_auth_token_configured": bool(account.get("mcp_auth_token")),
@@ -932,9 +765,6 @@ def read_account(account_key: str) -> dict:
 @app.get("/api/settings")
 def read_settings() -> dict:
     settings = get_settings()
-    cookie_import_browser_available, cookie_import_browser_reason = (
-        _cookie_import_browser_capability()
-    )
     return {
         "llm_api_key_configured": bool(settings.llm_api_key),
         "llm_api_key_masked": mask_secret(settings.llm_api_key),
@@ -973,8 +803,6 @@ def read_settings() -> dict:
         "smtp_password_masked": mask_secret(settings.smtp_password),
         "smtp_from": settings.smtp_from,
         "smtp_use_tls": settings.smtp_use_tls,
-        "cookie_import_browser_available": cookie_import_browser_available,
-        "cookie_import_browser_reason": cookie_import_browser_reason,
     }
 
 
@@ -1096,7 +924,11 @@ def save_account(payload: AccountPayload) -> dict:
         existing.get("name") if existing else key
     )
     name = raw_name.strip() if raw_name else key
-    cookie = payload.cookie.strip() if payload.cookie is not None else None
+    square_openapi_key = (
+        payload.square_openapi_key.strip()
+        if payload.square_openapi_key is not None
+        else None
+    )
     proxy_url = payload.proxy_url if payload.proxy_url is not None else None
     mcp_url = payload.mcp_url.strip() if payload.mcp_url is not None else None
     mcp_auth_token = (
@@ -1111,280 +943,20 @@ def save_account(payload: AccountPayload) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not key:
         raise HTTPException(status_code=400, detail="账号标识必填")
-    if existing is None and not cookie:
-        raise HTTPException(status_code=400, detail="新账号必须提供 Cookie")
+    if existing is None and not square_openapi_key:
+        raise HTTPException(
+            status_code=400,
+            detail="新账号必须提供 Binance Square OpenAPI Key",
+        )
     db.upsert_account(
         account_key=key,
         name=name,
-        cookie=cookie,
+        square_openapi_key=square_openapi_key,
         proxy_url=proxy_url,
         mcp_url=mcp_url,
         mcp_auth_token=mcp_auth_token,
     )
     return {"ok": True}
-
-
-BINANCE_AUTH_URL = f"{BINANCE_BASE_URL}{BINANCE_AUTH_PATH}"
-
-
-def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str:
-    selected: list[tuple[str, str]] = []
-    for cookie in cookies:
-        domain = str(cookie.get("domain") or "").strip().lower().lstrip(".")
-        if domain != "binance.com" and not domain.endswith(".binance.com"):
-            continue
-        name = str(cookie.get("name") or "")
-        value = cookie.get("value")
-        if not name or value is None:
-            continue
-        selected.append((name, str(value)))
-    return "; ".join(f"{name}={value}" for name, value in selected)
-
-
-def _is_transient_page_navigation_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return any(
-        marker in message
-        for marker in (
-            "execution context was destroyed",
-            "cannot find context",
-            "most likely because of a navigation",
-        )
-    )
-
-
-def _binance_login_status_from_page(page: Any) -> tuple[bool, str | None]:
-    page.goto(
-        f"{BINANCE_BASE_URL}/zh-CN/square",
-        wait_until="domcontentloaded",
-        timeout=60_000,
-    )
-    last_navigation_error: Exception | None = None
-    for attempt in range(1, 6):
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=15_000)
-            validate_binance_url(page.url, label="登录状态检查地址")
-            result = BinanceAccountChecker.probe_page_session(page)
-            if not result.valid:
-                attempts = (
-                    result.raw.get("attempts")
-                    if isinstance(result.raw, dict)
-                    else None
-                )
-                LOGGER.warning(
-                    "Binance page session probe failed: error=%s attempts=%s",
-                    result.error or "unknown",
-                    attempts or [],
-                )
-            return result.valid, result.error
-        except Exception as exc:
-            if not _is_transient_page_navigation_error(exc):
-                raise
-            last_navigation_error = exc
-            LOGGER.info(
-                "Binance page navigated during login probe; retrying attempt=%s/5",
-                attempt,
-            )
-            if attempt < 5:
-                try:
-                    page.wait_for_timeout(500 * attempt)
-                except Exception as wait_exc:
-                    if not _is_transient_page_navigation_error(wait_exc):
-                        raise
-
-    LOGGER.warning(
-        "Binance page did not stabilize during login probe: %s",
-        last_navigation_error,
-    )
-    return (
-        False,
-        "Binance 页面仍在跳转，请等待页面稳定并显示账号头像后再次点击完成导入。",
-    )
-
-
-def _validate_exported_binance_cookie(
-    browser: Any,
-    cookie_header: str,
-) -> tuple[bool, str | None]:
-    validation_context = browser.new_context(locale="zh-CN")
-    try:
-        parsed = BinanceAccountChecker._parse_cookie_header(cookie_header)
-        if parsed:
-            validation_context.add_cookies(parsed)
-        return _binance_login_status_from_page(validation_context.new_page())
-    finally:
-        validation_context.close()
-
-
-def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
-    browser_available, browser_reason = _cookie_import_browser_capability()
-    if not browser_available:
-        raise HTTPException(status_code=409, detail=browser_reason)
-    _cleanup_expired_cookie_login_sessions()
-    key = payload.account_key.strip()
-    if not key:
-        raise HTTPException(status_code=400, detail="账号标识必填")
-    existing_account = next(
-        (
-            row
-            for row in get_db().list_accounts(include_disabled=True)
-            if row["account_key"] == key
-        ),
-        None,
-    )
-    name = (
-        payload.name
-        or (existing_account.get("name") if existing_account else "")
-        or key
-    ).strip()
-
-    with cookie_login_sessions_lock:
-        existing_session = next(
-            (
-                (session_id, session)
-                for session_id, session in cookie_login_sessions.items()
-                if session.get("account_key") == key
-            ),
-            None,
-        )
-        if existing_session:
-            session_id, _ = existing_session
-            return {
-                "ok": True,
-                "session_id": session_id,
-                "message": "已恢复当前账号的登录窗口，请完成登录后点击完成导入。",
-            }
-        if len(cookie_login_sessions) >= MAX_COOKIE_LOGIN_SESSIONS:
-            raise HTTPException(
-                status_code=429,
-                detail="当前登录窗口过多，请先完成或取消已有导入会话",
-            )
-
-    try:
-        login_url = validate_binance_url(
-            payload.login_url or "https://www.binance.com/zh-CN/login",
-            label="登录地址",
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        requested_proxy_url = ""
-        if payload.proxy_url is not None:
-            requested_proxy_url = payload.proxy_url.strip()
-        elif existing_account:
-            requested_proxy_url = str(existing_account.get("proxy_url") or "").strip()
-        if not requested_proxy_url:
-            requested_proxy_url = os.getenv("COOKIE_LOGIN_PROXY_URL", "").strip()
-        proxy_url = (
-            normalize_proxy_url(requested_proxy_url)
-            if requested_proxy_url
-            else ""
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        base_url, auth_token = _mcp_control_target(key)
-        result = _mcp_control_request(
-            "POST",
-            "/browser-sessions/start",
-            base_url=base_url,
-            auth_token=auth_token,
-            payload={
-                "account_key": key,
-                "name": name,
-                "proxy_url": proxy_url,
-                "login_url": login_url,
-            },
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"MCP 打开登录窗口失败: {exc}") from exc
-
-    session_id = str(result.get("session_id") or "")
-    if not session_id:
-        raise HTTPException(status_code=500, detail="MCP 未返回登录会话标识")
-
-    with cookie_login_sessions_lock:
-        cookie_login_sessions[session_id] = {
-            "account_key": key,
-            "name": name,
-            "base_url": base_url,
-            "auth_token": auth_token,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "message": str(result.get("message") or "登录窗口已打开，请完成登录后点击确认登录"),
-    }
-
-
-def finish_account_cookie_import(
-    payload: AccountCookieImportFinishPayload,
-) -> dict:
-    session = _get_cookie_login_session(payload.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
-
-    try:
-        result = _mcp_control_request(
-            "POST",
-            f"/browser-sessions/{quote(payload.session_id, safe='')}/finish",
-            base_url=str(session["base_url"]),
-            auth_token=str(session["auth_token"]),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=409, detail=f"确认 Binance 登录失败: {exc}") from exc
-
-    _pop_cookie_login_session(payload.session_id)
-    return {
-        "ok": True,
-        "account_key": result.get("account_key") or session["account_key"],
-        "cookie_length": int(result.get("cookie_length") or 0),
-        "cookie_names": list(result.get("cookie_names") or []),
-        "valid": bool(result.get("valid")),
-        "active": bool(result.get("active")),
-        "message": result.get("message"),
-    }
-
-
-def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
-    session = _pop_cookie_login_session(payload.session_id)
-    if not session:
-        return {"ok": True}
-    try:
-        _mcp_control_request(
-            "DELETE",
-            f"/browser-sessions/{quote(payload.session_id, safe='')}",
-            base_url=str(session["base_url"]),
-            auth_token=str(session["auth_token"]),
-        )
-    except Exception:
-        pass
-    return {"ok": True}
-
-
-@app.post("/api/accounts/import-cookie/start")
-async def start_account_cookie_import_route(
-    payload: AccountCookieImportStartPayload,
-) -> dict:
-    return await _run_cookie_login_operation(start_account_cookie_import, payload)
-
-
-@app.post("/api/accounts/import-cookie/finish")
-async def finish_account_cookie_import_route(
-    payload: AccountCookieImportFinishPayload,
-    response: Response,
-) -> dict:
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Pragma"] = "no-cache"
-    return await _run_cookie_login_operation(finish_account_cookie_import, payload)
-
-
-@app.post("/api/accounts/import-cookie/cancel")
-async def cancel_account_cookie_import_route(
-    payload: AccountCookieImportFinishPayload,
-) -> dict:
-    return await _run_cookie_login_operation(cancel_account_cookie_import, payload)
 
 
 @app.delete("/api/accounts/{account_key}")
@@ -1402,35 +974,17 @@ def check_account(account_key: str) -> dict:
     )
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
-    try:
-        base_url, auth_token = _mcp_control_target(account_key)
-        result = _mcp_control_request(
-            "GET",
-            f"/browser-sessions/account/{quote(account_key, safe='')}",
-            base_url=base_url,
-            auth_token=auth_token,
-        )
-    except Exception as exc:
-        result = {
-            "active": False,
-            "ready": False,
-            "valid": False,
-            "signature_key": None,
-            "error": f"MCP 常驻浏览器检测失败: {exc}",
-        }
-    valid = bool(result.get("valid"))
-    error = str(result.get("error") or "") or None
-    status = "valid" if valid else "invalid"
+    configured = bool(account.get("square_openapi_key"))
+    error = None if configured else "未配置 Binance Square OpenAPI Key"
+    status = "configured" if configured else "missing"
     db.update_account_check(
         account_key,
-        signature_key=result.get("signature_key"),
+        signature_key=None,
         status=status,
         error=error,
     )
     return {
-        "valid": valid,
-        "active": bool(result.get("active")),
-        "ready": bool(result.get("ready")),
+        "configured": configured,
         "error": error,
     }
 
@@ -1479,7 +1033,10 @@ def run(payload: RunPayload) -> dict:
     try:
         accounts = [_account_from_row(row) for row in services.db.list_accounts()]
         if not accounts:
-            raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
+            raise HTTPException(
+                status_code=400,
+                detail="请先添加至少一个 Binance Square OpenAPI 账号",
+            )
         services.operator.accounts = tuple(accounts)
         services.operator.auto_publish = payload.auto_publish
         runs = services.operator.generate_for_all_accounts(
@@ -1755,14 +1312,14 @@ def account_performance_dashboard(days: int = 7) -> dict:
         )
 
         issue: dict[str, Any] | None = None
-        if account.check_status == "invalid":
+        if account.check_status in {"invalid", "missing"}:
             invalid_accounts += 1
             issue = {
                 "account_key": account.key,
                 "name": account.name,
                 "severity": "high",
                 "severity_label": "高",
-                "reason": "账号检测失效，建议先更新 Cookie",
+                "reason": "账号发布配置缺失，请检查 Square OpenAPI Key",
             }
         elif total_runs and published_count == 0:
             issue = {
@@ -1787,7 +1344,7 @@ def account_performance_dashboard(days: int = 7) -> dict:
                 "name": account.name,
                 "severity": "medium",
                 "severity_label": "中",
-                "reason": f"近 {window_days} 天被跳过 {skipped_count} 次，建议检查 Cookie / 策略限制",
+                "reason": f"近 {window_days} 天被跳过 {skipped_count} 次，建议检查 OpenAPI Key / 策略限制",
             }
         elif total_runs == 0:
             issue = {
@@ -1940,7 +1497,10 @@ def run_material_item(payload: RunMaterialPayload) -> dict:
     try:
         accounts = [_account_from_row(row) for row in services.db.list_accounts()]
         if not accounts:
-            raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
+            raise HTTPException(
+                status_code=400,
+                detail="请先添加至少一个 Binance Square OpenAPI 账号",
+            )
         services.operator.accounts = tuple(accounts)
         services.operator.auto_publish = payload.auto_publish
         runs = services.operator.run_material_item_for_all_accounts(payload.material_item_id)

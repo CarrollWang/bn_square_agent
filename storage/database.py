@@ -14,7 +14,12 @@ from ..models.schemas import ContentReview, PostAnalysis, StyleProfile
 
 
 ACCOUNT_SECRET_COLUMNS = frozenset(
-    {"cookie", "proxy_url", "mcp_auth_token", "signature_key"}
+    {
+        "square_openapi_key",
+        "proxy_url",
+        "mcp_auth_token",
+        "signature_key",
+    }
 )
 SECRET_APP_SETTING_KEYS = frozenset(
     {
@@ -145,7 +150,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS accounts (
                 account_key TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                cookie TEXT NOT NULL DEFAULT '',
+                square_openapi_key TEXT NOT NULL DEFAULT '',
                 proxy_url TEXT NOT NULL DEFAULT '',
                 mcp_url TEXT NOT NULL DEFAULT '',
                 mcp_auth_token TEXT NOT NULL DEFAULT '',
@@ -240,9 +245,9 @@ class Database:
             """
         )
         account_columns = self._columns(connection, "accounts")
-        if "cookie" not in account_columns:
+        if "square_openapi_key" not in account_columns:
             connection.execute(
-                "ALTER TABLE accounts ADD COLUMN cookie TEXT NOT NULL DEFAULT ''"
+                "ALTER TABLE accounts ADD COLUMN square_openapi_key TEXT NOT NULL DEFAULT ''"
             )
         if "proxy_url" not in account_columns:
             connection.execute(
@@ -877,27 +882,32 @@ class Database:
         *,
         account_key: str,
         name: str,
-        cookie: str | None = None,
+        square_openapi_key: str | None = None,
         proxy_url: str | None = None,
         mcp_url: str | None = None,
         mcp_auth_token: str | None = None,
     ) -> None:
-        encrypted_cookie = self._encrypt_secret(cookie)
+        encrypted_square_openapi_key = self._encrypt_secret(square_openapi_key)
         encrypted_proxy_url = self._encrypt_secret(proxy_url)
         encrypted_mcp_auth_token = self._encrypt_secret(mcp_auth_token)
+        new_check_status = (
+            None
+            if square_openapi_key is None
+            else ("configured" if square_openapi_key.strip() else "missing")
+        )
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO accounts (
-                    account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
-                    enabled, created_at
+                    account_key, name, square_openapi_key, proxy_url, mcp_url, mcp_auth_token,
+                    check_status, enabled, created_at
                 )
-                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), 1, ?)
+                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, 'unchecked'), 1, ?)
                 ON CONFLICT(account_key) DO UPDATE SET
                     name = excluded.name,
-                    cookie = CASE
-                        WHEN ? IS NULL THEN accounts.cookie
-                        ELSE excluded.cookie
+                    square_openapi_key = CASE
+                        WHEN ? IS NULL THEN accounts.square_openapi_key
+                        ELSE excluded.square_openapi_key
                     END,
                     proxy_url = CASE
                         WHEN ? IS NULL THEN accounts.proxy_url
@@ -911,13 +921,10 @@ class Database:
                         WHEN ? IS NULL THEN accounts.mcp_auth_token
                         ELSE excluded.mcp_auth_token
                     END,
-                    signature_key = CASE
-                        WHEN ? IS NULL THEN accounts.signature_key
-                        ELSE NULL
-                    END,
                     check_status = CASE
                         WHEN ? IS NULL THEN accounts.check_status
-                        ELSE 'unchecked'
+                        WHEN excluded.square_openapi_key = '' THEN 'missing'
+                        ELSE 'configured'
                     END,
                     checked_at = CASE
                         WHEN ? IS NULL THEN accounts.checked_at
@@ -932,25 +939,25 @@ class Database:
                 (
                     account_key,
                     name,
-                    encrypted_cookie,
+                    encrypted_square_openapi_key,
                     encrypted_proxy_url,
                     mcp_url,
                     encrypted_mcp_auth_token,
+                    new_check_status,
                     utc_now(),
-                    encrypted_cookie,
+                    encrypted_square_openapi_key,
                     encrypted_proxy_url,
                     mcp_url,
                     encrypted_mcp_auth_token,
-                    encrypted_cookie,
-                    encrypted_cookie,
-                    encrypted_cookie,
-                    encrypted_cookie,
+                    encrypted_square_openapi_key,
+                    encrypted_square_openapi_key,
+                    encrypted_square_openapi_key,
                 ),
             )
 
     def list_accounts(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         query = """
-            SELECT account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
+            SELECT account_key, name, square_openapi_key, proxy_url, mcp_url, mcp_auth_token,
                 signature_key, check_status, checked_at, check_error, enabled, created_at
             FROM accounts
         """

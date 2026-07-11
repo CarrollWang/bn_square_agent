@@ -4,9 +4,7 @@ export interface Account {
   account_key: string;
   name: string;
   enabled: boolean;
-  cookie_saved: boolean;
-  cookie_length: number;
-  cookie_names: string[];
+  square_openapi_key_configured: boolean;
   check_status?: string;
   checked_at?: string;
   check_error?: string;
@@ -20,23 +18,10 @@ export interface Account {
 export interface AccountDetail {
   account_key: string;
   name: string;
-  cookie_saved: boolean;
+  square_openapi_key_configured: boolean;
   proxy_url: string;
   mcp_url: string;
   mcp_auth_token_configured: boolean;
-}
-
-export interface CookieImportStartResult {
-  ok: boolean;
-  session_id: string;
-  message: string;
-}
-
-export interface CookieImportFinishResult {
-  ok: boolean;
-  account_key: string;
-  cookie_length: number;
-  cookie_names: string[];
 }
 
 export interface MaterialSource {
@@ -229,6 +214,4 @@ export interface Settings {
   smtp_password_masked: string;
   smtp_from: string;
   smtp_use_tls: boolean;
-  cookie_import_browser_available: boolean;
-  cookie_import_browser_reason: string;
 }

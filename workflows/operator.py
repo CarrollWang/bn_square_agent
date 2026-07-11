@@ -40,7 +40,7 @@ class MultiAccountOperator:
             self.db.upsert_account(
                 account_key=account.key,
                 name=account.name,
-                cookie=account.cookie,
+                square_openapi_key=account.square_openapi_key,
             )
 
     @staticmethod
@@ -93,10 +93,8 @@ class MultiAccountOperator:
             return None
         if not account.enabled:
             return "账号已禁用，已跳过"
-        if not account.cookie:
-            return "账号缺少 Cookie，已跳过"
-        if account.check_status == "invalid":
-            return "账号检测失效，已跳过"
+        if not account.square_openapi_key:
+            return "账号缺少 Binance Square OpenAPI Key，已跳过"
         return None
 
     def _account_requires_material_run(self, account: AccountConfig) -> bool:

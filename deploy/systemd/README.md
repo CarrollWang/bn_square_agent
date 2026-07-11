@@ -96,4 +96,4 @@ Back up these files together:
 - `/opt/bn-square-agent/data/bn_square.db`
 - `/opt/bn-square-agent/data/app_secret.key`
 
-Losing the secret key makes encrypted cookies and API keys unrecoverable.
+Losing the secret key makes encrypted API keys and tokens unrecoverable.

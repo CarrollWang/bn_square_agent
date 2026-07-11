@@ -1,8 +1,6 @@
 $ErrorActionPreference = "Stop"
 
 Set-Location -LiteralPath $PSScriptRoot
-$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PSScriptRoot "ms-playwright"
-
 $existing = Get-NetTCPConnection -LocalPort 8788 -ErrorAction SilentlyContinue |
   Where-Object { $_.State -eq "Listen" } |
   Select-Object -First 1

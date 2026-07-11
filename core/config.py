@@ -109,7 +109,7 @@ def normalize_openai_base_url(value: str) -> str:
 class AccountConfig:
     key: str
     name: str
-    cookie: str
+    square_openapi_key: str
     proxy_url: str = ""
     mcp_url: str = ""
     mcp_auth_token: str = ""
@@ -128,7 +128,7 @@ def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
             AccountConfig(
                 key=f"account_{index}",
                 name=f"account_{index}",
-                cookie=item.strip(),
+                square_openapi_key=item.strip(),
             )
             for index, item in enumerate(value.split(","), start=1)
             if item.strip()
@@ -139,7 +139,7 @@ def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
     for item in payload:
         if isinstance(item, str):
             key = f"account_{len(accounts) + 1}"
-            accounts.append(AccountConfig(key=key, name=key, cookie=item))
+            accounts.append(AccountConfig(key=key, name=key, square_openapi_key=item))
             continue
         if not isinstance(item, dict):
             raise ValueError("AGENT_ACCOUNTS 中的账号必须是字符串或对象")
@@ -150,7 +150,11 @@ def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
             AccountConfig(
                 key=key,
                 name=str(item.get("name") or key),
-                cookie=str(item.get("cookie") or "").strip(),
+                square_openapi_key=str(
+                    item.get("square_openapi_key")
+                    or item.get("openapi_key")
+                    or ""
+                ).strip(),
                 proxy_url=normalize_proxy_url(
                     str(item.get("proxy_url") or item.get("proxy") or "")
                 )
@@ -353,9 +357,13 @@ class Settings:
         return ""
 
     def validate_for_publish(self) -> None:
-        missing = [account.key for account in self.accounts if not account.cookie]
+        missing = [
+            account.key for account in self.accounts if not account.square_openapi_key
+        ]
         if missing:
-            raise ValueError(f"以下账号缺少 cookie: {', '.join(missing)}")
+            raise ValueError(
+                f"以下账号缺少 Binance Square OpenAPI Key: {', '.join(missing)}"
+            )
 
     def with_overrides(self, values: dict[str, str]) -> "Settings":
         if not values:

@@ -81,8 +81,10 @@ class MCPPublisher:
         account: AccountConfig,
         generated: dict[str, Any],
     ) -> dict[str, Any]:
-        if not account.cookie:
-            raise RuntimeError(f"账号 {account.key} 缺少 Cookie，无法发布")
+        if not account.square_openapi_key:
+            raise RuntimeError(
+                f"账号 {account.key} 缺少 Binance Square OpenAPI Key，无法发布"
+            )
         tool_name = self.resolve_publish_tool(account)
         client = self._client_for_account(account)
         client.initialize()
@@ -93,7 +95,6 @@ class MCPPublisher:
             flags=re.IGNORECASE,
         ).rstrip()
         arguments = {
-            "cookie": account.cookie,
             "content": content,
             "account_key": account.key,
         }
@@ -110,8 +111,6 @@ class MCPPublisher:
         if target:
             coin = target.symbol.removesuffix("USDT")
             arguments["coins"] = f"{coin}:{target.market}"
-        if account.proxy_url:
-            arguments["proxy_url"] = account.proxy_url
         try:
             image_base64 = self.chart_images.image_for_text(
                 chart_text,

@@ -9,7 +9,6 @@ User=bn-square
 Group=bn-square
 WorkingDirectory=/opt/bn-square-agent
 EnvironmentFile=/etc/bn-square-agent/env
-Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/bn-square-agent/ms-playwright
 ExecStart=/opt/bn-square-agent/.venv/bin/python -B run.py serve-mcp --host 127.0.0.1 --port 8788
 Restart=on-failure
 RestartSec=5
