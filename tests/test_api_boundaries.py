@@ -6,7 +6,7 @@ import re
 import unittest
 
 from bn_square_agent.publishing.self_hosted_mcp import _tool_definition
-from bn_square_agent.webapp import _basic_auth_matches
+from bn_square_agent.webapp import _basic_auth_matches, publish_evidence
 
 
 class WebBoundaryTests(unittest.TestCase):
@@ -24,6 +24,21 @@ class WebBoundaryTests(unittest.TestCase):
         token = base64.b64encode(b"admin:secret").decode("ascii")
         self.assertTrue(_basic_auth_matches(f"Basic {token}", "admin", "secret"))
         self.assertFalse(_basic_auth_matches(f"Basic {token}", "admin", "wrong"))
+
+    def test_publish_history_extracts_canonical_post_evidence(self) -> None:
+        post_id, post_url = publish_evidence(
+            {
+                "structuredContent": {
+                    "post_id": "343615300021041",
+                    "post_url": "https://app.binance.com/uni-qr/cpos/343615300021041",
+                }
+            }
+        )
+        self.assertEqual(post_id, "343615300021041")
+        self.assertEqual(
+            post_url,
+            "https://www.binance.com/zh-CN/square/post/343615300021041",
+        )
 
 
 class McpBoundaryTests(unittest.TestCase):

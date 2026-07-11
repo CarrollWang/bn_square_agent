@@ -61,6 +61,8 @@ export interface PublishHistoryItem {
   last_activity_at?: string | null;
   error?: string | null;
   publish_result?: Record<string, unknown> | string | null;
+  post_id?: string | null;
+  post_url?: string | null;
   material_title?: string | null;
   material_content?: string | null;
   material_url?: string | null;

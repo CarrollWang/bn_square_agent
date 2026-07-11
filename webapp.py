@@ -640,6 +640,42 @@ def mask_secret(value: str | None) -> str:
     return f"{value[:4]}{'*' * 8}{value[-4:]}"
 
 
+def publish_evidence(payload: Any) -> tuple[str | None, str | None]:
+    post_id: str | None = None
+    post_url: str | None = None
+
+    def visit(value: Any) -> None:
+        nonlocal post_id, post_url
+        if isinstance(value, dict):
+            for key, child in value.items():
+                lowered = str(key).lower()
+                if post_id is None and lowered in {"post_id", "postid"} and child:
+                    post_id = str(child)
+                if post_url is None and lowered in {
+                    "post_url",
+                    "posturl",
+                    "sharelink",
+                    "url",
+                } and child:
+                    post_url = str(child)
+                visit(child)
+            return
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if isinstance(value, str) and value.lstrip().startswith("{"):
+            try:
+                visit(json.loads(value))
+            except ValueError:
+                pass
+
+    visit(payload)
+    if post_id:
+        post_url = f"https://www.binance.com/zh-CN/square/post/{post_id}"
+    return post_id, post_url
+
+
 def is_masked_secret(value: str | None) -> bool:
     if not value:
         return False
@@ -1134,6 +1170,7 @@ def list_publish_history(
                 payload = json.loads(raw_payload)
             except ValueError:
                 payload = raw_payload
+        post_id, post_url = publish_evidence(payload)
         result.append(
             {
                 "material_item_id": row["material_item_id"],
@@ -1150,6 +1187,8 @@ def list_publish_history(
                 or row.get("updated_at"),
                 "error": row.get("error"),
                 "publish_result": payload,
+                "post_id": post_id,
+                "post_url": post_url,
                 "material_title": row.get("material_title"),
                 "material_content": row.get("material_content"),
                 "material_url": row.get("material_url"),

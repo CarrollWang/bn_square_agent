@@ -852,7 +852,7 @@ class Database:
                 """
                 UPDATE material_items
                 SET status = 'ignored',
-                    error = 'expired_after_2h',
+                    error = 'expired_after_ttl',
                     updated_at = ?
                 WHERE status = 'new'
                     AND datetime(created_at) <= datetime('now', ?)
