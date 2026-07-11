@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 import sqlite3
 import tempfile
 import unittest
@@ -28,6 +29,49 @@ class BrowserPublisherLogicTests(unittest.TestCase):
             ),
             "$BTC 继续关注回踩位置",
         )
+
+    def test_account_profile_path_is_stable_and_isolated(self) -> None:
+        from bn_square_agent.publishing.browser_profile import browser_profile_dir
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"BINANCE_PROFILE_ROOT": temp_dir}):
+                first = browser_profile_dir("main")
+                second = browser_profile_dir("main")
+                other = browser_profile_dir("secondary")
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+
+    def test_mcp_publisher_passes_account_key(self) -> None:
+        from bn_square_agent.core.config import AccountConfig, Settings
+        from bn_square_agent.publishing.publisher import MCPPublisher
+
+        settings = replace(
+            Settings.from_env(),
+            auto_publish=True,
+            mcp_url="http://127.0.0.1:8788/mcp",
+            mcp_publish_tool="publish_binance_square",
+        )
+        publisher = MCPPublisher(settings)
+        client = MagicMock()
+        client.call_tool.return_value = {"success": True}
+        with (
+            patch.object(publisher, "_client_for_account", return_value=client),
+            patch.object(publisher.chart_images, "image_for_text", return_value=None),
+        ):
+            publisher.publish(
+                account=AccountConfig(key="main", name="Main", cookie="p20t=x"),
+                generated={"content": "测试内容"},
+            )
+
+        arguments = client.call_tool.call_args.args[1]
+        self.assertEqual(arguments["account_key"], "main")
+
+    def test_mcp_tool_accepts_account_key(self) -> None:
+        from bn_square_agent.publishing.self_hosted_mcp import _tool_definition
+
+        schema = _tool_definition()["inputSchema"]
+        self.assertIn("account_key", schema["properties"])
 
 
 class SourceRuntimeTests(unittest.TestCase):

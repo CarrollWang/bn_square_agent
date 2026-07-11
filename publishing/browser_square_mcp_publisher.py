@@ -16,6 +16,7 @@ import uuid
 
 from ..core.config import mask_url_credentials, playwright_proxy_settings
 from .account_check import BINANCE_BASE_URL, BinanceAccountChecker
+from .browser_profile import browser_profile_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -101,12 +102,15 @@ class BrowserBinanceSquarePublisher:
         *,
         cookie: str,
         content: str,
+        account_key: str = "",
         coins: str = "",
         image_base64: str = "",
         proxy_url: str = "",
     ) -> BrowserPublishResult:
-        if not cookie.strip():
-            return BrowserPublishResult(False, "缺少 cookie")
+        profile_path = browser_profile_path(account_key) if account_key.strip() else None
+        profile_dir = profile_path if profile_path is not None and profile_path.exists() else None
+        if not cookie.strip() and profile_dir is None:
+            return BrowserPublishResult(False, "缺少 cookie 或 account_key")
         if not content.strip():
             return BrowserPublishResult(False, "缺少 content")
         content = self._ensure_coin_reference(content, coins)
@@ -123,27 +127,36 @@ class BrowserBinanceSquarePublisher:
             from playwright.sync_api import sync_playwright
 
             with sync_playwright() as playwright:
-                launch_args = {
+                launch_args: dict[str, Any] = {
                     "headless": True,
                     "args": ["--disable-blink-features=AutomationControlled"],
                 }
                 proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
                 if proxy:
                     launch_args["proxy"] = proxy
-                browser = playwright.chromium.launch(**launch_args)
-                context = browser.new_context(
-                    locale="zh-CN",
-                    viewport={"width": 1440, "height": 960},
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
-                )
+                browser = None
+                if profile_dir is not None:
+                    context = playwright.chromium.launch_persistent_context(
+                        str(profile_dir),
+                        locale="zh-CN",
+                        viewport={"width": 1440, "height": 960},
+                        **launch_args,
+                    )
+                else:
+                    browser = playwright.chromium.launch(**launch_args)
+                    context = browser.new_context(
+                        locale="zh-CN",
+                        viewport={"width": 1440, "height": 960},
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/125.0.0.0 Safari/537.36"
+                        ),
+                    )
                 cookies = BinanceAccountChecker._parse_cookie_header(cookie)
                 if cookies:
                     context.add_cookies(cookies)
-                page = context.new_page()
+                page = context.pages[0] if context.pages else context.new_page()
                 self._attach_debug_listeners(page, diagnostics)
                 try:
                     page.goto(
@@ -158,7 +171,9 @@ class BrowserBinanceSquarePublisher:
                     if temp_image_path is not None:
                         self._upload_image(page, temp_image_path)
                     result = self._publish_post(page, diagnostics)
-                    browser.close()
+                    context.close()
+                    if browser is not None:
+                        browser.close()
                     return result
                 except Exception as exc:
                     debug_artifact = self._debug_capture_bundle(
@@ -170,7 +185,9 @@ class BrowserBinanceSquarePublisher:
                             "proxy_url": self.masked_proxy(proxy_url),
                         },
                     )
-                    browser.close()
+                    context.close()
+                    if browser is not None:
+                        browser.close()
                     LOGGER.exception("Binance Square publish failed")
                     return BrowserPublishResult(
                         False,

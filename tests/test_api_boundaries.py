@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import re
+import tempfile
 from threading import get_ident
 import unittest
 from unittest.mock import MagicMock, patch
@@ -172,7 +173,7 @@ class WebApiBoundaryTests(unittest.TestCase):
         headers = BinanceAccountChecker._headers("cr00=csrf-token; session=abc")
         self.assertEqual(headers["csrftoken"], "csrf-token")
 
-    def test_cookie_login_session_cleanup_removes_temporary_profile(self) -> None:
+    def test_cookie_login_session_cleanup_preserves_account_profile(self) -> None:
         from bn_square_agent.webapp import (
             _close_cookie_login_session,
             _cookie_import_profile_dir,
@@ -186,16 +187,18 @@ class WebApiBoundaryTests(unittest.TestCase):
             def stop(self):
                 return None
 
-        profile_dir = _cookie_import_profile_dir("cleanup-test-account")
-        _close_cookie_login_session(
-            {
-                "context": Closable(),
-                "browser": Closable(),
-                "playwright": PlaywrightHandle(),
-                "profile_dir": profile_dir,
-            }
-        )
-        self.assertFalse(profile_dir.exists())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"BINANCE_PROFILE_ROOT": temp_dir}):
+                profile_dir = _cookie_import_profile_dir("cleanup-test-account")
+                _close_cookie_login_session(
+                    {
+                        "context": Closable(),
+                        "browser": Closable(),
+                        "playwright": PlaywrightHandle(),
+                        "profile_dir": profile_dir,
+                    }
+                )
+                self.assertTrue(profile_dir.exists())
 
     def test_cookie_import_launch_options_include_proxy(self) -> None:
         options = _cookie_import_launch_options("socks5://127.0.0.1:18789")

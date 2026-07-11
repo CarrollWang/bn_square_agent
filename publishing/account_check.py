@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from ..core.config import normalize_proxy_url, playwright_proxy_settings
+from .browser_profile import browser_profile_path
 
 
 BINANCE_BASE_URL = "https://www.binance.com"
@@ -312,6 +313,43 @@ class BinanceAccountChecker:
                     raw=browser_result.raw,
                 )
             return browser_result
+
+    def check_profile(
+        self,
+        account_key: str,
+        *,
+        proxy_url: str = "",
+    ) -> AccountCheckResult:
+        try:
+            from playwright.sync_api import sync_playwright
+
+            profile_dir = browser_profile_path(account_key)
+            if not profile_dir.exists():
+                return AccountCheckResult(valid=False, error="账号浏览器 Profile 不存在")
+            with sync_playwright() as playwright:
+                launch_args: dict[str, Any] = {
+                    "headless": True,
+                    "locale": "zh-CN",
+                    "args": ["--disable-blink-features=AutomationControlled"],
+                }
+                proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
+                if proxy:
+                    launch_args["proxy"] = proxy
+                context = playwright.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    **launch_args,
+                )
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(
+                    f"{BINANCE_BASE_URL}/zh-CN/square",
+                    wait_until="domcontentloaded",
+                    timeout=int(self.timeout * 1000),
+                )
+                result = self.probe_page_session(page)
+                context.close()
+            return result
+        except Exception as exc:
+            return AccountCheckResult(valid=False, error=str(exc))
 
     @staticmethod
     def _parse_cookie_header(cookie: str) -> list[dict[str, Any]]:

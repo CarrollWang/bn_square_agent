@@ -95,6 +95,7 @@ class MCPPublisher:
         arguments = {
             "cookie": account.cookie,
             "content": content,
+            "account_key": account.key,
         }
         chart_text = "\n".join(
             item

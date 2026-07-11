@@ -145,6 +145,11 @@ def _tool_definition() -> dict[str, object]:
                     "type": "string",
                     "description": "要发布的正文内容",
                 },
+                "account_key": {
+                    "type": "string",
+                    "description": "可选，复用该账号在本机保存的独立浏览器 Profile",
+                    "maxLength": 128,
+                },
                 "coins": {
                     "type": "string",
                     "description": "可选，形如 BTC:future；自建浏览器发布器会确保正文包含对应 cashtag",
@@ -331,6 +336,7 @@ async def handle_mcp(
             )
         cookie = str(arguments.get("cookie") or "")
         content = str(arguments.get("content") or "")
+        account_key = str(arguments.get("account_key") or "").strip()
         coins = str(arguments.get("coins") or "")
         image_base64 = str(arguments.get("image_base64") or "")
         proxy_url = str(arguments.get("proxy_url") or "").strip()
@@ -346,6 +352,13 @@ async def handle_mcp(
                 request_id,
                 -32602,
                 "content 过长",
+                session_id=session_id,
+            )
+        if len(account_key) > 128:
+            return _jsonrpc_error(
+                request_id,
+                -32602,
+                "account_key 过长",
                 session_id=session_id,
             )
         if len(image_base64) > MAX_IMAGE_BASE64_LENGTH:
@@ -383,6 +396,7 @@ async def handle_mcp(
             publisher.publish,
             cookie=cookie,
             content=content,
+            account_key=account_key,
             coins=coins,
             image_base64=image_base64,
             proxy_url=effective_proxy,

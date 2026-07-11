@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-import hashlib
 import json
 import ipaddress
 import logging
@@ -18,7 +17,6 @@ import shutil
 import sys
 from pathlib import Path
 import smtplib
-import tempfile
 from threading import Lock
 from typing import Any
 from uuid import uuid4
@@ -44,6 +42,7 @@ from .publishing.account_check import (
     BINANCE_BASE_URL,
     BinanceAccountChecker,
 )
+from .publishing.browser_profile import browser_profile_dir
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
 from .sources.binance_square import MaterialSourceService
@@ -140,7 +139,7 @@ def _cookie_import_launch_options(proxy_url: str = "") -> dict[str, Any]:
 def _close_cookie_login_session(
     session: dict[str, Any],
     *,
-    cleanup_profile: bool = True,
+    cleanup_profile: bool = False,
 ) -> None:
     try:
         session["context"].close()
@@ -159,7 +158,7 @@ def _close_cookie_login_session(
         shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-def _close_all_cookie_login_sessions(cleanup_profile: bool = True) -> None:
+def _close_all_cookie_login_sessions(cleanup_profile: bool = False) -> None:
     with cookie_login_sessions_lock:
         sessions = list(cookie_login_sessions.values())
         cookie_login_sessions.clear()
@@ -168,10 +167,7 @@ def _close_all_cookie_login_sessions(cleanup_profile: bool = True) -> None:
 
 
 def _cookie_import_profile_dir(account_key: str) -> Path:
-    digest = hashlib.sha256(account_key.encode("utf-8")).hexdigest()[:12]
-    profile_dir = Path(tempfile.gettempdir()) / f"bn-square-cookie-import-{digest}"
-    profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return profile_dir
+    return browser_profile_dir(account_key)
 
 
 def _cleanup_expired_cookie_login_sessions() -> int:
@@ -1300,7 +1296,6 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
                 playwright.stop()
             except Exception:
                 pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
         detail = f"打开登录窗口失败: {exc}"
         if any(
             marker in str(exc)
@@ -1373,7 +1368,7 @@ def finish_account_cookie_import(
         ) from exc
 
     _pop_cookie_login_session(payload.session_id)
-    _close_cookie_login_session(session)
+    _close_cookie_login_session(session, cleanup_profile=False)
     return result
 
 
@@ -1433,10 +1428,28 @@ def check_account(account_key: str) -> dict:
         raise HTTPException(status_code=404, detail="账号不存在")
     if not account["cookie"]:
         raise HTTPException(status_code=400, detail="账号缺少 Cookie")
-    result = BinanceAccountChecker().check(
-        account["cookie"],
+    checker = BinanceAccountChecker()
+    result = checker.check_profile(
+        account_key,
         proxy_url=account.get("proxy_url") or "",
     )
+    if not result.valid:
+        cookie_result = checker.check(
+            account["cookie"],
+            proxy_url=account.get("proxy_url") or "",
+        )
+        if cookie_result.valid:
+            result = cookie_result
+        elif cookie_result.error:
+            result = type(result)(
+                valid=False,
+                signature_key=None,
+                error=(
+                    f"Profile 检测失败: {result.error or 'unknown'}; "
+                    f"Cookie 回退检测失败: {cookie_result.error}"
+                ),
+                raw=result.raw or cookie_result.raw,
+            )
     status = "valid" if result.valid else "invalid"
     db.update_account_check(
         account_key,
