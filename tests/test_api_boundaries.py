@@ -265,6 +265,7 @@ class WebApiBoundaryTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
+        self.assertNotIn("cookie", result)
         db.upsert_account.assert_called_once()
         db.update_account_check.assert_not_called()
 

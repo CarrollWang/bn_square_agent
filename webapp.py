@@ -1358,7 +1358,6 @@ def finish_account_cookie_import(
         result = {
             "ok": True,
             "account_key": session["account_key"],
-            "cookie": cookie_header,
             "cookie_length": len(cookie_header),
             "cookie_names": [
                 item["name"]

@@ -85,28 +85,6 @@
       </el-form-item>
     </el-form>
 
-    <div v-if="importedCookie" class="cookie-copy-panel">
-      <el-alert
-        title="Cookie 已在本机提取完成"
-        description="Cookie 已加密保存到当前设备的本地数据库。下方明文只用于必要时手工迁移，刷新页面后会清空。"
-        type="success"
-        :closable="false"
-        show-icon
-      />
-      <el-input
-        :model-value="importedCookie"
-        type="textarea"
-        :rows="5"
-        readonly
-        class="cookie-copy-value"
-      />
-      <div class="cookie-copy-actions">
-        <el-button type="primary" @click="copyImportedCookie">复制 Cookie</el-button>
-        <el-button plain @click="clearImportedCookie">清除临时 Cookie</el-button>
-        <span class="muted">一般无需复制；仅在手工迁移账号时使用</span>
-      </div>
-    </div>
-
     <el-table :data="accounts" border stripe class="data-table">
       <el-table-column prop="name" label="账号" min-width="140">
         <template #default="{ row }">
@@ -176,7 +154,6 @@ const cookieImportBrowserAvailable = ref(true);
 const cookieImportBrowserReason = ref("");
 const COOKIE_IMPORT_SESSION_KEY = "bn_square_cookie_import_session";
 const cookieImportSessionId = ref(sessionStorage.getItem(COOKIE_IMPORT_SESSION_KEY) || "");
-const importedCookie = ref("");
 const showAdvanced = ref(false);
 const form = reactive({
   account_key: "",
@@ -201,30 +178,6 @@ async function loadAccounts() {
   accounts.value = accountItems;
   cookieImportBrowserAvailable.value = settings.cookie_import_browser_available;
   cookieImportBrowserReason.value = settings.cookie_import_browser_reason || "";
-}
-
-async function writeImportedCookieToClipboard() {
-  if (!importedCookie.value || !navigator.clipboard?.writeText) return false;
-  try {
-    await navigator.clipboard.writeText(importedCookie.value);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function copyImportedCookie() {
-  const copied = await writeImportedCookieToClipboard();
-  if (copied) {
-    ElMessage.success("Cookie 已复制，可用于手工迁移");
-  } else {
-    ElMessage.warning("浏览器未允许自动复制，请在文本框中按 Ctrl+A、Ctrl+C 手动复制");
-  }
-}
-
-function clearImportedCookie() {
-  importedCookie.value = "";
-  ElMessage.success("临时 Cookie 已从页面清除");
 }
 
 function resetForm() {
@@ -298,16 +251,10 @@ async function finishCookieImport() {
   try {
     const result = await api.finishCookieImport(cookieImportSessionId.value);
     setCookieImportSessionId("");
-    importedCookie.value = result.cookie;
     editingAccountKey.value = "";
     resetForm();
     await loadAccounts();
-    const copied = await writeImportedCookieToClipboard();
-    ElMessage.success(
-      copied
-        ? `Cookie 已导入并保存到当前设备，同时已复制：${result.cookie_length} 字符`
-        : `Cookie 已导入并保存到当前设备：${result.cookie_length} 字符`,
-    );
+    ElMessage.success(`Cookie 已加密保存到当前设备：${result.cookie_length} 字符`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Cookie 导入验证失败";
     if (message.includes("导入会话不存在或已结束")) {
@@ -377,25 +324,6 @@ onMounted(loadAccounts);
 
 .form-grid .wide {
   grid-column: 1 / -1;
-}
-
-.cookie-copy-panel {
-  display: grid;
-  gap: 12px;
-  max-width: 1040px;
-  margin: 4px 0 18px;
-}
-
-.cookie-copy-value :deep(textarea) {
-  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-  font-size: 12px;
-}
-
-.cookie-copy-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
 }
 
 .advanced-toggle {
