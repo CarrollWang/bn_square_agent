@@ -77,6 +77,7 @@ class MaterialTaggerTests(unittest.TestCase):
         )
         self.assertTrue(ai_tag.accepted)
         self.assertIn("ai", ai_tag.topics)
+        self.assertIsNone(ai_tag.symbol)
 
         unrelated = MaterialTagger().tag(
             title="交易员加仓标普 500 空单",
@@ -84,6 +85,22 @@ class MaterialTaggerTests(unittest.TestCase):
         )
         self.assertFalse(unrelated.accepted)
         self.assertIn("missing_relevant_topic", unrelated.reasons)
+
+    def test_uses_the_asset_from_each_news_item(self) -> None:
+        cases = (
+            ("以太坊升级临近", "Ethereum 开发者公布升级计划。", "ETHUSDT"),
+            ("Solana 链上活跃回升", "SOL 生态交易量有所增加。", "SOLUSDT"),
+            (
+                "BNB Chain 公布路线图",
+                "新路线图聚焦网络性能、验证节点效率和开发者工具升级。",
+                "BNBUSDT",
+            ),
+        )
+        for title, content, expected in cases:
+            with self.subTest(title=title):
+                tag = MaterialTagger().tag(title=title, content=content)
+                self.assertTrue(tag.accepted)
+                self.assertEqual(tag.symbol, expected)
 
 
 class StaticAssetTests(unittest.TestCase):

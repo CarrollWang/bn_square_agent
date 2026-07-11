@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import re
 from typing import Any
 
 import httpx
@@ -88,12 +87,13 @@ class MCPPublisher:
         tool_name = self.resolve_publish_tool(account)
         client = self._client_for_account(account)
         client.initialize()
-        content = re.sub(
-            r"\n*\{future\}\([A-Z0-9]{2,30}USDT\)\s*",
-            "",
-            generated["content"],
-            flags=re.IGNORECASE,
-        ).rstrip()
+        # Binance Square can render markers such as ``{future}(BTCUSDT)`` as
+        # clickable trading components.  Older browser-based publishers
+        # stripped the marker and passed the market separately, but the
+        # self-hosted OpenAPI publisher sends ``content`` as bodyTextOnly.
+        # Preserve the marker so it can reach Binance instead of silently
+        # degrading a futures component into plain text/cashtag content.
+        content = generated["content"].rstrip()
         arguments = {
             "content": content,
             "account_key": account.key,

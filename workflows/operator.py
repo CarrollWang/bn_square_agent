@@ -10,6 +10,9 @@ from ..storage.database import Database
 from ..publishing.publisher import PublishingService, PublishResult
 
 
+DEFAULT_FUTURE_SYMBOL = "BTCUSDT"
+
+
 @dataclass
 class AccountContentRun:
     account_key: str
@@ -64,7 +67,7 @@ class MultiAccountOperator:
         token = re.search(r"\$([A-Z][A-Z0-9]{0,14})\b", text)
         if token and token.group(1).upper() not in {"USD", "USDT"}:
             return f"{token.group(1).upper()}USDT"
-        return None
+        return DEFAULT_FUTURE_SYMBOL
 
     @staticmethod
     def _ensure_future_marker(content: str, symbol: str | None) -> str:
@@ -309,6 +312,7 @@ class MultiAccountOperator:
         source_name: str | None = None,
         future_symbol: str | None = None,
     ) -> list[AccountContentRun]:
+        resolved_future_symbol = future_symbol or DEFAULT_FUTURE_SYMBOL
         runs = []
         for account in self.accounts:
             runs.append(
@@ -318,7 +322,7 @@ class MultiAccountOperator:
                     title=title,
                     url=url,
                     source_name=source_name,
-                    future_symbol=future_symbol,
+                    future_symbol=resolved_future_symbol,
                 )
             )
         return runs

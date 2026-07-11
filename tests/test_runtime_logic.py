@@ -11,7 +11,10 @@ from bn_square_agent.core.secret_store import SecretStore
 from bn_square_agent.publishing.binance_square_openapi import (
     BinanceSquareOpenAPIClient,
 )
+from bn_square_agent.publishing.chart_image import ChartTarget
+from bn_square_agent.publishing.self_hosted_mcp import _ensure_trading_component
 from bn_square_agent.storage.database import Database
+from bn_square_agent.workflows.operator import MultiAccountOperator
 
 
 class PublisherLogicTests(unittest.TestCase):
@@ -42,6 +45,76 @@ class PublisherLogicTests(unittest.TestCase):
         self.assertEqual(arguments["account_key"], "main")
         self.assertNotIn("square_openapi_key", arguments)
         self.assertNotIn("cookie", arguments)
+
+    def test_mcp_publisher_preserves_future_marker(self) -> None:
+        from bn_square_agent.publishing.publisher import MCPPublisher
+
+        settings = MagicMock(spec=Settings)
+        settings.mcp_publish_tool = "publish_binance_square"
+        settings.mcp_url = "http://127.0.0.1:8788/mcp"
+        settings.mcp_auth_token = "token"
+        settings.validate_for_publish.return_value = None
+        publisher = MCPPublisher(settings)
+        client = MagicMock()
+        client.call_tool.return_value = {"success": True}
+        publisher._client_for_account = MagicMock(return_value=client)
+        publisher.chart_images.extract_target = MagicMock(
+            return_value=ChartTarget("BTCUSDT", "future")
+        )
+        publisher.chart_images.image_for_text = MagicMock(return_value=None)
+
+        publisher.publish(
+            account=AccountConfig(
+                key="main",
+                name="Main",
+                square_openapi_key="secret-key",
+            ),
+            generated={"content": "等待 BTC 突破确认。\n\n{future}(BTCUSDT)"},
+        )
+
+        arguments = client.call_tool.call_args.args[1]
+        self.assertEqual(
+            arguments["content"],
+            "等待 BTC 突破确认。\n\n{future}(BTCUSDT)",
+        )
+        self.assertEqual(arguments["coins"], "BTC:future")
+
+    def test_mcp_boundary_appends_future_marker_from_coins(self) -> None:
+        for coin in ("BTC", "ETH", "SOL"):
+            with self.subTest(coin=coin):
+                self.assertEqual(
+                    _ensure_trading_component("等待突破确认。", f"{coin}:future"),
+                    f"等待突破确认。\n\n{{future}}({coin}USDT)",
+                )
+
+    def test_mcp_boundary_rejects_conflicting_future_marker(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不一致"):
+            _ensure_trading_component(
+                "等待突破确认。\n\n{future}(ETHUSDT)",
+                "BTC:future",
+            )
+
+    def test_material_symbol_uses_news_asset_with_btc_fallback(self) -> None:
+        self.assertEqual(
+            MultiAccountOperator._symbol_from_material(
+                {
+                    "tag_json": '{"symbol": "ETHUSDT"}',
+                    "title": "以太坊升级",
+                    "content": "升级计划已经公布。",
+                }
+            ),
+            "ETHUSDT",
+        )
+        self.assertEqual(
+            MultiAccountOperator._symbol_from_material(
+                {
+                    "tag_json": '{"symbol": null}',
+                    "title": "AI Agent 行业进展",
+                    "content": "行业发布了新的智能体框架。",
+                }
+            ),
+            "BTCUSDT",
+        )
 
     def test_openapi_504_is_unknown_not_success(self) -> None:
         client = BinanceSquareOpenAPIClient("secret")

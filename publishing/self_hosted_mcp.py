@@ -25,6 +25,10 @@ MAX_CONTENT_LENGTH = 50_000
 MAX_IMAGE_BASE64_LENGTH = 18 * 1024 * 1024
 MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
 COINS_PATTERN = re.compile(r"^[A-Z0-9]{2,20}:(?:future|spot)$", re.IGNORECASE)
+FUTURE_MARKER_PATTERN = re.compile(
+    r"\{future\}\(([A-Z0-9]{2,30}USDT)\)",
+    re.IGNORECASE,
+)
 
 
 def _bounded_env_int(
@@ -179,11 +183,46 @@ def _load_account(account_key: str) -> dict[str, object]:
     return account
 
 
+def _ensure_trading_component(content: str, coins: str) -> str:
+    """Keep the trading component explicit at the OpenAPI boundary.
+
+    ``coins`` used to be consumed by the remote browser publisher.  The
+    self-hosted publisher calls Square OpenAPI directly, so it must translate
+    that metadata back into the bodyTextOnly marker instead of merely logging
+    it.  Existing explicit markers are preserved and conflicting symbols are
+    rejected to avoid publishing a BTC article with an ETH trading component.
+    """
+
+    text = content.strip()
+    if not coins:
+        return text
+
+    coin, market = coins.split(":", 1)
+    coin = coin.upper()
+    market = market.lower()
+    if market == "future":
+        symbol = coin if coin.endswith("USDT") else f"{coin}USDT"
+        existing = [match.upper() for match in FUTURE_MARKER_PATTERN.findall(text)]
+        if existing:
+            if symbol not in existing:
+                raise ValueError(
+                    f"正文合约组件 {existing[0]} 与发布币种 {symbol} 不一致"
+                )
+            return text
+        return f"{text}\n\n{{future}}({symbol})"
+
+    cashtag = coin.removesuffix("USDT")
+    if re.search(rf"\${re.escape(cashtag)}\b", text, re.IGNORECASE):
+        return text
+    return f"{text}\n\n${cashtag}"
+
+
 def _publish(
     settings: SelfHostedMCPSettings,
     *,
     content: str,
     account_key: str,
+    coins: str,
     image_base64: str,
 ) -> dict[str, object]:
     account = _load_account(account_key)
@@ -192,7 +231,13 @@ def _publish(
         proxy_url=str(account.get("proxy_url") or ""),
         timeout_seconds=settings.timeout_seconds,
     )
-    return client.publish_text(content, image_base64=image_base64).as_dict()
+    publish_content = _ensure_trading_component(content, coins)
+    if len(publish_content) > MAX_CONTENT_LENGTH:
+        raise ValueError("补充交易组件后 content 过长")
+    return client.publish_text(
+        publish_content,
+        image_base64=image_base64,
+    ).as_dict()
 
 
 def _build_publish_payload(
@@ -351,6 +396,7 @@ async def handle_mcp(
                 settings,
                 content=content,
                 account_key=account_key,
+                coins=coins,
                 image_base64=image_base64,
             )
         except (KeyError, ValueError) as exc:
