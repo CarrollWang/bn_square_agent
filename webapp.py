@@ -1119,22 +1119,65 @@ def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str
     )
 
 
+def _is_transient_page_navigation_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "execution context was destroyed",
+            "cannot find context",
+            "most likely because of a navigation",
+        )
+    )
+
+
 def _binance_login_status_from_page(page: Any) -> tuple[bool, str | None]:
     page.goto(
         f"{BINANCE_BASE_URL}/zh-CN/square",
         wait_until="domcontentloaded",
         timeout=60_000,
     )
-    validate_binance_url(page.url, label="登录状态检查地址")
-    result = BinanceAccountChecker.probe_page_session(page)
-    if not result.valid:
-        attempts = result.raw.get("attempts") if isinstance(result.raw, dict) else None
-        LOGGER.warning(
-            "Binance page session probe failed: error=%s attempts=%s",
-            result.error or "unknown",
-            attempts or [],
-        )
-    return result.valid, result.error
+    last_navigation_error: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15_000)
+            validate_binance_url(page.url, label="登录状态检查地址")
+            result = BinanceAccountChecker.probe_page_session(page)
+            if not result.valid:
+                attempts = (
+                    result.raw.get("attempts")
+                    if isinstance(result.raw, dict)
+                    else None
+                )
+                LOGGER.warning(
+                    "Binance page session probe failed: error=%s attempts=%s",
+                    result.error or "unknown",
+                    attempts or [],
+                )
+            return result.valid, result.error
+        except Exception as exc:
+            if not _is_transient_page_navigation_error(exc):
+                raise
+            last_navigation_error = exc
+            LOGGER.info(
+                "Binance page navigated during login probe; retrying attempt=%s/5",
+                attempt,
+            )
+            if attempt < 5:
+                try:
+                    page.wait_for_timeout(500 * attempt)
+                except Exception as wait_exc:
+                    if not _is_transient_page_navigation_error(wait_exc):
+                        raise
+
+    LOGGER.warning(
+        "Binance page did not stabilize during login probe: %s",
+        last_navigation_error,
+    )
+    return (
+        False,
+        "Binance 页面仍在跳转，请等待页面稳定并显示账号头像后再次点击完成导入。",
+    )
 
 
 def _validate_exported_binance_cookie(

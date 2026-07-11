@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from bn_square_agent.publishing.account_check import BinanceAccountChecker
 from bn_square_agent.webapp import (
+    _binance_login_status_from_page,
     _cookie_header_from_playwright_cookies,
     _cookie_import_launch_options,
 )
@@ -18,6 +19,29 @@ class FakePage:
 
     def evaluate(self, _script, _argument):
         return self.result
+
+
+class NavigatingFakePage:
+    url = "https://www.binance.com/zh-CN/square"
+
+    def __init__(self, evaluate_results):
+        self.evaluate_results = iter(evaluate_results)
+        self.wait_timeouts = []
+
+    def goto(self, _url, **_kwargs):
+        return None
+
+    def wait_for_load_state(self, _state, **_kwargs):
+        return None
+
+    def wait_for_timeout(self, timeout):
+        self.wait_timeouts.append(timeout)
+
+    def evaluate(self, _script, _argument):
+        result = next(self.evaluate_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class WebApiBoundaryTests(unittest.TestCase):
@@ -103,6 +127,38 @@ class WebApiBoundaryTests(unittest.TestCase):
         )
         self.assertFalse(result.valid)
         self.assertEqual(result.error, "Please login first")
+
+    def test_login_status_retries_when_navigation_destroys_context(self) -> None:
+        page = NavigatingFakePage(
+            [
+                RuntimeError(
+                    "Page.evaluate: Execution context was destroyed, "
+                    "most likely because of a navigation."
+                ),
+                {
+                    "valid": True,
+                    "signature_key": "square-user-1",
+                    "attempts": [],
+                },
+            ]
+        )
+
+        valid, error = _binance_login_status_from_page(page)
+
+        self.assertTrue(valid)
+        self.assertIsNone(error)
+        self.assertEqual(page.wait_timeouts, [500])
+
+    def test_login_status_returns_retryable_error_after_navigation_retries(self) -> None:
+        page = NavigatingFakePage(
+            [RuntimeError("Cannot find context with specified id") for _ in range(5)]
+        )
+
+        valid, error = _binance_login_status_from_page(page)
+
+        self.assertFalse(valid)
+        self.assertIn("页面仍在跳转", error)
+        self.assertEqual(page.wait_timeouts, [500, 1000, 1500, 2000])
 
     def test_account_headers_reuse_binance_csrf_cookie(self) -> None:
         headers = BinanceAccountChecker._headers("cr00=csrf-token; session=abc")
