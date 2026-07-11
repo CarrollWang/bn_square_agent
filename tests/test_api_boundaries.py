@@ -216,6 +216,49 @@ class WebApiBoundaryTests(unittest.TestCase):
         with cookie_login_sessions_lock:
             self.assertNotIn(session_id, cookie_login_sessions)
 
+    def test_existing_account_login_reuses_saved_proxy(self) -> None:
+        from bn_square_agent.webapp import (
+            AccountCookieImportStartPayload,
+            cookie_login_sessions,
+            cookie_login_sessions_lock,
+            start_account_cookie_import,
+        )
+
+        db = MagicMock()
+        db.list_accounts.return_value = [
+            {
+                "account_key": "main",
+                "name": "Main",
+                "proxy_url": "socks5://127.0.0.1:18789",
+            }
+        ]
+        with (
+            patch(
+                "bn_square_agent.webapp._cookie_import_browser_capability",
+                return_value=(True, ""),
+            ),
+            patch("bn_square_agent.webapp.get_db", return_value=db),
+            patch(
+                "bn_square_agent.webapp._mcp_control_target",
+                return_value=("http://127.0.0.1:8788", ""),
+            ),
+            patch(
+                "bn_square_agent.webapp._mcp_control_request",
+                return_value={"session_id": "proxy-session", "message": "ok"},
+            ) as request,
+        ):
+            result = start_account_cookie_import(
+                AccountCookieImportStartPayload(account_key="main")
+            )
+
+        self.assertEqual(result["session_id"], "proxy-session")
+        self.assertEqual(
+            request.call_args.kwargs["payload"]["proxy_url"],
+            "socks5://127.0.0.1:18789",
+        )
+        with cookie_login_sessions_lock:
+            cookie_login_sessions.pop("proxy-session", None)
+
     def test_cookie_import_is_disabled_without_a_graphical_session(self) -> None:
         from fastapi import HTTPException
         from bn_square_agent.webapp import (

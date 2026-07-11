@@ -1222,9 +1222,21 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
         raise HTTPException(status_code=409, detail=browser_reason)
     _cleanup_expired_cookie_login_sessions()
     key = payload.account_key.strip()
-    name = (payload.name or key).strip()
     if not key:
         raise HTTPException(status_code=400, detail="账号标识必填")
+    existing_account = next(
+        (
+            row
+            for row in get_db().list_accounts(include_disabled=True)
+            if row["account_key"] == key
+        ),
+        None,
+    )
+    name = (
+        payload.name
+        or (existing_account.get("name") if existing_account else "")
+        or key
+    ).strip()
 
     with cookie_login_sessions_lock:
         existing_session = next(
@@ -1256,11 +1268,13 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
-        requested_proxy_url = (
-            payload.proxy_url.strip()
-            if payload.proxy_url and payload.proxy_url.strip()
-            else os.getenv("COOKIE_LOGIN_PROXY_URL", "").strip()
-        )
+        requested_proxy_url = ""
+        if payload.proxy_url is not None:
+            requested_proxy_url = payload.proxy_url.strip()
+        elif existing_account:
+            requested_proxy_url = str(existing_account.get("proxy_url") or "").strip()
+        if not requested_proxy_url:
+            requested_proxy_url = os.getenv("COOKIE_LOGIN_PROXY_URL", "").strip()
         proxy_url = (
             normalize_proxy_url(requested_proxy_url)
             if requested_proxy_url
