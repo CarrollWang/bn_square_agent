@@ -35,6 +35,7 @@ export interface CookieImportStartResult {
 export interface CookieImportFinishResult {
   ok: boolean;
   account_key: string;
+  cookie: string;
   cookie_length: number;
   cookie_names: string[];
 }

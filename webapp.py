@@ -1322,7 +1322,12 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
 
 
 @app.post("/api/accounts/import-cookie/finish")
-def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
+def finish_account_cookie_import(
+    payload: AccountCookieImportFinishPayload,
+    response: Response,
+) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     session = _get_cookie_login_session(payload.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
@@ -1384,6 +1389,7 @@ def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
         result = {
             "ok": True,
             "account_key": session["account_key"],
+            "cookie": cookie_header,
             "cookie_length": len(cookie_header),
             "cookie_names": [
                 item["name"]
