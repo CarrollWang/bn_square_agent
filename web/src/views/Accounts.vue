@@ -4,15 +4,15 @@
         <div class="toolbar">
           <div class="toolbar-title">
             <strong>账号管理</strong>
-          <span>当前推荐由 Mac 长期运行，登录、Cookie、发布环境保持在同一台设备</span>
+          <span>自建 MCP 持有每个账号的常驻浏览器，登录与发布始终复用同一活会话</span>
           </div>
           <el-button plain @click="loadAccounts">刷新</el-button>
         </div>
       </template>
 
       <el-alert
-        title="推荐模式：Mac 长期运行，直接在当前设备完成 Binance 登录。"
-        description="“打开登录窗口导入 Cookie”会在运行服务的 Mac 上打开浏览器，完成后 Cookie 会加密保存到当前设备的本地数据库，无需再搬运到云服务器。编辑已有账号时，Cookie 和独立 MCP Token 留空会保留已保存值。"
+        title="登录窗口由自建 MCP 持有，确认登录后不要关闭该浏览器。"
+        description="发布时会直接复用这个仍在运行的浏览器上下文，不再依赖把 Cookie 注入新浏览器。每个账号使用独立 Profile 和独立代理；MCP 或浏览器重启后需要重新登录。"
         type="info"
         :closable="false"
         show-icon
@@ -70,7 +70,7 @@
           :disabled="!cookieImportBrowserAvailable"
           @click="startCookieImport"
         >
-          在当前机器打开登录窗口导入 Cookie
+          在自建 MCP 主机打开登录窗口
         </el-button>
         <el-button
           v-if="cookieImportSessionId"
@@ -78,7 +78,7 @@
           :loading="finishingImport"
           @click="finishCookieImport"
         >
-          完成导入
+          确认登录并保持会话
         </el-button>
         <el-button v-if="cookieImportSessionId" plain @click="cancelCookieImport">取消导入</el-button>
         <el-button v-if="editingAccountKey" plain @click="resetForm">取消编辑</el-button>
@@ -254,7 +254,7 @@ async function finishCookieImport() {
     editingAccountKey.value = "";
     resetForm();
     await loadAccounts();
-    ElMessage.success(`Cookie 已加密保存到当前设备：${result.cookie_length} 字符`);
+    ElMessage.success(`登录已确认，常驻浏览器保持运行；Cookie 已加密保存（${result.cookie_length} 字符）`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Cookie 导入验证失败";
     if (message.includes("导入会话不存在或已结束")) {
@@ -297,7 +297,11 @@ async function editAccount(accountKey: string) {
 async function checkAccount(accountKey: string) {
   const result = await api.checkAccount(accountKey);
   await loadAccounts();
-  ElMessage.success(result.valid ? "账号有效" : "检测完成，请查看状态");
+  if (result.valid) {
+    ElMessage.success("账号常驻浏览器有效");
+  } else {
+    ElMessage.error(result.error || "账号浏览器会话无效，请重新登录");
+  }
 }
 
 async function deleteAccount(accountKey: string) {

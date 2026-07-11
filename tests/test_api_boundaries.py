@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 import re
-import tempfile
-from threading import get_ident
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -173,33 +170,6 @@ class WebApiBoundaryTests(unittest.TestCase):
         headers = BinanceAccountChecker._headers("cr00=csrf-token; session=abc")
         self.assertEqual(headers["csrftoken"], "csrf-token")
 
-    def test_cookie_login_session_cleanup_preserves_account_profile(self) -> None:
-        from bn_square_agent.webapp import (
-            _close_cookie_login_session,
-            _cookie_import_profile_dir,
-        )
-
-        class Closable:
-            def close(self):
-                return None
-
-        class PlaywrightHandle:
-            def stop(self):
-                return None
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.dict("os.environ", {"BINANCE_PROFILE_ROOT": temp_dir}):
-                profile_dir = _cookie_import_profile_dir("cleanup-test-account")
-                _close_cookie_login_session(
-                    {
-                        "context": Closable(),
-                        "browser": Closable(),
-                        "playwright": PlaywrightHandle(),
-                        "profile_dir": profile_dir,
-                    }
-                )
-                self.assertTrue(profile_dir.exists())
-
     def test_cookie_import_launch_options_include_proxy(self) -> None:
         options = _cookie_import_launch_options("socks5://127.0.0.1:18789")
         self.assertEqual(
@@ -207,19 +177,7 @@ class WebApiBoundaryTests(unittest.TestCase):
             {"server": "socks5://127.0.0.1:18789"},
         )
 
-    def test_cookie_login_operations_share_one_worker_thread(self) -> None:
-        from bn_square_agent.webapp import _run_cookie_login_operation
-
-        async def capture_worker_threads() -> tuple[int, int]:
-            first = await _run_cookie_login_operation(get_ident)
-            second = await _run_cookie_login_operation(get_ident)
-            return first, second
-
-        first, second = asyncio.run(capture_worker_threads())
-        self.assertEqual(first, second)
-        self.assertNotEqual(first, get_ident())
-
-    def test_cookie_import_finish_extracts_without_extra_login_probe(self) -> None:
+    def test_cookie_import_finish_keeps_cookie_inside_mcp(self) -> None:
         from bn_square_agent.webapp import (
             AccountCookieImportFinishPayload,
             cookie_login_sessions,
@@ -227,50 +185,36 @@ class WebApiBoundaryTests(unittest.TestCase):
             finish_account_cookie_import,
         )
 
-        class Context:
-            def cookies(self, _urls=None):
-                return [
-                    {
-                        "name": "session",
-                        "value": "test-value",
-                        "domain": "www.binance.com",
-                        "path": "/",
-                        "expires": -1,
-                    }
-                ]
-
-            def close(self):
-                return None
-
-        class Browser:
-            def close(self):
-                return None
-
-        class PlaywrightHandle:
-            def stop(self):
-                return None
-
         session_id = "finish-without-probe"
         with cookie_login_sessions_lock:
             cookie_login_sessions[session_id] = {
                 "account_key": "test-account",
                 "name": "Test Account",
-                "context": Context(),
-                "browser": Browser(),
-                "playwright": PlaywrightHandle(),
-                "profile_dir": None,
+                "base_url": "http://127.0.0.1:8788",
+                "auth_token": "test-token",
             }
 
-        db = MagicMock()
-        with patch("bn_square_agent.webapp.get_db", return_value=db):
+        with patch(
+            "bn_square_agent.webapp._mcp_control_request",
+            return_value={
+                "account_key": "test-account",
+                "active": True,
+                "ready": True,
+                "valid": True,
+                "cookie_length": 123,
+                "cookie_names": ["session"],
+            },
+        ) as request:
             result = finish_account_cookie_import(
                 AccountCookieImportFinishPayload(session_id=session_id)
             )
 
         self.assertTrue(result["ok"])
         self.assertNotIn("cookie", result)
-        db.upsert_account.assert_called_once()
-        db.update_account_check.assert_not_called()
+        self.assertEqual(result["cookie_length"], 123)
+        request.assert_called_once()
+        with cookie_login_sessions_lock:
+            self.assertNotIn(session_id, cookie_login_sessions)
 
     def test_cookie_import_is_disabled_without_a_graphical_session(self) -> None:
         from fastapi import HTTPException
@@ -294,32 +238,34 @@ class WebApiBoundaryTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail, reason)
 
-    def test_cookie_import_is_available_on_macos(self) -> None:
+    def test_cookie_import_is_available_when_self_hosted_mcp_is_configured(self) -> None:
         from bn_square_agent.webapp import _cookie_import_browser_capability
 
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch("bn_square_agent.webapp.os.name", "posix"),
-            patch("bn_square_agent.webapp.sys.platform", "darwin"),
-        ):
+        settings = MagicMock(mcp_url="http://127.0.0.1:8788/mcp")
+        with patch("bn_square_agent.webapp.get_settings", return_value=settings):
             available, reason = _cookie_import_browser_capability()
 
         self.assertTrue(available)
         self.assertEqual(reason, "")
 
 
-class McpBoundaryTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
+class McpBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
         try:
-            from fastapi.testclient import TestClient
+            import httpx
             from bn_square_agent.publishing.self_hosted_mcp import app
         except ModuleNotFoundError as exc:
             raise unittest.SkipTest(f"runtime dependency is not installed: {exc}")
-        cls.client = TestClient(app)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        )
 
-    def test_initialize_and_argument_validation(self) -> None:
-        initialized = self.client.post(
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
+
+    async def test_initialize_and_argument_validation(self) -> None:
+        initialized = await self.client.post(
             "/mcp",
             json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         )
@@ -329,7 +275,7 @@ class McpBoundaryTests(unittest.TestCase):
             "2025-06-18",
         )
 
-        invalid = self.client.post(
+        invalid = await self.client.post(
             "/mcp",
             json={
                 "jsonrpc": "2.0",

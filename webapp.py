@@ -4,7 +4,6 @@ import asyncio
 import base64
 import binascii
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -13,12 +12,11 @@ import ipaddress
 import logging
 import os
 import secrets
-import shutil
-import sys
 from pathlib import Path
 import smtplib
 from threading import Lock
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -80,47 +78,22 @@ monitor_state: dict[str, Any] = {
 }
 cookie_login_sessions: dict[str, dict[str, Any]] = {}
 cookie_login_sessions_lock = Lock()
-cookie_login_executor = ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="bn-square-cookie-login",
-)
-
-
 async def _run_cookie_login_operation(operation: Any, *args: Any) -> Any:
-    """Run all sync Playwright operations on one persistent worker thread.
-
-    Playwright's sync API is thread-affine. FastAPI executes separate sync
-    requests on arbitrary worker threads, so a browser created by the start
-    request cannot safely be reused by the finish or cancel request unless all
-    related operations are routed through the same executor thread.
-    """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(cookie_login_executor, operation, *args)
+    """Run blocking MCP control calls without blocking FastAPI's event loop."""
+    return await asyncio.to_thread(operation, *args)
 
 
 def _cookie_import_browser_capability() -> tuple[bool, str]:
     configured = os.getenv("COOKIE_LOGIN_BROWSER_ENABLED", "").strip().lower()
-    if configured:
-        enabled = configured not in {"0", "false", "no", "off"}
-        if enabled:
-            return True, ""
-        return (
-            False,
-            "当前服务已禁用弹窗导入。请在具备图形桌面的本机运行同版本服务导入，"
-            "或直接粘贴 Cookie。SSH 隧道只转发网页，不会把服务器浏览器窗口转到本机。",
-        )
-    if (
-        os.name == "nt"
-        or sys.platform == "darwin"
-        or os.getenv("DISPLAY")
-        or os.getenv("WAYLAND_DISPLAY")
-    ):
-        return True, ""
-    return (
-        False,
-        "当前服务运行在无图形界面的服务器上，无法打开可交互登录窗口。"
-        "请在 Windows 或 macOS 本机运行同版本服务导入，或直接粘贴 Cookie。",
-    )
+    if configured in {"0", "false", "no", "off"}:
+        return False, "当前服务已禁用 MCP 常驻浏览器登录"
+    try:
+        settings = get_settings()
+    except Exception as exc:
+        return False, f"无法读取 MCP 配置: {exc}"
+    if not settings.mcp_url:
+        return False, "请先配置自建 MCP_URL，登录浏览器由 MCP 服务持有"
+    return True, ""
 
 
 def _cookie_import_launch_options(proxy_url: str = "") -> dict[str, Any]:
@@ -141,29 +114,15 @@ def _close_cookie_login_session(
     *,
     cleanup_profile: bool = False,
 ) -> None:
-    try:
-        session["context"].close()
-    except Exception:
-        pass
-    try:
-        session["browser"].close()
-    except Exception:
-        pass
-    try:
-        session["playwright"].stop()
-    except Exception:
-        pass
-    profile_dir = session.get("profile_dir")
-    if cleanup_profile and profile_dir:
-        shutil.rmtree(profile_dir, ignore_errors=True)
+    # Browser ownership moved to the self-hosted MCP process. The Web process
+    # keeps only routing metadata and must never close a confirmed live session.
+    _ = session, cleanup_profile
 
 
 def _close_all_cookie_login_sessions(cleanup_profile: bool = False) -> None:
     with cookie_login_sessions_lock:
-        sessions = list(cookie_login_sessions.values())
         cookie_login_sessions.clear()
-    for session in sessions:
-        _close_cookie_login_session(session, cleanup_profile=cleanup_profile)
+    _ = cleanup_profile
 
 
 def _cookie_import_profile_dir(account_key: str) -> Path:
@@ -172,7 +131,7 @@ def _cookie_import_profile_dir(account_key: str) -> Path:
 
 def _cleanup_expired_cookie_login_sessions() -> int:
     now = datetime.now(timezone.utc)
-    expired: list[dict[str, Any]] = []
+    expired_ids: list[str] = []
     with cookie_login_sessions_lock:
         for session_id, session in list(cookie_login_sessions.items()):
             try:
@@ -181,10 +140,10 @@ def _cleanup_expired_cookie_login_sessions() -> int:
                 created_at = datetime.min.replace(tzinfo=timezone.utc)
             if (now - created_at).total_seconds() < COOKIE_LOGIN_SESSION_TTL_SECONDS:
                 continue
-            expired.append(cookie_login_sessions.pop(session_id))
-    for session in expired:
-        _close_cookie_login_session(session)
-    return len(expired)
+            expired_ids.append(session_id)
+        for session_id in expired_ids:
+            cookie_login_sessions.pop(session_id, None)
+    return len(expired_ids)
 
 
 def _pop_cookie_login_session(session_id: str) -> dict[str, Any] | None:
@@ -837,6 +796,62 @@ def get_db() -> Database:
     return Settings.from_env().build_database()
 
 
+def _mcp_control_base_url(mcp_url: str) -> str:
+    parsed = urlsplit(mcp_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("MCP_URL 必须是合法的 HTTP/HTTPS 地址")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/mcp"):
+        path = path[:-4]
+    return urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
+
+
+def _mcp_control_target(account_key: str = "") -> tuple[str, str]:
+    settings = get_settings()
+    mcp_url = settings.mcp_url
+    auth_token = settings.mcp_auth_token
+    if account_key:
+        account = next(
+            (
+                row
+                for row in get_db().list_accounts(include_disabled=True)
+                if row["account_key"] == account_key
+            ),
+            None,
+        )
+        if account:
+            mcp_url = account.get("mcp_url") or mcp_url
+            auth_token = account.get("mcp_auth_token") or auth_token
+    if not mcp_url:
+        raise ValueError("未配置自建 MCP_URL")
+    return _mcp_control_base_url(mcp_url), auth_token
+
+
+def _mcp_control_request(
+    method: str,
+    path: str,
+    *,
+    base_url: str,
+    auth_token: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    with httpx.Client(timeout=120, trust_env=False) as client:
+        response = client.request(
+            method,
+            f"{base_url}{path}",
+            headers=headers,
+            json=payload,
+        )
+    data = response.json() if response.content else {}
+    if response.is_error:
+        detail = data.get("detail") if isinstance(data, dict) else None
+        raise RuntimeError(str(detail or response.reason_phrase))
+    if not isinstance(data, dict):
+        raise RuntimeError("MCP 浏览器控制接口返回格式错误")
+    return data
+
+
 def _account_from_row(row: dict[str, Any]) -> AccountConfig:
     return AccountConfig(
         key=row["account_key"],
@@ -1234,12 +1249,6 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
             )
 
     try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Playwright 不可用: {exc}") from exc
-
-    session_id = uuid4().hex
-    try:
         login_url = validate_binance_url(
             payload.login_url or "https://www.binance.com/zh-CN/login",
             label="登录地址",
@@ -1259,70 +1268,39 @@ def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dic
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    playwright = None
-    browser = None
-    context = None
-    profile_dir = _cookie_import_profile_dir(key)
-    for singleton_file in profile_dir.glob("Singleton*"):
-        try:
-            singleton_file.unlink()
-        except OSError:
-            pass
     try:
-        playwright = sync_playwright().start()
-        context = playwright.chromium.launch_persistent_context(
-            str(profile_dir),
-            **_cookie_import_launch_options(proxy_url),
+        base_url, auth_token = _mcp_control_target(key)
+        result = _mcp_control_request(
+            "POST",
+            "/browser-sessions/start",
+            base_url=base_url,
+            auth_token=auth_token,
+            payload={
+                "account_key": key,
+                "name": name,
+                "proxy_url": proxy_url,
+                "login_url": login_url,
+            },
         )
-        browser = context.browser
-        if browser is None:
-            raise RuntimeError("无法获取浏览器实例")
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
-        validate_binance_url(page.url, label="登录页重定向地址")
     except Exception as exc:
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        if playwright is not None:
-            try:
-                playwright.stop()
-            except Exception:
-                pass
-        detail = f"打开登录窗口失败: {exc}"
-        if any(
-            marker in str(exc)
-            for marker in (
-                "ERR_CONNECTION_RESET",
-                "ERR_CONNECTION_CLOSED",
-                "ERR_PROXY_CONNECTION_FAILED",
-            )
-        ):
-            detail += "。请在本机页面的“独立代理”填写可用的 HTTP/SOCKS5 代理后重试。"
-        raise HTTPException(status_code=500, detail=detail) from exc
+        raise HTTPException(status_code=500, detail=f"MCP 打开登录窗口失败: {exc}") from exc
+
+    session_id = str(result.get("session_id") or "")
+    if not session_id:
+        raise HTTPException(status_code=500, detail="MCP 未返回登录会话标识")
 
     with cookie_login_sessions_lock:
         cookie_login_sessions[session_id] = {
             "account_key": key,
             "name": name,
-            "playwright": playwright,
-            "browser": browser,
-            "context": context,
-            "page": page,
-            "profile_dir": profile_dir,
+            "base_url": base_url,
+            "auth_token": auth_token,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     return {
         "ok": True,
         "session_id": session_id,
-        "message": "登录窗口已打开。请在弹出的窗口里完成 Binance 登录后，回到本页点击完成导入。",
+        "message": str(result.get("message") or "登录窗口已打开，请完成登录后点击确认登录"),
     }
 
 
@@ -1333,43 +1311,26 @@ def finish_account_cookie_import(
     if not session:
         raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
 
-    context = session["context"]
     try:
-        cookies = context.cookies(
-            ["https://www.binance.com", "https://accounts.binance.com"]
+        result = _mcp_control_request(
+            "POST",
+            f"/browser-sessions/{quote(payload.session_id, safe='')}/finish",
+            base_url=str(session["base_url"]),
+            auth_token=str(session["auth_token"]),
         )
-        cookie_header = _cookie_header_from_playwright_cookies(cookies)
-        if not cookie_header:
-            raise HTTPException(
-                status_code=400,
-                detail="未读取到 Binance Cookie。请确认已在弹出的窗口里完成登录。",
-            )
-        db = get_db()
-        db.upsert_account(
-            account_key=session["account_key"],
-            name=session["name"],
-            cookie=cookie_header,
-        )
-        result = {
-            "ok": True,
-            "account_key": session["account_key"],
-            "cookie_length": len(cookie_header),
-            "cookie_names": [
-                item["name"]
-                for item in BinanceAccountChecker._parse_cookie_header(cookie_header)
-            ],
-        }
-    except HTTPException:
-        raise
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"提取 Binance Cookie 失败: {exc}",
-        ) from exc
+        raise HTTPException(status_code=409, detail=f"确认 Binance 登录失败: {exc}") from exc
 
     _pop_cookie_login_session(payload.session_id)
-    _close_cookie_login_session(session, cleanup_profile=False)
-    return result
+    return {
+        "ok": True,
+        "account_key": result.get("account_key") or session["account_key"],
+        "cookie_length": int(result.get("cookie_length") or 0),
+        "cookie_names": list(result.get("cookie_names") or []),
+        "valid": bool(result.get("valid")),
+        "active": bool(result.get("active")),
+        "message": result.get("message"),
+    }
 
 
 def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
@@ -1377,11 +1338,12 @@ def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> d
     if not session:
         return {"ok": True}
     try:
-        session["browser"].close()
-    except Exception:
-        pass
-    try:
-        session["playwright"].stop()
+        _mcp_control_request(
+            "DELETE",
+            f"/browser-sessions/{quote(payload.session_id, safe='')}",
+            base_url=str(session["base_url"]),
+            auth_token=str(session["auth_token"]),
+        )
     except Exception:
         pass
     return {"ok": True}
@@ -1426,41 +1388,36 @@ def check_account(account_key: str) -> dict:
     )
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
-    if not account["cookie"]:
-        raise HTTPException(status_code=400, detail="账号缺少 Cookie")
-    checker = BinanceAccountChecker()
-    result = checker.check_profile(
-        account_key,
-        cookie=account["cookie"],
-        proxy_url=account.get("proxy_url") or "",
-    )
-    if not result.valid:
-        cookie_result = checker.check(
-            account["cookie"],
-            proxy_url=account.get("proxy_url") or "",
+    try:
+        base_url, auth_token = _mcp_control_target(account_key)
+        result = _mcp_control_request(
+            "GET",
+            f"/browser-sessions/account/{quote(account_key, safe='')}",
+            base_url=base_url,
+            auth_token=auth_token,
         )
-        if cookie_result.valid:
-            result = cookie_result
-        elif cookie_result.error:
-            result = type(result)(
-                valid=False,
-                signature_key=None,
-                error=(
-                    f"Profile 检测失败: {result.error or 'unknown'}; "
-                    f"Cookie 回退检测失败: {cookie_result.error}"
-                ),
-                raw=result.raw or cookie_result.raw,
-            )
-    status = "valid" if result.valid else "invalid"
+    except Exception as exc:
+        result = {
+            "active": False,
+            "ready": False,
+            "valid": False,
+            "signature_key": None,
+            "error": f"MCP 常驻浏览器检测失败: {exc}",
+        }
+    valid = bool(result.get("valid"))
+    error = str(result.get("error") or "") or None
+    status = "valid" if valid else "invalid"
     db.update_account_check(
         account_key,
-        signature_key=result.signature_key,
+        signature_key=result.get("signature_key"),
         status=status,
-        error=result.error,
+        error=error,
     )
     return {
-        "valid": result.valid,
-        "error": result.error,
+        "valid": valid,
+        "active": bool(result.get("active")),
+        "ready": bool(result.get("ready")),
+        "error": error,
     }
 
 

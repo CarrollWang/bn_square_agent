@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import ipaddress
 import json
@@ -12,9 +13,15 @@ import uuid
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
+from ..core.config import Settings as AgentSettings
 from ..core.config import mask_url_credentials, normalize_proxy_url
-from .browser_square_mcp_publisher import BrowserBinanceSquarePublisher
+from .browser_square_mcp_publisher import (
+    BrowserBinanceSquarePublisher,
+    BrowserPublishResult,
+)
+from .live_browser_session import DEFAULT_LOGIN_URL, LiveBrowserSessionManager
 
 
 TOOL_NAME = "publish_binance_square"
@@ -57,6 +64,7 @@ class SelfHostedMCPSettings:
     timeout_ms: int
     render_wait_ms: int
     publish_wait_ms: int
+    browser_headless: bool
 
     @classmethod
     def from_env(cls) -> "SelfHostedMCPSettings":
@@ -91,7 +99,125 @@ class SelfHostedMCPSettings:
                 minimum=3_000,
                 maximum=120_000,
             ),
+            browser_headless=os.getenv("MCP_BROWSER_HEADLESS", "0")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"},
         )
+
+
+class BrowserLoginStartPayload(BaseModel):
+    account_key: str = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, max_length=120)
+    proxy_url: str | None = Field(default=None, max_length=2_048)
+    login_url: str | None = Field(default=None, max_length=2_048)
+
+
+browser_session_executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="bn-square-live-browser",
+)
+_browser_session_manager: LiveBrowserSessionManager | None = None
+
+
+def _get_browser_session_manager(
+    settings: SelfHostedMCPSettings,
+) -> LiveBrowserSessionManager:
+    global _browser_session_manager
+    if _browser_session_manager is None:
+        _browser_session_manager = LiveBrowserSessionManager(
+            headless=settings.browser_headless,
+            timeout_ms=settings.timeout_ms,
+        )
+    return _browser_session_manager
+
+
+async def _run_browser_operation(operation, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(browser_session_executor, operation, *args)
+
+
+def _start_live_browser(
+    settings: SelfHostedMCPSettings,
+    payload: BrowserLoginStartPayload,
+) -> dict[str, object]:
+    manager = _get_browser_session_manager(settings)
+    return manager.start_login(
+        account_key=payload.account_key,
+        name=payload.name or payload.account_key,
+        proxy_url=payload.proxy_url or "",
+        login_url=payload.login_url or DEFAULT_LOGIN_URL,
+    )
+
+
+def _finish_live_browser(
+    settings: SelfHostedMCPSettings,
+    session_id: str,
+) -> dict[str, object]:
+    manager = _get_browser_session_manager(settings)
+    result = manager.finish_login(session_id)
+    cookie_header = str(result.pop("cookie_header"))
+    account_key = str(result["account_key"])
+    name = str(result.pop("name"))
+    proxy_url = str(result.pop("proxy_url"))
+    database = AgentSettings.from_env().build_database()
+    database.upsert_account(
+        account_key=account_key,
+        name=name,
+        cookie=cookie_header,
+        proxy_url=proxy_url,
+    )
+    database.update_account_check(
+        account_key,
+        signature_key=result.get("signature_key"),
+        status="valid",
+        error=None,
+    )
+    return result
+
+
+def _live_browser_status(
+    settings: SelfHostedMCPSettings,
+    account_key: str,
+) -> dict[str, object]:
+    return _get_browser_session_manager(settings).status(account_key)
+
+
+def _close_live_browser(
+    settings: SelfHostedMCPSettings,
+    session_id: str,
+) -> bool:
+    return _get_browser_session_manager(settings).close(session_id=session_id)
+
+
+def _publish_with_live_browser(
+    settings: SelfHostedMCPSettings,
+    publisher: BrowserBinanceSquarePublisher,
+    cookie: str,
+    content: str,
+    account_key: str,
+    coins: str,
+    image_base64: str,
+    proxy_url: str,
+) -> BrowserPublishResult:
+    manager = _get_browser_session_manager(settings)
+    if account_key and manager.has_session(account_key):
+        page = manager.get_ready_page(account_key)
+        return publisher.publish_in_page(
+            page=page,
+            content=content,
+            coins=coins,
+            image_base64=image_base64,
+            proxy_url=proxy_url,
+        )
+    return publisher.publish(
+        cookie=cookie,
+        content=content,
+        account_key=account_key,
+        coins=coins,
+        image_base64=image_base64,
+        proxy_url=proxy_url,
+    )
 
 
 def _jsonrpc_result(
@@ -131,15 +257,15 @@ def _tool_definition() -> dict[str, object]:
     return {
         "name": TOOL_NAME,
         "description": (
-            "使用 Binance Cookie 在 Binance Square 发布内容。"
-            "支持可选代理、自定义图片上传和 coins 参数透传。"
+            "使用账号的常驻浏览器会话在 Binance Square 发布内容。"
+            "Cookie 仅作为旧链路回退；支持独立代理、自定义图片和 coins 参数。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cookie": {
                     "type": "string",
-                    "description": "浏览器 Cookie 原文",
+                    "description": "可选，仅在没有常驻浏览器会话时作为兼容回退",
                 },
                 "content": {
                     "type": "string",
@@ -147,7 +273,7 @@ def _tool_definition() -> dict[str, object]:
                 },
                 "account_key": {
                     "type": "string",
-                    "description": "可选，复用该账号在本机保存的独立浏览器 Profile",
+                    "description": "账号标识；优先复用 MCP 内该账号仍在运行的浏览器会话",
                     "maxLength": 128,
                 },
                 "coins": {
@@ -164,7 +290,7 @@ def _tool_definition() -> dict[str, object]:
                     "description": "可选，账号独立代理，例如 http://user:pass@host:port",
                 },
             },
-            "required": ["cookie", "content"],
+            "required": ["content"],
             "additionalProperties": False,
         },
     }
@@ -229,6 +355,12 @@ def _build_publish_payload(
 app = FastAPI(title="BN Square Self-Hosted MCP")
 
 
+@app.on_event("shutdown")
+async def shutdown_live_browsers() -> None:
+    if _browser_session_manager is not None:
+        await _run_browser_operation(_browser_session_manager.close_all)
+
+
 @app.get("/")
 def root() -> dict[str, object]:
     settings = SelfHostedMCPSettings.from_env()
@@ -248,6 +380,79 @@ def healthz() -> dict[str, object]:
         "tool": TOOL_NAME,
         "auth_enabled": bool(settings.auth_token),
     }
+
+
+@app.post("/browser-sessions/start")
+async def start_browser_session(
+    payload: BrowserLoginStartPayload,
+    request: Request,
+    authorization: str | None = Header(None),
+) -> dict[str, object]:
+    settings = SelfHostedMCPSettings.from_env()
+    _check_auth(
+        authorization,
+        settings,
+        client_host=request.client.host if request.client else None,
+    )
+    try:
+        return await _run_browser_operation(_start_live_browser, settings, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"打开常驻登录浏览器失败: {exc}") from exc
+
+
+@app.post("/browser-sessions/{session_id}/finish")
+async def finish_browser_session(
+    session_id: str,
+    request: Request,
+    authorization: str | None = Header(None),
+) -> dict[str, object]:
+    settings = SelfHostedMCPSettings.from_env()
+    _check_auth(
+        authorization,
+        settings,
+        client_host=request.client.host if request.client else None,
+    )
+    try:
+        return await _run_browser_operation(_finish_live_browser, settings, session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"确认登录失败: {exc}") from exc
+
+
+@app.get("/browser-sessions/account/{account_key}")
+async def browser_session_status(
+    account_key: str,
+    request: Request,
+    authorization: str | None = Header(None),
+) -> dict[str, object]:
+    settings = SelfHostedMCPSettings.from_env()
+    _check_auth(
+        authorization,
+        settings,
+        client_host=request.client.host if request.client else None,
+    )
+    return await _run_browser_operation(_live_browser_status, settings, account_key)
+
+
+@app.delete("/browser-sessions/{session_id}")
+async def close_browser_session(
+    session_id: str,
+    request: Request,
+    authorization: str | None = Header(None),
+) -> dict[str, object]:
+    settings = SelfHostedMCPSettings.from_env()
+    _check_auth(
+        authorization,
+        settings,
+        client_host=request.client.host if request.client else None,
+    )
+    closed = await _run_browser_operation(_close_live_browser, settings, session_id)
+    return {"ok": True, "closed": closed}
 
 
 @app.post("/mcp")
@@ -392,15 +597,20 @@ async def handle_mcp(
             publish_wait_ms=settings.publish_wait_ms,
             debug_dir=settings.debug_dir,
         )
-        result = await asyncio.to_thread(
-            publisher.publish,
-            cookie=cookie,
-            content=content,
-            account_key=account_key,
-            coins=coins,
-            image_base64=image_base64,
-            proxy_url=effective_proxy,
-        )
+        try:
+            result = await _run_browser_operation(
+                _publish_with_live_browser,
+                settings,
+                publisher,
+                cookie,
+                content,
+                account_key,
+                coins,
+                image_base64,
+                effective_proxy,
+            )
+        except Exception as exc:
+            result = BrowserPublishResult(False, f"发布失败: {exc}")
         return _jsonrpc_result(
             request_id,
             _build_publish_payload(

@@ -113,8 +113,65 @@ class BrowserBinanceSquarePublisher:
             return BrowserPublishResult(False, "缺少 cookie 或 account_key")
         if not content.strip():
             return BrowserPublishResult(False, "缺少 content")
-        content = self._ensure_coin_reference(content, coins)
+        from playwright.sync_api import sync_playwright
 
+        with sync_playwright() as playwright:
+            launch_args: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+            proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
+            if proxy:
+                launch_args["proxy"] = proxy
+            browser = None
+            if profile_dir is not None:
+                context = playwright.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    locale="zh-CN",
+                    viewport={"width": 1440, "height": 960},
+                    **launch_args,
+                )
+            else:
+                browser = playwright.chromium.launch(**launch_args)
+                context = browser.new_context(
+                    locale="zh-CN",
+                    viewport={"width": 1440, "height": 960},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/125.0.0.0 Safari/537.36"
+                    ),
+                )
+            try:
+                cookies = BinanceAccountChecker._parse_cookie_header(cookie)
+                if cookies:
+                    context.add_cookies(cookies)
+                page = context.pages[0] if context.pages else context.new_page()
+                return self.publish_in_page(
+                    page=page,
+                    content=content,
+                    coins=coins,
+                    image_base64=image_base64,
+                    proxy_url=proxy_url,
+                )
+            finally:
+                context.close()
+                if browser is not None:
+                    browser.close()
+
+    def publish_in_page(
+        self,
+        *,
+        page: Any,
+        content: str,
+        coins: str = "",
+        image_base64: str = "",
+        proxy_url: str = "",
+    ) -> BrowserPublishResult:
+        """Publish through an already authenticated, still-running page."""
+        if not content.strip():
+            return BrowserPublishResult(False, "缺少 content")
+        content = self._ensure_coin_reference(content, coins)
         diagnostics = PublishDiagnostics(
             attempt_id=f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}",
             started_at=datetime.now(timezone.utc).isoformat(),
@@ -123,77 +180,36 @@ class BrowserBinanceSquarePublisher:
         try:
             if image_base64.strip():
                 temp_image_path = self._write_temp_image(image_base64)
-
-            from playwright.sync_api import sync_playwright
-
-            with sync_playwright() as playwright:
-                launch_args: dict[str, Any] = {
-                    "headless": True,
-                    "args": ["--disable-blink-features=AutomationControlled"],
-                }
-                proxy = playwright_proxy_settings(proxy_url) if proxy_url else None
-                if proxy:
-                    launch_args["proxy"] = proxy
-                browser = None
-                if profile_dir is not None:
-                    context = playwright.chromium.launch_persistent_context(
-                        str(profile_dir),
-                        locale="zh-CN",
-                        viewport={"width": 1440, "height": 960},
-                        **launch_args,
-                    )
-                else:
-                    browser = playwright.chromium.launch(**launch_args)
-                    context = browser.new_context(
-                        locale="zh-CN",
-                        viewport={"width": 1440, "height": 960},
-                        user_agent=(
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/125.0.0.0 Safari/537.36"
-                        ),
-                    )
-                cookies = BinanceAccountChecker._parse_cookie_header(cookie)
-                if cookies:
-                    context.add_cookies(cookies)
-                page = context.pages[0] if context.pages else context.new_page()
-                self._attach_debug_listeners(page, diagnostics)
-                try:
-                    page.goto(
-                        SQUARE_HOME_URL,
-                        wait_until="domcontentloaded",
-                        timeout=self.timeout_ms,
-                    )
-                    self._dismiss_popups(page)
-                    self._ensure_logged_in(page)
-                    self._open_compose_surface(page)
-                    self._fill_editor(page, content)
-                    if temp_image_path is not None:
-                        self._upload_image(page, temp_image_path)
-                    result = self._publish_post(page, diagnostics)
-                    context.close()
-                    if browser is not None:
-                        browser.close()
-                    return result
-                except Exception as exc:
-                    debug_artifact = self._debug_capture_bundle(
-                        page,
-                        diagnostics,
-                        prefix="publish_failed",
-                        extra={
-                            "exception": str(exc),
-                            "proxy_url": self.masked_proxy(proxy_url),
-                        },
-                    )
-                    context.close()
-                    if browser is not None:
-                        browser.close()
-                    LOGGER.exception("Binance Square publish failed")
-                    return BrowserPublishResult(
-                        False,
-                        f"发布失败: {exc}",
-                        debug_artifact=debug_artifact,
-                    )
+            self._attach_debug_listeners(page, diagnostics)
+            page.goto(
+                SQUARE_HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=self.timeout_ms,
+            )
+            self._dismiss_popups(page)
+            self._ensure_logged_in(page)
+            self._open_compose_surface(page)
+            self._fill_editor(page, content)
+            if temp_image_path is not None:
+                self._upload_image(page, temp_image_path)
+            return self._publish_post(page, diagnostics)
+        except Exception as exc:
+            debug_artifact = self._debug_capture_bundle(
+                page,
+                diagnostics,
+                prefix="publish_failed",
+                extra={
+                    "exception": str(exc),
+                    "proxy_url": self.masked_proxy(proxy_url),
+                    "live_session": True,
+                },
+            )
+            LOGGER.exception("Binance Square live-session publish failed")
+            return BrowserPublishResult(
+                False,
+                f"发布失败: {exc}",
+                debug_artifact=debug_artifact,
+            )
         finally:
             if temp_image_path is not None:
                 temp_image_path.unlink(missing_ok=True)
