@@ -25,6 +25,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .ai.llm import StructuredLLM
+from .ai.binance_symbols import futures_symbol_catalog
 from .ai.material_tagger import MaterialTagger
 from .core.config import (
     AccountConfig,
@@ -361,11 +362,16 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         monitor_state["last_results"] = results
         monitor_state["current_stage"] = "素材打标"
         tag_results: list[dict[str, Any]] = []
-        tagger = MaterialTagger()
-        for material in db.pending_material_items_for_tagging(
+        pending_materials = db.pending_material_items_for_tagging(
             limit=100,
             strategy=MaterialTagger.STRATEGY,
-        ):
+        )
+        tagger = (
+            MaterialTagger(valid_futures_symbols=futures_symbol_catalog.get())
+            if pending_materials
+            else MaterialTagger()
+        )
+        for material in pending_materials:
             try:
                 tag = tagger.tag(
                     title=material.get("title"),

@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import unittest
 
+from bn_square_agent.ai.binance_symbols import BinanceFuturesSymbolCatalog
 from bn_square_agent.ai.material_tagger import MaterialTagger
 from bn_square_agent.core.url_policy import (
     validate_binance_url,
@@ -101,6 +102,66 @@ class MaterialTaggerTests(unittest.TestCase):
                 tag = MaterialTagger().tag(title=title, content=content)
                 self.assertTrue(tag.accepted)
                 self.assertEqual(tag.symbol, expected)
+
+    def test_recognizes_bare_lab_only_when_binance_lists_the_contract(self) -> None:
+        tag = MaterialTagger(
+            valid_futures_symbols={"LABUSDT", "BTCUSDT"},
+        ).tag(
+            title="LAB 庄家向 Aster 转移 1850 万枚 LAB",
+            content="市场同时关注比特币走势，但本条核心交易对象是 LAB。",
+        )
+        self.assertTrue(tag.accepted)
+        self.assertEqual(tag.token, "LAB")
+        self.assertEqual(tag.symbol, "LABUSDT")
+
+    def test_rejects_uppercase_words_that_are_not_listed_contracts(self) -> None:
+        tag = MaterialTagger(
+            valid_futures_symbols={"BTCUSDT", "ETHUSDT"},
+        ).tag(
+            title="AI API 与 ETF 行业进展",
+            content="新的人工智能接口和行业基金研究已经公布。",
+        )
+        self.assertTrue(tag.accepted)
+        self.assertIsNone(tag.symbol)
+
+    def test_rejects_explicit_but_unlisted_symbol(self) -> None:
+        tag = MaterialTagger(
+            valid_futures_symbols={"BTCUSDT"},
+        ).tag(
+            title="$FAKE 项目更新",
+            content="该项目发布了新的加密市场路线图和产品计划。",
+        )
+        self.assertTrue(tag.accepted)
+        self.assertIsNone(tag.symbol)
+
+
+class BinanceFuturesSymbolCatalogTests(unittest.TestCase):
+    def test_parses_only_trading_usdt_perpetual_symbols(self) -> None:
+        symbols = BinanceFuturesSymbolCatalog.parse(
+            {
+                "symbols": [
+                    {
+                        "symbol": "LABUSDT",
+                        "status": "TRADING",
+                        "contractType": "PERPETUAL",
+                        "quoteAsset": "USDT",
+                    },
+                    {
+                        "symbol": "OLDUSDT",
+                        "status": "SETTLING",
+                        "contractType": "PERPETUAL",
+                        "quoteAsset": "USDT",
+                    },
+                    {
+                        "symbol": "BTCUSDC",
+                        "status": "TRADING",
+                        "contractType": "PERPETUAL",
+                        "quoteAsset": "USDC",
+                    },
+                ]
+            }
+        )
+        self.assertEqual(symbols, frozenset({"LABUSDT"}))
 
 
 class StaticAssetTests(unittest.TestCase):

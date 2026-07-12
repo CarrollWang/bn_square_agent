@@ -7,6 +7,7 @@ from dataclasses import dataclass, asdict
 TOKEN_RE = re.compile(
     r"(?:\{future\}\(([A-Z0-9]{2,20}USDT)\))|\$([A-Z][A-Z0-9]{1,20})|([A-Z0-9]{2,20}USDT)"
 )
+BARE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9$])([A-Z][A-Z0-9]{1,19})(?![A-Za-z0-9])")
 
 TOKEN_ALIASES = (
     ("BTC", ("BTC", "比特币", "Bitcoin")),
@@ -84,9 +85,22 @@ class MaterialTagger:
         "智谱",
     )
 
+    def __init__(
+        self,
+        *,
+        valid_futures_symbols: set[str] | frozenset[str] | None = None,
+    ) -> None:
+        self.valid_futures_symbols = (
+            frozenset(symbol.upper() for symbol in valid_futures_symbols)
+            if valid_futures_symbols is not None
+            else None
+        )
+
     def tag(self, *, title: str | None, content: str) -> MaterialTag:
         text = f"{title or ''}\n{content}".strip()
-        token, symbol = self._extract_token(text)
+        token, symbol = self._extract_token((title or "").strip())
+        if not symbol:
+            token, symbol = self._extract_token(content)
         direction, has_conflict = self._extract_direction(text)
         topics = self._extract_topics(text, token=token)
         reasons: list[str] = []
@@ -142,17 +156,31 @@ class MaterialTagger:
     def _extract_token(self, text: str) -> tuple[str | None, str | None]:
         for match in TOKEN_RE.finditer(text):
             futures_symbol, cash_token, plain_symbol = match.groups()
-            if futures_symbol:
+            if futures_symbol and self._is_valid_symbol(futures_symbol):
                 return futures_symbol.removesuffix("USDT"), futures_symbol
-            if plain_symbol:
+            if plain_symbol and self._is_valid_symbol(plain_symbol):
                 return plain_symbol.removesuffix("USDT"), plain_symbol
             if cash_token:
                 token = cash_token.upper()
-                return token, f"{token}USDT"
+                symbol = f"{token}USDT"
+                if self._is_valid_symbol(symbol):
+                    return token, symbol
         alias_match = self._find_first_alias(text)
-        if alias_match:
+        if alias_match and self._is_valid_symbol(f"{alias_match}USDT"):
             return alias_match, f"{alias_match}USDT"
+        if self.valid_futures_symbols is not None:
+            for match in BARE_TOKEN_RE.finditer(text):
+                token = match.group(1).upper()
+                symbol = f"{token}USDT"
+                if self._is_valid_symbol(symbol):
+                    return token, symbol
         return None, None
+
+    def _is_valid_symbol(self, symbol: str) -> bool:
+        return (
+            self.valid_futures_symbols is None
+            or symbol.upper() in self.valid_futures_symbols
+        )
 
     @staticmethod
     def _alias_index(text: str, alias: str) -> int | None:
