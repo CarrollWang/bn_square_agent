@@ -10,6 +10,9 @@ from ..storage.database import Database
 from ..publishing.publisher import PublishingService, PublishResult
 
 
+DEFAULT_FUTURE_SYMBOL = "BTCUSDT"
+
+
 @dataclass
 class AccountContentRun:
     account_key: str
@@ -40,7 +43,7 @@ class MultiAccountOperator:
             self.db.upsert_account(
                 account_key=account.key,
                 name=account.name,
-                cookie=account.cookie,
+                square_openapi_key=account.square_openapi_key,
             )
 
     @staticmethod
@@ -64,7 +67,7 @@ class MultiAccountOperator:
         token = re.search(r"\$([A-Z][A-Z0-9]{0,14})\b", text)
         if token and token.group(1).upper() not in {"USD", "USDT"}:
             return f"{token.group(1).upper()}USDT"
-        return None
+        return DEFAULT_FUTURE_SYMBOL
 
     @staticmethod
     def _ensure_future_marker(content: str, symbol: str | None) -> str:
@@ -93,10 +96,8 @@ class MultiAccountOperator:
             return None
         if not account.enabled:
             return "账号已禁用，已跳过"
-        if not account.cookie:
-            return "账号缺少 Cookie，已跳过"
-        if account.check_status == "invalid":
-            return "账号检测失效，已跳过"
+        if not account.square_openapi_key:
+            return "账号缺少 Binance Square OpenAPI Key，已跳过"
         return None
 
     def _account_requires_material_run(self, account: AccountConfig) -> bool:
@@ -128,6 +129,7 @@ class MultiAccountOperator:
         content: str,
         title: str | None,
         url: str | None,
+        source_name: str | None,
         future_symbol: str | None,
     ) -> AccountContentRun:
         run = AccountContentRun(account_key=account.key)
@@ -143,6 +145,7 @@ class MultiAccountOperator:
                     "content": content,
                     "title": title,
                     "url": url,
+                    "source_name": source_name,
                 }
             )
             run.generated_ids = state.get("generated_ids", [])
@@ -168,7 +171,10 @@ class MultiAccountOperator:
                         or result.get("message")
                         or "发布失败"
                     )
-                    if result.get("outcome") == "unknown":
+                    if result.get("outcome") == "rate_limited":
+                        run.status = "rate_limited"
+                        run.error = f"publish_rate_limited: {detail}"
+                    elif result.get("outcome") == "unknown":
                         run.error = f"publish_outcome_unknown: {detail}"
                     else:
                         run.error = detail
@@ -236,6 +242,19 @@ class MultiAccountOperator:
         if run.status == "already_published":
             return
         if run.status == "generated":
+            return
+        if run.status == "rate_limited":
+            self.db.save_material_account_run(
+                material_item_id,
+                account_key=run.account_key,
+                status="failed",
+                generated_id=run.approved_generated_id,
+                publish_result=(
+                    run.publish_result.result if run.publish_result else None
+                ),
+                error=run.error,
+                increment_attempts=False,
+            )
             return
         self.db.save_material_account_run(
             material_item_id,
@@ -306,8 +325,10 @@ class MultiAccountOperator:
         content: str,
         title: str | None = None,
         url: str | None = None,
+        source_name: str | None = None,
         future_symbol: str | None = None,
     ) -> list[AccountContentRun]:
+        resolved_future_symbol = future_symbol or DEFAULT_FUTURE_SYMBOL
         runs = []
         for account in self.accounts:
             runs.append(
@@ -316,7 +337,8 @@ class MultiAccountOperator:
                     content=content,
                     title=title,
                     url=url,
-                    future_symbol=future_symbol,
+                    source_name=source_name,
+                    future_symbol=resolved_future_symbol,
                 )
             )
         return runs
@@ -343,6 +365,7 @@ class MultiAccountOperator:
                 content=item["content"],
                 title=item.get("title"),
                 url=item.get("url"),
+                source_name=item.get("source_name"),
                 future_symbol=symbol,
             )
             self._save_material_run(material_item_id, run)
@@ -366,6 +389,7 @@ class MultiAccountOperator:
             content=item["content"],
             title=item.get("title"),
             url=item.get("url"),
+            source_name=item.get("source_name"),
             future_symbol=symbol,
         )
         self._save_material_run(material_item_id, run)
@@ -387,20 +411,38 @@ class MultiAccountOperator:
             ordered_accounts = ordered_accounts[shift:] + ordered_accounts[:shift]
         reserved_material_ids: set[int] = set()
         consume_results: list[dict[str, Any]] = []
-        for account in ordered_accounts:
-            if max_total_runs is not None and len(consume_results) >= max_total_runs:
-                break
-            if not self._account_requires_material_run(account):
-                continue
-            queue = self.db.list_material_queue_for_account(
-                account.key,
-                limit=max(limit_per_account * 5, 10),
+        eligible_accounts = [
+            account
+            for account in ordered_accounts
+            if self._account_requires_material_run(account)
+        ]
+        queues = {
+            account.key: iter(
+                self.db.list_material_queue_for_account(
+                    account.key,
+                    limit=max(limit_per_account * 5, 10),
+                )
             )
-            processed = 0
-            for material in queue:
-                material_id = int(material["id"])
-                if material_id in reserved_material_ids:
+            for account in eligible_accounts
+        }
+        processed_by_account = {account.key: 0 for account in eligible_accounts}
+
+        while eligible_accounts:
+            made_progress = False
+            for account in eligible_accounts:
+                if max_total_runs is not None and len(consume_results) >= max_total_runs:
+                    return consume_results
+                if processed_by_account[account.key] >= limit_per_account:
                     continue
+
+                queue = queues[account.key]
+                material = next(queue, None)
+                while material is not None and int(material["id"]) in reserved_material_ids:
+                    material = next(queue, None)
+                if material is None:
+                    continue
+
+                material_id = int(material["id"])
                 run = self.run_material_item_for_account(material_id, account.key)
                 consume_results.append(
                     {
@@ -411,9 +453,9 @@ class MultiAccountOperator:
                     }
                 )
                 reserved_material_ids.add(material_id)
-                processed += 1
-                if max_total_runs is not None and len(consume_results) >= max_total_runs:
-                    break
-                if processed >= limit_per_account:
-                    break
+                processed_by_account[account.key] += 1
+                made_progress = True
+
+            if not made_progress:
+                break
         return consume_results

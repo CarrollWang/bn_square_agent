@@ -124,6 +124,12 @@
           <el-form-item label="每轮消费数量">
             <el-input-number v-model="form.material_consume_batch_size" :min="1" />
           </el-form-item>
+          <el-form-item label="单账号每小时上限">
+            <el-input-number v-model="form.max_posts_per_account_per_hour" :min="1" :max="5" />
+          </el-form-item>
+          <el-form-item label="单账号 24 小时上限">
+            <el-input-number v-model="form.max_posts_per_account_per_day" :min="1" :max="80" />
+          </el-form-item>
         </el-form>
       </el-tab-pane>
     </el-tabs>
@@ -169,11 +175,13 @@ const form = reactive<Record<string, any>>({
   auto_publish: true,
   auto_consume_materials: true,
   material_poll_interval_seconds: 300,
-  material_success_interval_seconds: 600,
+  material_success_interval_seconds: 3600,
   material_failure_interval_seconds: 120,
   material_ttl_seconds: 7200,
-  material_consume_batch_size: 1,
+  material_consume_batch_size: 5,
   publish_failure_alert_threshold: 5,
+  max_posts_per_account_per_hour: 5,
+  max_posts_per_account_per_day: 80,
   alert_email_enabled: false,
   alert_email_to: "",
   smtp_host: "",
@@ -204,11 +212,13 @@ function applySettings(data: Settings) {
   form.auto_publish = Boolean(data.auto_publish);
   form.auto_consume_materials = Boolean(data.auto_consume_materials);
   form.material_poll_interval_seconds = data.material_poll_interval_seconds || 300;
-  form.material_success_interval_seconds = data.material_success_interval_seconds || 600;
+  form.material_success_interval_seconds = data.material_success_interval_seconds || 3600;
   form.material_failure_interval_seconds = data.material_failure_interval_seconds || 120;
   form.material_ttl_seconds = data.material_ttl_seconds || 7200;
-  form.material_consume_batch_size = data.material_consume_batch_size || 1;
+  form.material_consume_batch_size = data.material_consume_batch_size || 5;
   form.publish_failure_alert_threshold = data.publish_failure_alert_threshold || 5;
+  form.max_posts_per_account_per_hour = data.max_posts_per_account_per_hour || 5;
+  form.max_posts_per_account_per_day = data.max_posts_per_account_per_day || 80;
   form.alert_email_enabled = Boolean(data.alert_email_enabled);
   form.alert_email_to = data.alert_email_to || "";
   form.smtp_host = data.smtp_host || "";
@@ -247,6 +257,8 @@ function payload() {
     material_ttl_seconds: form.material_ttl_seconds,
     material_consume_batch_size: form.material_consume_batch_size,
     publish_failure_alert_threshold: form.publish_failure_alert_threshold,
+    max_posts_per_account_per_hour: form.max_posts_per_account_per_hour,
+    max_posts_per_account_per_day: form.max_posts_per_account_per_day,
     alert_email_enabled: form.alert_email_enabled,
     alert_email_to: form.alert_email_to,
     smtp_host: form.smtp_host,

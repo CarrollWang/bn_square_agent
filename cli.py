@@ -44,11 +44,11 @@ def check_config(_: argparse.Namespace) -> int:
     print(f"- AUTO_PUBLISH: {settings.auto_publish}")
     print(f"- accounts: {len(settings.accounts)}")
     for account in settings.accounts:
-        cookie_state = "已配置" if account.cookie else "缺失"
+        openapi_state = "已配置" if account.square_openapi_key else "缺失"
         proxy_state = account.proxy_url or "默认出口"
         mcp_state = account.mcp_url or "沿用全局"
         print(
-            f"  - {account.key} ({account.name}): cookie {cookie_state}; "
+            f"  - {account.key} ({account.name}): Square OpenAPI Key {openapi_state}; "
             f"proxy {proxy_state}; mcp {mcp_state}"
         )
     print(f"- LLM_API_KEY: {'已配置' if settings.llm_api_key else '缺失'}")

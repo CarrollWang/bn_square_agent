@@ -8,6 +8,7 @@ from ..models.schemas import (
     Candidate,
     CandidateSet,
     ContentReview,
+    MaterialAssessment,
     PostAnalysis,
     ProfileBatchSummary,
     StyleProfile,
@@ -38,6 +39,39 @@ class AnalysisAgent:
             ),
             user_prompt=f"分析以下目标作者历史文章：\n\n{content}",
             response_model=PostAnalysis,
+        )
+
+
+class MaterialAssessmentAgent:
+    def __init__(self, llm: StructuredLLM):
+        self.llm = llm
+
+    def assess(
+        self,
+        *,
+        title: str | None,
+        content: str,
+        source_name: str | None = None,
+        source_type: str | None = None,
+    ) -> MaterialAssessment:
+        return self.llm.invoke(
+            system_prompt=(
+                "你是 Binance Square 素材价值判断 Agent，只判断一条素材是否值得进入"
+                "后续写作，不生成帖子。有效素材不要求明确看多或看空，但必须与加密市场、"
+                "Web3 或重要 AI 行业动态相关，并包含可核实的具体事件、数据、公告、链上"
+                "变化、监管变化或明确市场观点。拒绝广告、加群引流、返佣推广、空泛口号、"
+                "只有标题没有事实、与主题无关的传统市场消息，以及信息密度过低的内容。"
+                "不得补充素材没有的事实，不得把潜在影响写成确定结果。accepted=true 时"
+                " relevance_score 必须至少 60，information_density 必须至少 50。"
+            ),
+            user_prompt=(
+                f"来源名称：{source_name or '未知'}\n"
+                f"来源类型：{source_type or '未知'}\n"
+                f"标题：{title or ''}\n\n"
+                f"正文：\n{content}"
+            ),
+            response_model=MaterialAssessment,
+            retries=1,
         )
 
 
@@ -92,12 +126,16 @@ class WriterAgent:
         result = self.llm.invoke(
             system_prompt=(
                 "你是 BN 广场短帖改写 Agent。任务是把外部素材改写成适合自动发布的"
-                "币圈广场短帖，而不是写研报或总结。必须保留素材里的币种、方向、"
-                "核心理由和情绪强度，不得添加素材没有的新事实、数据、消息或来源。"
-                "表达要短句、口语、有交易员语气，可以有态度，但预测必须用可能、"
-                "我看、关注、别追太满、注意风险等方式保留不确定性。不要写成"
+                "加密或 AI 资讯短帖，而不是洗稿、研报或机械摘要。必须保留素材明确"
+                "提供的主体、核心事实、数据、来源和不确定性，不得添加素材没有的"
+                "新事实、价格目标、持仓经历或消息来源。素材明确给出多空方向时才"
+                "保留方向；没有方向时禁止自行补做多、做空或涨跌预测。表达要短句、"
+                "口语、有判断，但判断必须能够从素材事实直接推出，并用可能、值得"
+                "关注、风险在于等表达保留边界。来源名称存在时应自然归因。不要写成"
                 "触发点/需要留意/总结/首先其次这种报告结构。不得复制素材或历史"
-                "文章的原句、句式和段落。一次只生成一篇候选，candidate_index 固定为 1。"
+                "文章的原句、句式和段落。正文提到币种代码时必须使用 $TOKEN 格式，"
+                "例如 $BTC、$LAB；不要把 {future}(TOKENUSDT) 写进正文，该组件由发布"
+                "边界补充。一次只生成一篇候选，candidate_index 固定为 1。"
             ),
             user_prompt=(
                 f"外部素材：\n{material}\n\n"
@@ -106,9 +144,10 @@ class WriterAgent:
                 f"{as_json(similar_analyses)}\n\n"
                 "输出要求：\n"
                 "1. 只输出一条可直接发布的短帖正文。\n"
-                "2. 开头尽量直接给币种和方向，例如 $XXX 多/空/继续看。\n"
+                "2. 交易观点素材可直接给币种和方向；资讯素材直接给事实及其影响。\n"
                 "3. 不要解释自己在改写，不要写标题，不要写项目符号。\n"
-                "4. 文末可以自然提醒风险，但不要变成投资建议声明。"
+                "4. 不得伪装成亲历者，不得虚构我买了、我卖了或独家获悉。\n"
+                "5. 文末可以自然提醒风险，但不要变成投资建议声明。"
             ),
             response_model=CandidateSet,
         )
@@ -128,8 +167,10 @@ class WriterAgent:
         return self.llm.invoke(
             system_prompt=(
                 "你是 BN 广场短帖改写 Agent。根据审核反馈重写候选稿。"
-                "不得添加素材没有的新事实，必须保留币种、方向、核心理由和口语节奏。"
-                "允许明确标注为不确定的预测。必须解决全部审核问题，避免报告腔。"
+                "不得添加素材没有的新事实，必须保留主体、核心事实、来源归因和口语"
+                "节奏。只有素材明确存在方向时才保留方向，不得虚构交易动作或预测。"
+                "正文提到币种代码时必须使用 $TOKEN 格式，不要自行输出 {future} 组件。"
+                "必须解决全部审核问题，避免报告腔。"
             ),
             user_prompt=(
                 f"外部素材：\n{material}\n\n"

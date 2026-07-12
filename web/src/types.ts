@@ -1,12 +1,10 @@
-export type SourceType = "binance_square" | "techflow_newsletter";
+export type SourceType = "news_feed";
 
 export interface Account {
   account_key: string;
   name: string;
   enabled: boolean;
-  cookie_saved: boolean;
-  cookie_length: number;
-  cookie_names: string[];
+  square_openapi_key_configured: boolean;
   check_status?: string;
   checked_at?: string;
   check_error?: string;
@@ -20,23 +18,10 @@ export interface Account {
 export interface AccountDetail {
   account_key: string;
   name: string;
-  cookie_saved: boolean;
+  square_openapi_key_configured: boolean;
   proxy_url: string;
   mcp_url: string;
   mcp_auth_token_configured: boolean;
-}
-
-export interface CookieImportStartResult {
-  ok: boolean;
-  session_id: string;
-  message: string;
-}
-
-export interface CookieImportFinishResult {
-  ok: boolean;
-  account_key: string;
-  cookie_length: number;
-  cookie_names: string[];
 }
 
 export interface MaterialSource {
@@ -76,6 +61,8 @@ export interface PublishHistoryItem {
   last_activity_at?: string | null;
   error?: string | null;
   publish_result?: Record<string, unknown> | string | null;
+  post_id?: string | null;
+  post_url?: string | null;
   material_title?: string | null;
   material_content?: string | null;
   material_url?: string | null;
@@ -220,6 +207,8 @@ export interface Settings {
   material_ttl_seconds: number;
   material_consume_batch_size: number;
   publish_failure_alert_threshold: number;
+  max_posts_per_account_per_hour: number;
+  max_posts_per_account_per_day: number;
   alert_email_enabled: boolean;
   alert_email_to: string;
   smtp_host: string;

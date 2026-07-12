@@ -4,7 +4,7 @@
       <template #header>
         <div class="toolbar">
           <div class="toolbar-title">
-            <strong>{{ isTechFlow ? "深潮源配置" : "BN 广场源配置" }}</strong>
+            <strong>新闻源配置</strong>
             <span>{{ sourceTypeLabel(activeType) }}</span>
           </div>
           <el-space wrap>
@@ -15,8 +15,7 @@
       </template>
 
       <el-alert
-        v-if="isTechFlow"
-        title="深潮快讯使用固定官方快讯源，无需填写来源名称和链接。"
+        title="支持 TechFlow、PANews、CoinDesk、Cointelegraph 等已审核新闻源。请填写来源名称和 RSS/新闻链接。"
         type="info"
         show-icon
         :closable="false"
@@ -25,22 +24,17 @@
 
       <el-form :model="sourceForm" label-width="110px" class="source-form">
         <el-form-item label="来源类型">
-          <el-select v-model="activeType" disabled>
-            <el-option label="BN 广场作者" value="binance_square" />
-            <el-option label="TechFlow 深潮快讯" value="techflow_newsletter" />
-          </el-select>
+          <el-input model-value="新闻源" disabled />
         </el-form-item>
-        <template v-if="!isTechFlow">
-          <el-form-item label="来源名称">
-            <el-input v-model="sourceForm.name" placeholder="目标作者 / 频道名" />
-          </el-form-item>
-          <el-form-item label="素材链接" class="wide">
-            <el-input v-model="sourceForm.url" placeholder="https://www.binance.com/zh-CN/square/profile/..." />
-          </el-form-item>
-        </template>
+        <el-form-item label="来源名称">
+          <el-input v-model="sourceForm.name" placeholder="例如 PANews" />
+        </el-form-item>
+        <el-form-item label="新闻链接" class="wide">
+          <el-input v-model="sourceForm.url" placeholder="https://www.panewslab.com/rss.xml" />
+        </el-form-item>
         <el-form-item class="wide">
           <el-button type="primary" :loading="saving" @click="saveSource">
-            {{ isTechFlow ? "保存/启用深潮快讯源" : "保存 BN 广场源" }}
+            保存新闻源
           </el-button>
         </el-form-item>
       </el-form>
@@ -78,7 +72,7 @@
       <template #header>
         <div class="toolbar">
           <div class="toolbar-title">
-            <strong>{{ isTechFlow ? "深潮素材库" : "BN 广场素材库" }}</strong>
+            <strong>新闻素材库</strong>
             <span>只展示当前来源类型的待使用素材</span>
           </div>
           <el-button plain @click="loadItems">刷新素材</el-button>
@@ -122,7 +116,7 @@ import type { MaterialItem, MaterialSource, SourceType } from "@/types";
 import { formatTime, sourceTypeLabel } from "@/utils";
 
 const route = useRoute();
-const activeType = ref<SourceType>((route.query.type as SourceType) || "binance_square");
+const activeType = ref<SourceType>("news_feed");
 const sources = ref<MaterialSource[]>([]);
 const items = ref<MaterialItem[]>([]);
 const saving = ref(false);
@@ -132,7 +126,6 @@ const sourceForm = reactive({
   url: "",
 });
 
-const isTechFlow = computed(() => activeType.value === "techflow_newsletter");
 const filteredSources = computed(() => sources.value.filter((item) => item.source_type === activeType.value));
 const filteredItems = computed(() => items.value.filter((item) => item.source_type === activeType.value));
 
@@ -161,10 +154,8 @@ async function saveSource() {
   saving.value = true;
   try {
     await api.saveMaterialSource({
-      name: isTechFlow.value ? "TechFlow 深潮快讯" : sourceForm.name.trim(),
-      url: isTechFlow.value
-        ? "https://www.techflowpost.com/newsletter?is_hot=1&articleType=1006"
-        : sourceForm.url.trim(),
+      name: sourceForm.name.trim(),
+      url: sourceForm.url.trim(),
       source_type: activeType.value,
       enabled: true,
     });
@@ -186,9 +177,6 @@ async function checkSource(sourceId: number) {
 async function checkAll() {
   checkingAll.value = true;
   try {
-    if (!filteredSources.value.length && isTechFlow.value) {
-      await saveSource();
-    }
     const targets = filteredSources.value.length ? filteredSources.value : sources.value.filter((item) => item.source_type === activeType.value);
     if (targets.length) {
       for (const source of targets) {
@@ -224,7 +212,7 @@ async function runMaterial(materialId: number) {
 watch(
   () => [route.query.type, route.query.section],
   async ([value, section]) => {
-    activeType.value = (value as SourceType) || "binance_square";
+    activeType.value = "news_feed";
     await nextTick();
     document
       .getElementById(section === "items" ? "source-items" : "source-config")

@@ -1,266 +1,161 @@
 # BN Square Agent
 
-BN Square Agent 是一个本地自动运营控制台，用来采集 Binance Square 作者文章，自动打标、改写、配走势图，并通过你自己的 MCP 发布到 Binance Square。
+BN Square Agent 是一个 Binance Square 多账号内容运营控制台，包含素材采集、LLM 改写与审核、账号轮转、自建 MCP、账号表现、发文历史和 TickTick 风格 Web UI。
+
+发布链路只使用 Binance 官方 Square OpenAPI，不使用 Cookie、扫码登录或浏览器自动发布。
+
+## 架构
+
+```text
+Web 管理台
+→ 多账号配置 / 审核 / 轮转 / 定时 / 看板 / 历史回写
+→ 自建 MCP: publish_binance_square
+→ Binance Square OpenAPI
+→ 帖子 ID 与公开 URL
+```
+
+自建 MCP 根据 `account_key` 从同机加密数据库读取对应账号的 Square OpenAPI Key。Key 不会出现在 MCP 参数、日志、API 响应或 Git 中。
 
 ## 功能
 
-- 本地 FastAPI 服务，Vue 前端源码放在 `web/`，构建产物输出到 `dist/`
-- 多账号 Cookie 管理，数据保存到本地 SQLite
-- 监控 Binance Square 作者主页并采集文章
-- 素材入库、打标、过期清理
-- 后台自动循环运行，也支持前端手动立即运行
-- 自动运行带任务互斥，避免多入口并发导致重复采集 / 重复发布
-- 每个账号生成不同终稿
-- LLM 自动审核与重写
-- 支持智谱等 OpenAI 兼容服务或 DashScope Embedding，并使用 Chroma 做风格检索
-- Playwright 自动截取 Binance 合约走势图
-- 通过你自己的 MCP 工具 `publish_binance_square` 发布文章
-- 支持账号级独立代理 / 独立 MCP 地址，便于多账号隔离运行
-- 按“素材 x 账号”记录发布状态，已成功账号不会重复发，失效账号会自动跳过
+### 素材有效性判断
 
-## 安全说明
+素材进入生成链路前使用两级漏斗：
 
-不要提交运行数据和密钥。仓库已忽略：
+1. 规则层零 Token 处理空内容、过短内容、推广引流、有效 Binance 币种和明确多空信号。
+2. 对方向不明确的加密/AI 新闻、主题关键词不足但信息完整的素材，调用一次结构化 LLM 判断相关度、信息密度、时效和影响类型。
+3. 明确交易信号不重复调用素材判断模型；模型异常时保留原规则结果，避免素材监控循环因 LLM 暂时不可用而停止。
 
-- `.env`
-- `data/`
-- `chroma_db/`
-- 本地 agent / 工具缓存目录
+语义判断只决定素材是否进入 Writer，不生成帖子，也不会把新闻影响自动改成做多或做空指令。
 
-Cookie、API Key、生成稿、采集样本都只应该保存在本地数据库或本地配置中，不要提交到 GitHub。
+Binance Square 创作者主页只用于离线风格对标，不进入自动素材采集；生产素材源仅接受经过域名白名单校验的新闻链接和 RSS。
 
-现在数据库里的这些字段会自动加密保存：
+- 多账号独立 Square OpenAPI Key。
+- 多账号独立代理、MCP 地址和 MCP Token。
+- 多新闻源采集、去重、打标和队列消费；TechFlow、PANews、CoinDesk、Cointelegraph 统一按 `news_feed` 配置。
+- LLM 多候选生成、审核与重写。
+- 账号轮转、失败重试、发布历史和表现看板。
+- 文本发布与单图发布。
+- 自建 MCP 服务，工具名固定为 `publish_binance_square`。
 
-- 账号 Cookie
-- 账号代理地址 `proxy_url`（包括可能包含的认证信息）
-- 账号级 `mcp_auth_token`
-- 全局 `LLM_API_KEY`、`EMBEDDING_API_KEY`、`MCP_AUTH_TOKEN`、`SMTP_PASSWORD`
+## Binance Square OpenAPI Key
 
-默认会在 `SECRET_KEY_PATH` 指向的位置生成主密钥文件；如果你更希望自己管理，也可以直接设置 `APP_SECRET_KEY`。
-迁移或备份服务器时，数据库和这个主密钥必须一起保留，否则历史密文无法解开。
+在 [Binance Square Creator Center](https://www.binance.com/square/creator-center/home) 创建 Key，然后只通过 Web 账号管理页录入。
+
+不要把 Key 写进：
+
+- `.env` 的公开样例。
+- MCP 调用参数。
+- 命令行参数。
+- 日志、聊天或 Git。
+
+账号 Key、代理凭据和 MCP Token 使用应用密钥加密保存到 SQLite。请备份 `SECRET_KEY_PATH` 指向的密钥文件；丢失后已加密凭据无法恢复。
 
 ## 安装
 
-建议使用 Python 3.11 或更高版本；依赖中也包含了 Python 3.9 的类型注解兼容层。
+要求 Python 3.11+ 和 Node.js 18+。
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-```
-
-macOS / Linux 激活虚拟环境时使用：
-
-```bash
-source .venv/bin/activate
-```
-
-可以复制 `.env.example` 到 `.env` 使用文件配置，也可以直接在网页控制台里保存配置。
-
-```powershell
-copy .env.example .env
-```
-
-如果不想手工生成主密钥，可以直接留空 `APP_SECRET_KEY`，程序会在 `SECRET_KEY_PATH` 自动生成一个本地主密钥文件。
-
-## 启动
-
-首次构建前端：
-
-```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 cd web
-npm ci
+npm install
 npm run build
 cd ..
 ```
 
-```powershell
-python -B run.py serve --host 127.0.0.1 --port 8787
-```
-
-打开：
-
-```text
-http://127.0.0.1:8787/
-```
-
-Windows 下如果 Playwright 采集或截图报 `WinError 5`，需要用更高权限启动服务。
-
-如果你需要从局域网或公网直接访问 `8787`，必须先配置应用级 Basic Auth：
-
-```text
-WEB_AUTH_USERNAME=admin
-WEB_AUTH_PASSWORD=请使用足够长的随机密码
-```
-
-然后才可以监听非本机地址：
+Playwright 仍用于素材采集和行情截图，不参与登录或发布。如需这些能力：
 
 ```powershell
-python -B run.py serve --host 0.0.0.0 --port 8787
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-这时你可以在自己本地浏览器直接打开：
+复制 `.env.example` 为 `.env`，至少配置 LLM、Embedding、自建 MCP 和安全项。账号 Square OpenAPI Key 在 Web 页面单独录入。
 
-```text
-http://你的服务器IP:8787/
-```
+## 本地运行
 
-未配置应用认证时，程序会拒绝非本机直接访问。更推荐让服务只监听
-`127.0.0.1`，再用 Nginx / Caddy 的 HTTPS 和 Basic Auth 暴露管理台；这种模式
-不需要再配置 `WEB_AUTH_USERNAME` / `WEB_AUTH_PASSWORD`。
-如果你只把 `serve-mcp` 部署到服务器，那么本地网页控制台不会自动跟过去；这种情况下是“本地控制台 + 远程 MCP”模式。
-
-### 推荐公网部署方式
-
-如果你是“自用 + 公网服务器”，更推荐这套拓扑：
-
-```text
-浏览器 -> Nginx(443, Basic Auth, HTTPS) -> Web 管理台(127.0.0.1:8787)
-                                      └-> MCP 服务(127.0.0.1:8788, 仅本机可见)
-```
-
-也就是：
-
-- Web 管理台只监听 `127.0.0.1:8787`
-- MCP 服务只监听 `127.0.0.1:8788`
-- Nginx 作为唯一公网入口
-- 主程序里的 `MCP_URL` 直接填 `http://127.0.0.1:8788/mcp`
-
-这套模式下，服务器可以长期自己运行，不需要你把本地电脑一直开着。
-比较实用的日常流程是：
-
-- 平时只让服务器常驻运行
-- 只有当 Binance Cookie 失效时，才在本机临时更新一次 Cookie
-- 更新方式可以是本机临时运行同版本程序，用登录窗口导入 Cookie，或者直接手动粘贴到服务器后台
-
-仓库里已经放了 Nginx 样板：
-
-- [deploy/nginx/bn-square-agent-web.conf.example](deploy/nginx/bn-square-agent-web.conf.example)
-- [deploy/nginx/bn-square-agent-mcp.conf.example](deploy/nginx/bn-square-agent-mcp.conf.example)
-- [deploy/nginx/README.md](deploy/nginx/README.md)
-
-## 自建 MCP 发布服务
-
-项目内置了一个可单独部署的 HTTP MCP 服务。仅供同机主程序调用时，保持本机监听：
+启动 MCP：
 
 ```powershell
-python -B run.py serve-mcp --host 127.0.0.1 --port 8788
+.\start-local-mcp.ps1
 ```
 
-启动后发布地址通常是：
-
-```text
-http://127.0.0.1:8788/mcp
-```
-
-如果确实需要公开 MCP，必须先配置 `MCP_SERVER_AUTH_TOKEN`，然后才监听
-`0.0.0.0`：
-
-```text
-MCP_SERVER_AUTH_TOKEN=your-secret-token
-MCP_SERVER_DEFAULT_PROXY=
-MCP_SERVER_DEBUG_DIR=./data/mcp_debug
-MCP_SERVER_PUBLISH_WAIT_MS=12000
-```
+启动 Web：
 
 ```powershell
-python -B run.py serve-mcp --host 0.0.0.0 --port 8788
+.\.venv\Scripts\python.exe -B run.py serve --host 127.0.0.1 --port 8787
 ```
 
-然后在主程序里这样填：
+访问：<http://127.0.0.1:8787/>
 
-- `MCP_URL=http://你的服务器:8788/mcp`
-- `MCP_AUTH_TOKEN=your-secret-token`
-- 如果某个账号需要独立出口 IP，可以在账号管理里单独填写 `proxy_url`
+## MCP 工具
 
-### 自建 MCP 特性
+`publish_binance_square` 参数：
 
-- 工具名保持为 `publish_binance_square`
-- 支持 `cookie`、`content`
-- 可选支持 `coins`、`image_base64`、`proxy_url`；自建浏览器发布器会根据
-  `coins` 确保正文包含对应 `$TOKEN` cashtag
-- 发布过程使用 Playwright 本地浏览器自动化，不再依赖第三方黑盒 MCP
-- 发布前会等待按钮进入可点击状态，发布后会结合页面提示、网络响应和编辑器状态判定结果
-- 发布失败或结果不确定时，会在 `MCP_SERVER_DEBUG_DIR` 下保存调试包
+- `content`：必填，发布正文。
+- `account_key`：必填，账号标识。
+- `coins`：可选，形如 `SOL:future`；用于指定一个主合约。发布边界会
+  根据 Binance 现货/合约目录把正文中的其他有效币种规范为 `$TOKEN`，
+  并为主币种补充 `{future}(SOLUSDT)` 组件。
+- `image_base64`：可选，一张图片的 data URL 或纯 base64。
 
-调试包里会包含：
+工具不接受 OpenAPI Key、Cookie 或代理参数。MCP 从加密数据库读取 Key 和账号代理。
 
-- `page.png`：完整截图
-- `page.html`：当时的页面 HTML
-- `diagnostics.json`：最近网络响应、请求失败、控制台日志、页面异常
+## 发布结果
 
-### 部署建议
+- OpenAPI 返回帖子 ID 或公开 URL：`outcome=published`。
+- `/content/add` 返回 HTTP 504，或成功码但没有 ID/URL：`outcome=unknown`，不能记为最终成功。
+- API 明确错误：`outcome=failed`。
+- 账号达到本机发布上限：`outcome=rate_limited`，素材保留等待后续重试。
 
-- 用 `systemd` 或 `supervisor` 常驻运行 `python -B run.py serve-mcp`
-- 外层用 Nginx/Caddy 反代到 `/mcp`
-- 强烈建议开启 HTTPS，并配置 `MCP_SERVER_AUTH_TOKEN`
-- 如果你要做多账号 IP 隔离，可以给每个账号单独配置 `proxy_url`，或者给不同账号指向不同的自建 MCP 地址
+第一条真实发布必须先人工确认正文，并以公开帖子 URL 或页面证据验收。
 
-## 本地校验
+## 账号发布限流
 
-从项目父目录运行后端回归测试：
+所有自动发布、Web 手动触发和直接 MCP 调用共用数据库额度账本：
 
-```bash
-python -m unittest discover -s bn_square_agent/tests -v
-```
+- 单账号滚动 1 小时最多 5 篇。
+- 单账号滚动 24 小时最多 80 篇。
+- `published`、`unknown` 和进行中的请求占额度；明确 `failed` 不占额度。
+- 上限可以在 Web 设置页调低，但不能调高到超过 5/小时、80/24 小时。
 
-前端类型检查和生产构建：
+该限制只统计经过本项目自建 MCP 发布的帖子；直接在 Binance App 或其他工具发布的内容不在本地账本中，因此仍需给官方 100 篇/天上限保留余量。
 
-```bash
-npm --prefix bn_square_agent/web run build
-```
+## 服务器部署
 
-## 网页配置
+参考 `deploy/systemd/`：
 
-网页控制台会把这些配置保存到 SQLite：
+- Web：`127.0.0.1:8787`
+- MCP：`127.0.0.1:8788`
+- 环境文件：`/etc/bn-square-agent/env`，建议权限 `600`
+- 数据库、应用密钥和 Chroma 数据目录需要持久化
 
-- LLM API Key、Base URL、模型名
-- Embedding 服务、API Key、Base URL 和模型（支持智谱 `embedding-3`）
-- 默认 MCP 地址、发布工具、访问 Token
-- 账号级独立 MCP 地址 / 独立代理配置
-- 自动循环、自动发布、自动消费素材
-- 采集间隔、成功后间隔、失败重试间隔、素材有效期
+MCP 和 Web 应使用相同的 `DATABASE_PATH` 与 `SECRET_KEY_PATH`，否则 MCP 无法读取 Web 保存的账号 Key。
 
-LLM 和 Embedding 有独立测试按钮，方便分别确认连接是否正常。
-
-## 自动运行流程
-
-1. 在账号管理里添加 Binance Cookie。
-2. 在素材中心添加 Binance Square 作者主页链接。
-3. 后台循环按配置间隔采集新文章。
-4. 素材源文章进入本地素材库。
-5. 打标器识别币种、方向、合约符号。
-6. 过期素材会按 TTL 自动失效。
-7. 自动消费器从可用素材中取一条。
-8. 自动消费按账号队列轮转分配素材，尽量避免一条素材同一轮被所有账号同时消费。
-9. Writer Agent 改写成账号对应的终稿。
-10. Review Agent 自动审核，不合格则重写。
-11. 发布前自动匹配合约图和 `coins` 参数。
-12. 你的 MCP 使用 Cookie 发布文章。
-
-## 前端页面
-
-前端采用 Vue3/Vite/TypeScript 管理后台布局：
-
-- 自动运行：查看状态、启动/暂停循环、立即运行、检查发布通道
-- 账号管理：保存账号 Cookie，配置独立代理 / 独立 MCP，支持在当前运行机器打开登录窗口导入 Cookie
-- 账号表现：按 7/30/90 天窗口看账号成功率、活跃度、问题账号、来源效果
-- 发文历史：查看账号成功/失败/跳过汇总，以及每条素材的发布明细
-- 素材中心：管理采集源、查看素材库
-- 系统设置：配置 LLM、Embedding、自动运行参数
-
-## 项目结构
+推荐不要再为 BN Square Agent 单独开放公网域名，而是作为个人工作台里的一个子模块接入，例如：
 
 ```text
-ai/           LLM Agent、改写、审核、打标
-core/         配置与环境变量
-web/          Vue3/Vite 前端源码
-dist/         前端构建产物，由 FastAPI 托管
-knowledge/    Chroma / Embedding 风格检索
-models/       Pydantic 数据结构
-publishing/   MCP 发布、走势图截图、账号检测、账号隔离出网
-sources/      素材源采集
-storage/      SQLite 持久化
-workflows/    LangGraph 工作流和自动运营编排
+https://dashboard.alphatools.site/ticktick/bn-square/
 ```
+
+部署要点：
+
+- 由工作台首页或导航进入 BN Square，不再保留旧的独立公网入口。
+- nginx 通过子路径反向代理到 `127.0.0.1:8787`，并用带 `/` 结尾的 `proxy_pass` 去掉前缀。
+- Web 前端已改成相对静态资源路径和相对子路径 API，可直接工作在 `/ticktick/bn-square/` 之类的挂载点。
+- 建议单独加一条 `/ticktick/bn-square/api/` 代理规则到 `127.0.0.1:8787/api/`。
+
+默认保持以下开关关闭，完成一条真实首帖后再逐级开启：
+
+```text
+AUTO_MONITOR_ENABLED=0
+AUTO_CONSUME_MATERIALS=0
+AUTO_PUBLISH=0
+```
+
+## 安全边界
+
+- Web/MCP 默认只绑定 `127.0.0.1`。
+- 非本机访问必须启用认证或使用 SSH/Tailscale 隧道。
+- 不在日志中输出 Key、Token 或代理密码。
+- 不把 HTTP 504 当作已验证发布成功。

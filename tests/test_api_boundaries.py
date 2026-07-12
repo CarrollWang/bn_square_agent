@@ -1,171 +1,91 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 import re
 import unittest
-from unittest.mock import patch
 
-from bn_square_agent.publishing.account_check import BinanceAccountChecker
-from bn_square_agent.webapp import _cookie_header_from_playwright_cookies
-
-
-class FakePage:
-    def __init__(self, result):
-        self.result = result
-
-    def evaluate(self, _script, _argument):
-        return self.result
+from bn_square_agent.publishing.self_hosted_mcp import _tool_definition
+from bn_square_agent.webapp import (
+    _basic_auth_matches,
+    _consume_results_failure_count,
+    _consume_results_have_failure,
+    _next_monitor_delay,
+    publish_evidence,
+)
 
 
-class WebApiBoundaryTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        try:
-            from fastapi.testclient import TestClient
-            from bn_square_agent.webapp import app
-        except ModuleNotFoundError as exc:
-            raise unittest.SkipTest(f"runtime dependency is not installed: {exc}")
-        cls.client = TestClient(app)
-
-    def test_index_and_built_assets_are_served(self) -> None:
+class WebBoundaryTests(unittest.TestCase):
+    def test_index_references_existing_built_assets(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         index_html = (project_root / "dist" / "index.html").read_text(encoding="utf-8")
-        asset_path = re.search(r'(?:src|href)="(/assets/[^"]+)', index_html)
-        self.assertIsNotNone(asset_path)
-        self.assertEqual(self.client.get("/").status_code, 200)
-        self.assertEqual(self.client.get(asset_path.group(1)).status_code, 200)
-
-    def test_basic_auth_is_optional_locally_and_enforced_when_configured(self) -> None:
-        with patch.dict(
-            "os.environ",
-            {"WEB_AUTH_USERNAME": "admin", "WEB_AUTH_PASSWORD": "secret"},
-        ):
-            self.assertEqual(self.client.get("/").status_code, 401)
-            self.assertEqual(
-                self.client.get("/", auth=("admin", "secret")).status_code,
-                200,
+        asset_paths = re.findall(r'(?:src|href)="(/assets/[^"]+)', index_html)
+        self.assertTrue(asset_paths)
+        for asset_path in asset_paths:
+            self.assertTrue(
+                (project_root / "dist" / "assets" / asset_path.removeprefix("/assets/")).is_file()
             )
-            self.assertEqual(self.client.get("/healthz").status_code, 200)
 
-    def test_material_source_rejects_untrusted_host(self) -> None:
-        response = self.client.post(
-            "/api/material-sources",
-            json={
-                "name": "bad",
-                "url": "https://evil.example/news",
-                "source_type": "techflow_newsletter",
-            },
-        )
-        self.assertEqual(response.status_code, 400)
+    def test_basic_auth_match_is_exact(self) -> None:
+        token = base64.b64encode(b"admin:secret").decode("ascii")
+        self.assertTrue(_basic_auth_matches(f"Basic {token}", "admin", "secret"))
+        self.assertFalse(_basic_auth_matches(f"Basic {token}", "admin", "wrong"))
 
-    def test_cookie_export_filters_domains_and_deduplicates_names(self) -> None:
-        cookies = [
-            {"name": "p20t", "value": "global", "domain": ".binance.com", "path": "/"},
-            {"name": "p20t", "value": "account", "domain": "accounts.binance.com", "path": "/"},
-            {"name": "p20t", "value": "www", "domain": "www.binance.com", "path": "/"},
-            {"name": "shared", "value": "yes", "domain": ".binance.com", "path": "/"},
-            {"name": "wrong_path", "value": "no", "domain": ".binance.com", "path": "/zh-CN"},
-            {"name": "other", "value": "no", "domain": ".example.com", "path": "/"},
-        ]
-        header = _cookie_header_from_playwright_cookies(cookies)
-        self.assertIn("p20t=www", header)
-        self.assertIn("shared=yes", header)
-        self.assertNotIn("account", header)
-        self.assertNotIn("wrong_path", header)
-        self.assertEqual(header.count("p20t="), 1)
-
-    def test_page_session_probe_accepts_private_square_identity(self) -> None:
-        result = BinanceAccountChecker.probe_page_session(
-            FakePage(
-                {
-                    "valid": True,
-                    "signature_key": "square-user-1",
-                    "source": "/bapi/composite/v3/private/pgc/user/client",
-                    "attempts": [],
-                }
-            )
-        )
-        self.assertTrue(result.valid)
-        self.assertEqual(result.signature_key, "square-user-1")
-
-    def test_page_session_probe_preserves_login_error(self) -> None:
-        result = BinanceAccountChecker.probe_page_session(
-            FakePage(
-                {
-                    "valid": False,
-                    "error": "Please login first",
-                    "attempts": [],
-                }
-            )
-        )
-        self.assertFalse(result.valid)
-        self.assertEqual(result.error, "Please login first")
-
-    def test_account_headers_reuse_binance_csrf_cookie(self) -> None:
-        headers = BinanceAccountChecker._headers("cr00=csrf-token; session=abc")
-        self.assertEqual(headers["csrftoken"], "csrf-token")
-
-    def test_cookie_login_session_cleanup_removes_temporary_profile(self) -> None:
-        from bn_square_agent.webapp import (
-            _close_cookie_login_session,
-            _cookie_import_profile_dir,
-        )
-
-        class Closable:
-            def close(self):
-                return None
-
-        class PlaywrightHandle:
-            def stop(self):
-                return None
-
-        profile_dir = _cookie_import_profile_dir("cleanup-test-account")
-        _close_cookie_login_session(
+    def test_publish_history_extracts_canonical_post_evidence(self) -> None:
+        post_id, post_url = publish_evidence(
             {
-                "context": Closable(),
-                "browser": Closable(),
-                "playwright": PlaywrightHandle(),
-                "profile_dir": profile_dir,
+                "structuredContent": {
+                    "post_id": "343615300021041",
+                    "post_url": "https://app.binance.com/uni-qr/cpos/343615300021041",
+                }
             }
         )
-        self.assertFalse(profile_dir.exists())
+        self.assertEqual(post_id, "343615300021041")
+        self.assertEqual(
+            post_url,
+            "https://www.binance.com/zh-CN/square/post/343615300021041",
+        )
+
+    def test_rate_limit_is_not_counted_as_publish_failure(self) -> None:
+        consume_results = [
+            {
+                "runs": [
+                    {
+                        "error": "publish_rate_limited: hourly limit",
+                        "publish_success": False,
+                        "publish_result": {"outcome": "rate_limited"},
+                    }
+                ]
+            }
+        ]
+        self.assertFalse(_consume_results_have_failure(consume_results))
+        self.assertEqual(_consume_results_failure_count(consume_results), 0)
+
+        settings = type(
+            "SettingsStub",
+            (),
+            {
+                "material_failure_interval_seconds": 900,
+                "material_success_interval_seconds": 7200,
+                "material_poll_interval_seconds": 900,
+            },
+        )()
+        self.assertEqual(
+            _next_monitor_delay(
+                settings,
+                {"consume_results": consume_results, "results": []},
+            ),
+            (3600, "rate_limited"),
+        )
 
 
 class McpBoundaryTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        try:
-            from fastapi.testclient import TestClient
-            from bn_square_agent.publishing.self_hosted_mcp import app
-        except ModuleNotFoundError as exc:
-            raise unittest.SkipTest(f"runtime dependency is not installed: {exc}")
-        cls.client = TestClient(app)
-
-    def test_initialize_and_argument_validation(self) -> None:
-        initialized = self.client.post(
-            "/mcp",
-            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-        )
-        self.assertEqual(initialized.status_code, 200)
-        self.assertEqual(
-            initialized.json()["result"]["protocolVersion"],
-            "2025-06-18",
-        )
-
-        invalid = self.client.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "publish_binance_square",
-                    "arguments": {"cookie": "x", "content": "y", "coins": "bad"},
-                },
-            },
-        )
-        self.assertEqual(invalid.status_code, 200)
-        self.assertIn("coins 格式", invalid.json()["error"]["message"])
+    def test_tool_schema_uses_account_key_and_never_accepts_secrets(self) -> None:
+        schema = _tool_definition()["inputSchema"]
+        self.assertEqual(schema["required"], ["content", "account_key"])
+        self.assertNotIn("cookie", schema["properties"])
+        self.assertNotIn("square_openapi_key", schema["properties"])
+        self.assertNotIn("proxy_url", schema["properties"])
 
 
 if __name__ == "__main__":

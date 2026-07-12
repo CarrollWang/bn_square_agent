@@ -2,8 +2,6 @@ import type {
   Account,
   AccountPerformanceDashboard,
   AccountDetail,
-  CookieImportFinishResult,
-  CookieImportStartResult,
   MaterialItem,
   MaterialSource,
   MonitorStatus,
@@ -12,8 +10,39 @@ import type {
   Settings,
 } from "./types";
 
+function appBasePath(): string {
+  const pathname = window.location.pathname || "/";
+  if (pathname === "/") {
+    return "/";
+  }
+  return pathname.endsWith("/")
+    ? pathname
+    : pathname.replace(/\/[^/]*$/, "/");
+}
+
+function apiBasePath(): string {
+  const base = appBasePath();
+  return `${base}api/`;
+}
+
+function resolveApiUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  if (path.startsWith("/api/")) {
+    return `${apiBasePath()}${path.slice(5)}`;
+  }
+  if (path.startsWith("api/")) {
+    return `${apiBasePath()}${path.slice(4)}`;
+  }
+  if (path.startsWith("/")) {
+    return path;
+  }
+  return `${apiBasePath()}${path}`;
+}
+
 async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, {
+  const response = await fetch(resolveApiUrl(url), {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
@@ -31,7 +60,7 @@ export const api = {
   saveAccount: (payload: {
     account_key: string;
     name?: string;
-    cookie?: string | null;
+    square_openapi_key?: string | null;
     proxy_url?: string;
     mcp_url?: string;
     mcp_auth_token?: string | null;
@@ -47,25 +76,6 @@ export const api = {
   checkAccount: (accountKey: string) =>
     requestJson<any>(`/api/accounts/${encodeURIComponent(accountKey)}/check`, {
       method: "POST",
-    }),
-  startCookieImport: (payload: {
-    account_key: string;
-    name?: string;
-    login_url?: string;
-  }) =>
-    requestJson<CookieImportStartResult>("/api/accounts/import-cookie/start", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    }),
-  finishCookieImport: (session_id: string) =>
-    requestJson<CookieImportFinishResult>("/api/accounts/import-cookie/finish", {
-      method: "POST",
-      body: JSON.stringify({ session_id }),
-    }),
-  cancelCookieImport: (session_id: string) =>
-    requestJson<{ ok: boolean }>("/api/accounts/import-cookie/cancel", {
-      method: "POST",
-      body: JSON.stringify({ session_id }),
     }),
   settings: () => requestJson<Settings>("/api/settings"),
   saveSettings: (payload: Record<string, unknown>) =>

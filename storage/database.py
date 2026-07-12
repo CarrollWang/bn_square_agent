@@ -8,13 +8,19 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Iterator
+from uuid import uuid4
 
 from ..core.secret_store import SecretStore
 from ..models.schemas import ContentReview, PostAnalysis, StyleProfile
 
 
 ACCOUNT_SECRET_COLUMNS = frozenset(
-    {"cookie", "proxy_url", "mcp_auth_token", "signature_key"}
+    {
+        "square_openapi_key",
+        "proxy_url",
+        "mcp_auth_token",
+        "signature_key",
+    }
 )
 SECRET_APP_SETTING_KEYS = frozenset(
     {
@@ -25,6 +31,10 @@ SECRET_APP_SETTING_KEYS = frozenset(
         "SMTP_PASSWORD",
     }
 )
+
+
+class PublishRateLimitError(ValueError):
+    pass
 
 
 def utc_now() -> str:
@@ -120,6 +130,12 @@ class Database:
         }
 
     def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        publish_rate_table_existed = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'publish_rate_events'
+            """
+        ).fetchone() is not None
         source_columns = self._columns(connection, "source_posts")
         if "account_key" not in source_columns:
             connection.execute(
@@ -145,7 +161,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS accounts (
                 account_key TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                cookie TEXT NOT NULL DEFAULT '',
+                square_openapi_key TEXT NOT NULL DEFAULT '',
                 proxy_url TEXT NOT NULL DEFAULT '',
                 mcp_url TEXT NOT NULL DEFAULT '',
                 mcp_auth_token TEXT NOT NULL DEFAULT '',
@@ -174,7 +190,7 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 source_type TEXT NOT NULL CHECK(
-                    source_type IN ('binance_square', 'techflow_newsletter')
+                    source_type IN ('news_feed')
                 ),
                 url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -229,6 +245,19 @@ class Database:
                 FOREIGN KEY(generated_id) REFERENCES generated_posts(id)
             );
 
+            CREATE TABLE IF NOT EXISTS publish_rate_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reservation_id TEXT NOT NULL UNIQUE,
+                account_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('reserved', 'published', 'unknown', 'failed')
+                ),
+                post_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(account_key) REFERENCES accounts(account_key)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_material_items_status_tag_created
                 ON material_items(status, tag_status, created_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_generated_posts_account_status_created
@@ -237,12 +266,14 @@ class Database:
                 ON generated_posts(publish_status, published_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_material_account_runs_material_status
                 ON material_account_runs(material_item_id, status, account_key);
+            CREATE INDEX IF NOT EXISTS idx_publish_rate_events_account_created
+                ON publish_rate_events(account_key, created_at DESC, status);
             """
         )
         account_columns = self._columns(connection, "accounts")
-        if "cookie" not in account_columns:
+        if "square_openapi_key" not in account_columns:
             connection.execute(
-                "ALTER TABLE accounts ADD COLUMN cookie TEXT NOT NULL DEFAULT ''"
+                "ALTER TABLE accounts ADD COLUMN square_openapi_key TEXT NOT NULL DEFAULT ''"
             )
         if "proxy_url" not in account_columns:
             connection.execute(
@@ -266,9 +297,30 @@ class Database:
             connection.execute("ALTER TABLE accounts ADD COLUMN checked_at TEXT")
         if "check_error" not in account_columns:
             connection.execute("ALTER TABLE accounts ADD COLUMN check_error TEXT")
+        if not publish_rate_table_existed:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO publish_rate_events (
+                    reservation_id, account_key, status, post_id,
+                    created_at, updated_at
+                )
+                SELECT
+                    'bootstrap-generated-' || g.id,
+                    g.account_key,
+                    'published',
+                    NULL,
+                    g.published_at,
+                    g.published_at
+                FROM generated_posts g
+                JOIN accounts a ON a.account_key = g.account_key
+                WHERE g.publish_status = 'published'
+                    AND g.published_at IS NOT NULL
+                """
+            )
         material_columns = self._columns(connection, "material_items")
         self._ensure_material_source_types(connection)
         self._ensure_material_items_source_fk(connection)
+        self._ensure_material_account_runs_item_fk(connection)
         if "tag_status" not in material_columns:
             connection.execute(
                 "ALTER TABLE material_items ADD COLUMN tag_status TEXT NOT NULL DEFAULT 'pending'"
@@ -399,12 +451,115 @@ class Database:
             )
             return cursor.rowcount == 1
 
+    def reserve_publish_slot(
+        self,
+        account_key: str,
+        *,
+        hourly_limit: int,
+        daily_limit: int,
+        now: datetime | None = None,
+    ) -> str:
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+        hour_start = (current - timedelta(hours=1)).isoformat()
+        day_start = (current - timedelta(hours=24)).isoformat()
+        stale_start = (current - timedelta(minutes=10)).isoformat()
+        reservation_id = uuid4().hex
+        counted_statuses = ("reserved", "published", "unknown")
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # A process may die after the OpenAPI request but before finalizing
+            # the reservation. Count stale in-flight requests as unknown rather
+            # than freeing the slot and risking a duplicate burst.
+            connection.execute(
+                """
+                UPDATE publish_rate_events
+                SET status = 'unknown', updated_at = ?
+                WHERE status = 'reserved' AND created_at < ?
+                """,
+                (current.isoformat(), stale_start),
+            )
+            hour_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM publish_rate_events
+                    WHERE account_key = ?
+                        AND status IN (?, ?, ?)
+                        AND created_at >= ?
+                    """,
+                    (account_key, *counted_statuses, hour_start),
+                ).fetchone()[0]
+            )
+            if hour_count >= hourly_limit:
+                raise PublishRateLimitError(
+                    f"账号 {account_key} 已达到滚动 1 小时发布上限 {hourly_limit} 篇"
+                )
+
+            day_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM publish_rate_events
+                    WHERE account_key = ?
+                        AND status IN (?, ?, ?)
+                        AND created_at >= ?
+                    """,
+                    (account_key, *counted_statuses, day_start),
+                ).fetchone()[0]
+            )
+            if day_count >= daily_limit:
+                raise PublishRateLimitError(
+                    f"账号 {account_key} 已达到滚动 24 小时发布上限 {daily_limit} 篇"
+                )
+
+            connection.execute(
+                """
+                INSERT INTO publish_rate_events (
+                    reservation_id, account_key, status, post_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'reserved', NULL, ?, ?)
+                """,
+                (
+                    reservation_id,
+                    account_key,
+                    current.isoformat(),
+                    current.isoformat(),
+                ),
+            )
+        return reservation_id
+
+    def finalize_publish_slot(
+        self,
+        reservation_id: str,
+        *,
+        status: str,
+        post_id: str | None = None,
+    ) -> None:
+        if status not in {"published", "unknown", "failed"}:
+            raise ValueError(f"发布额度状态无效: {status}")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE publish_rate_events
+                SET status = ?, post_id = ?, updated_at = ?
+                WHERE reservation_id = ? AND status = 'reserved'
+                """,
+                (status, post_id, utc_now(), reservation_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"发布额度预约不存在或已结束: {reservation_id}")
+
     def _ensure_material_items_source_fk(self, connection: sqlite3.Connection) -> None:
         foreign_keys = connection.execute(
             "PRAGMA foreign_key_list(material_items)"
         ).fetchall()
         if not any(str(row["table"]) == "material_sources_old" for row in foreign_keys):
             return
+        connection.commit()
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
             """
@@ -442,6 +597,59 @@ class Database:
                 tag_error, tagged_at, error, created_at, updated_at
             FROM material_items_old;
             DROP TABLE material_items_old;
+            CREATE INDEX IF NOT EXISTS idx_material_items_status_tag_created
+                ON material_items(status, tag_status, created_at DESC, id DESC);
+            PRAGMA foreign_keys = ON;
+            """
+        )
+
+    def _ensure_material_account_runs_item_fk(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(material_account_runs)"
+        ).fetchall()
+        if not any(str(row["table"]) == "material_items_old" for row in foreign_keys):
+            return
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            ALTER TABLE material_account_runs RENAME TO material_account_runs_old;
+            CREATE TABLE material_account_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_item_id INTEGER NOT NULL,
+                account_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('published', 'failed', 'skipped')
+                ),
+                generated_id INTEGER,
+                publish_json TEXT,
+                error TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempted_at TEXT,
+                published_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(material_item_id, account_key),
+                FOREIGN KEY(material_item_id) REFERENCES material_items(id),
+                FOREIGN KEY(account_key) REFERENCES accounts(account_key),
+                FOREIGN KEY(generated_id) REFERENCES generated_posts(id)
+            );
+            INSERT INTO material_account_runs (
+                id, material_item_id, account_key, status, generated_id,
+                publish_json, error, attempt_count, last_attempted_at,
+                published_at, created_at, updated_at
+            )
+            SELECT
+                id, material_item_id, account_key, status, generated_id,
+                publish_json, error, attempt_count, last_attempted_at,
+                published_at, created_at, updated_at
+            FROM material_account_runs_old;
+            DROP TABLE material_account_runs_old;
+            CREATE INDEX IF NOT EXISTS idx_material_account_runs_material_status
+                ON material_account_runs(material_item_id, status, account_key);
             PRAGMA foreign_keys = ON;
             """
         )
@@ -451,17 +659,29 @@ class Database:
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'material_sources'"
         ).fetchone()
         table_sql = str(row["sql"] if row else "")
-        if "techflow_newsletter" in table_sql:
+        if "'news_feed'" in table_sql:
             return
+        connection.commit()
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
             """
+            UPDATE material_items
+            SET status = CASE WHEN status = 'new' THEN 'ignored' ELSE status END,
+                error = CASE
+                    WHEN status = 'new' THEN 'binance_square_source_removed'
+                    ELSE error
+                END,
+                source_id = NULL,
+                updated_at = datetime('now')
+            WHERE source_id IN (
+                SELECT id FROM material_sources WHERE source_type = 'binance_square'
+            );
             ALTER TABLE material_sources RENAME TO material_sources_old;
             CREATE TABLE material_sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 source_type TEXT NOT NULL CHECK(
-                    source_type IN ('binance_square', 'techflow_newsletter')
+                    source_type IN ('news_feed')
                 ),
                 url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -476,9 +696,10 @@ class Database:
                 last_error, created_at, updated_at
             )
             SELECT
-                id, name, source_type, url, enabled, last_checked_at,
+                id, name, 'news_feed', url, enabled, last_checked_at,
                 last_error, created_at, updated_at
-            FROM material_sources_old;
+            FROM material_sources_old
+            WHERE source_type IN ('techflow_newsletter', 'news_feed');
             DROP TABLE material_sources_old;
             PRAGMA foreign_keys = ON;
             """
@@ -732,10 +953,6 @@ class Database:
                 WHERE i.status = 'new'
                     AND i.tag_status = 'accepted'
                     AND (
-                        i.tag_json LIKE '%"direction": "long"%'
-                        OR i.tag_json LIKE '%"direction": "short"%'
-                    )
-                    AND (
                         r.status IS NULL
                         OR (
                             r.status = 'failed'
@@ -851,10 +1068,11 @@ class Database:
                 """
                 UPDATE material_items
                 SET status = 'ignored',
-                    error = 'expired_after_2h',
+                    error = 'expired_after_ttl',
                     updated_at = ?
                 WHERE status = 'new'
-                    AND datetime(created_at) <= datetime('now', ?)
+                    AND datetime(COALESCE(source_created_at, created_at))
+                        <= datetime('now', ?)
                 """,
                 (utc_now(), f"-{ttl_seconds} seconds"),
             )
@@ -877,27 +1095,32 @@ class Database:
         *,
         account_key: str,
         name: str,
-        cookie: str | None = None,
+        square_openapi_key: str | None = None,
         proxy_url: str | None = None,
         mcp_url: str | None = None,
         mcp_auth_token: str | None = None,
     ) -> None:
-        encrypted_cookie = self._encrypt_secret(cookie)
+        encrypted_square_openapi_key = self._encrypt_secret(square_openapi_key)
         encrypted_proxy_url = self._encrypt_secret(proxy_url)
         encrypted_mcp_auth_token = self._encrypt_secret(mcp_auth_token)
+        new_check_status = (
+            None
+            if square_openapi_key is None
+            else ("configured" if square_openapi_key.strip() else "missing")
+        )
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO accounts (
-                    account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
-                    enabled, created_at
+                    account_key, name, square_openapi_key, proxy_url, mcp_url, mcp_auth_token,
+                    check_status, enabled, created_at
                 )
-                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), 1, ?)
+                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, 'unchecked'), 1, ?)
                 ON CONFLICT(account_key) DO UPDATE SET
                     name = excluded.name,
-                    cookie = CASE
-                        WHEN ? IS NULL THEN accounts.cookie
-                        ELSE excluded.cookie
+                    square_openapi_key = CASE
+                        WHEN ? IS NULL THEN accounts.square_openapi_key
+                        ELSE excluded.square_openapi_key
                     END,
                     proxy_url = CASE
                         WHEN ? IS NULL THEN accounts.proxy_url
@@ -911,13 +1134,10 @@ class Database:
                         WHEN ? IS NULL THEN accounts.mcp_auth_token
                         ELSE excluded.mcp_auth_token
                     END,
-                    signature_key = CASE
-                        WHEN ? IS NULL THEN accounts.signature_key
-                        ELSE NULL
-                    END,
                     check_status = CASE
                         WHEN ? IS NULL THEN accounts.check_status
-                        ELSE 'unchecked'
+                        WHEN excluded.square_openapi_key = '' THEN 'missing'
+                        ELSE 'configured'
                     END,
                     checked_at = CASE
                         WHEN ? IS NULL THEN accounts.checked_at
@@ -932,25 +1152,25 @@ class Database:
                 (
                     account_key,
                     name,
-                    encrypted_cookie,
+                    encrypted_square_openapi_key,
                     encrypted_proxy_url,
                     mcp_url,
                     encrypted_mcp_auth_token,
+                    new_check_status,
                     utc_now(),
-                    encrypted_cookie,
+                    encrypted_square_openapi_key,
                     encrypted_proxy_url,
                     mcp_url,
                     encrypted_mcp_auth_token,
-                    encrypted_cookie,
-                    encrypted_cookie,
-                    encrypted_cookie,
-                    encrypted_cookie,
+                    encrypted_square_openapi_key,
+                    encrypted_square_openapi_key,
+                    encrypted_square_openapi_key,
                 ),
             )
 
     def list_accounts(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         query = """
-            SELECT account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
+            SELECT account_key, name, square_openapi_key, proxy_url, mcp_url, mcp_auth_token,
                 signature_key, check_status, checked_at, check_error, enabled, created_at
             FROM accounts
         """

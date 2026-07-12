@@ -17,7 +17,7 @@ def _load_accounts_from_db(db: Database) -> tuple[AccountConfig, ...]:
         AccountConfig(
             key=row["account_key"],
             name=row["name"],
-            cookie=row["cookie"],
+            square_openapi_key=row.get("square_openapi_key") or "",
             proxy_url=row.get("proxy_url") or "",
             mcp_url=row.get("mcp_url") or "",
             mcp_auth_token=row.get("mcp_auth_token") or "",
@@ -48,7 +48,7 @@ def build_services(settings: Settings | None = None) -> Services:
         db.upsert_account(
             account_key=account.key,
             name=account.name,
-            cookie=account.cookie or None,
+            square_openapi_key=account.square_openapi_key or None,
             proxy_url=account.proxy_url or None,
             mcp_url=account.mcp_url or None,
             mcp_auth_token=account.mcp_auth_token or None,

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import ipaddress
 import json
 import os
-from pathlib import Path
 import re
 import secrets
 import uuid
@@ -13,17 +12,31 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ..core.config import mask_url_credentials, normalize_proxy_url
-from .browser_square_mcp_publisher import BrowserBinanceSquarePublisher
+from ..ai.binance_symbols import futures_symbol_catalog, spot_asset_catalog
+from ..core.config import Settings as AgentSettings
+from ..storage.database import Database, PublishRateLimitError
+from .binance_square_openapi import (
+    BinanceSquareOpenAPIClient,
+    BinanceSquareOpenAPIError,
+)
 
 
 TOOL_NAME = "publish_binance_square"
 PROTOCOL_VERSION = "2025-06-18"
-MAX_COOKIE_LENGTH = 200_000
 MAX_CONTENT_LENGTH = 50_000
 MAX_IMAGE_BASE64_LENGTH = 18 * 1024 * 1024
 MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
 COINS_PATTERN = re.compile(r"^[A-Z0-9]{2,20}:(?:future|spot)$", re.IGNORECASE)
+FUTURE_MARKER_PATTERN = re.compile(
+    r"\{future\}\(([A-Z0-9]{2,30}USDT)\)",
+    re.IGNORECASE,
+)
+BARE_CASHTAG_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9$])([A-Z][A-Z0-9]{1,19})(?![A-Za-z0-9])"
+)
+CASHTAG_STOPWORDS = frozenset(
+    {"AI", "API", "CEO", "CFO", "DEX", "ETF", "SEC", "USD", "USDT"}
+)
 
 
 def _bounded_env_int(
@@ -41,26 +54,20 @@ def _bounded_env_int(
     return max(minimum, min(value, maximum))
 
 
-def _resolve_debug_dir(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return Path(__file__).resolve().parents[1] / path
-
-
 @dataclass(frozen=True)
 class SelfHostedMCPSettings:
     auth_token: str
     allow_insecure_public_bind: bool
-    default_proxy_url: str
-    debug_dir: Path
-    timeout_ms: int
-    render_wait_ms: int
-    publish_wait_ms: int
+    timeout_seconds: float
 
     @classmethod
     def from_env(cls) -> "SelfHostedMCPSettings":
-        default_proxy = os.getenv("MCP_SERVER_DEFAULT_PROXY", "").strip()
+        timeout_ms = _bounded_env_int(
+            "MCP_SERVER_TIMEOUT_MS",
+            90_000,
+            minimum=10_000,
+            maximum=300_000,
+        )
         return cls(
             auth_token=os.getenv("MCP_SERVER_AUTH_TOKEN", "").strip(),
             allow_insecure_public_bind=os.getenv(
@@ -69,28 +76,7 @@ class SelfHostedMCPSettings:
             .strip()
             .lower()
             not in {"0", "false", "no", "off"},
-            default_proxy_url=normalize_proxy_url(default_proxy) if default_proxy else "",
-            debug_dir=_resolve_debug_dir(
-                os.getenv("MCP_SERVER_DEBUG_DIR", "./data/mcp_debug")
-            ),
-            timeout_ms=_bounded_env_int(
-                "MCP_SERVER_TIMEOUT_MS",
-                90_000,
-                minimum=10_000,
-                maximum=300_000,
-            ),
-            render_wait_ms=_bounded_env_int(
-                "MCP_SERVER_RENDER_WAIT_MS",
-                2_000,
-                minimum=500,
-                maximum=30_000,
-            ),
-            publish_wait_ms=_bounded_env_int(
-                "MCP_SERVER_PUBLISH_WAIT_MS",
-                12_000,
-                minimum=3_000,
-                maximum=120_000,
-            ),
+            timeout_seconds=timeout_ms / 1000,
         )
 
 
@@ -117,10 +103,7 @@ def _jsonrpc_error(
     payload: dict[str, object] = {
         "jsonrpc": "2.0",
         "id": request_id,
-        "error": {
-            "code": code,
-            "message": message,
-        },
+        "error": {"code": code, "message": message},
     }
     if data is not None:
         payload["error"]["data"] = data
@@ -131,35 +114,35 @@ def _tool_definition() -> dict[str, object]:
     return {
         "name": TOOL_NAME,
         "description": (
-            "使用 Binance Cookie 在 Binance Square 发布内容。"
-            "支持可选代理、自定义图片上传和 coins 参数透传。"
+            "使用账号已加密保存的 Binance Square OpenAPI Key 发布内容。"
+            "Key 不通过 MCP 参数传输；支持账号轮转、独立代理和一张可选图片。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cookie": {
-                    "type": "string",
-                    "description": "浏览器 Cookie 原文",
-                },
                 "content": {
                     "type": "string",
                     "description": "要发布的正文内容",
                 },
+                "account_key": {
+                    "type": "string",
+                    "description": "账号标识；MCP 从同机加密数据库读取该账号的 OpenAPI Key",
+                    "maxLength": 128,
+                },
                 "coins": {
                     "type": "string",
-                    "description": "可选，形如 BTC:future；自建浏览器发布器会确保正文包含对应 cashtag",
+                    "description": (
+                        "可选，形如 SOL:future；用于选择主合约，正文其他有效币种"
+                        "会按 Binance 现货目录规范为 $TOKEN"
+                    ),
                     "maxLength": 32,
                 },
                 "image_base64": {
                     "type": "string",
                     "description": "可选，data URL 或纯 base64 图片",
                 },
-                "proxy_url": {
-                    "type": "string",
-                    "description": "可选，账号独立代理，例如 http://user:pass@host:port",
-                },
             },
-            "required": ["cookie", "content"],
+            "required": ["content", "account_key"],
             "additionalProperties": False,
         },
     }
@@ -189,33 +172,166 @@ def _check_auth(
         )
     expected = f"Bearer {settings.auth_token}"
     if not auth_header or not secrets.compare_digest(
-        auth_header.encode("utf-8"),
-        expected.encode("utf-8"),
+        auth_header.encode("utf-8"), expected.encode("utf-8")
     ):
         raise HTTPException(status_code=401, detail="MCP server auth failed")
 
 
-def _build_publish_payload(
-    *,
-    success: bool,
-    message: str,
+def _load_account_context(
+    account_key: str,
+) -> tuple[Database, AgentSettings, dict[str, object]]:
+    base_settings = AgentSettings.from_env()
+    database = base_settings.build_database()
+    effective_settings = base_settings.with_overrides(database.get_app_settings())
+    account = next(
+        (
+            row
+            for row in database.list_accounts()
+            if row["account_key"] == account_key
+        ),
+        None,
+    )
+    if not account:
+        raise KeyError(f"账号不存在或已禁用: {account_key}")
+    if not str(account.get("square_openapi_key") or "").strip():
+        raise ValueError(f"账号 {account_key} 缺少 Binance Square OpenAPI Key")
+    return database, effective_settings, account
+
+
+def _ensure_trading_component(
+    content: str,
     coins: str,
-    proxy_url: str,
-    post_url: str | None = None,
-    debug_artifact: str | None = None,
+    *,
+    valid_cashtag_tokens: set[str] | frozenset[str] | None = None,
+) -> str:
+    """Keep cashtags and trading components explicit at the OpenAPI boundary.
+
+    ``coins`` used to be consumed by the remote browser publisher.  The
+    self-hosted publisher calls Square OpenAPI directly, so it must translate
+    that metadata into the visible ``$TOKEN`` cashtag and, for futures, the
+    bodyTextOnly marker. Existing explicit markers are preserved and
+    conflicting symbols are rejected to avoid publishing a BTC article with
+    an ETH trading component.
+    """
+
+    text = content.strip()
+    if not coins:
+        return text
+
+    coin, market = coins.split(":", 1)
+    coin = coin.upper()
+    market = market.lower()
+    cashtag = coin.removesuffix("USDT")
+    bare_token = re.compile(
+        rf"(?<![A-Za-z0-9$]){re.escape(cashtag)}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    text, _ = bare_token.subn(f"${cashtag}", text)
+    valid_tokens = {
+        str(token).strip().upper()
+        for token in (valid_cashtag_tokens or ())
+        if str(token).strip()
+    }
+
+    def normalize_secondary(match: re.Match[str]) -> str:
+        token = match.group(1).upper()
+        if token == cashtag:
+            return f"${token}"
+        if token in valid_tokens and token not in CASHTAG_STOPWORDS:
+            return f"${token}"
+        return match.group(0)
+
+    text = BARE_CASHTAG_TOKEN_PATTERN.sub(normalize_secondary, text)
+    if not re.search(rf"\${re.escape(cashtag)}\b", text, re.IGNORECASE):
+        text = f"${cashtag} {text}".strip()
+
+    if market == "future":
+        symbol = coin if coin.endswith("USDT") else f"{coin}USDT"
+        existing = [match.upper() for match in FUTURE_MARKER_PATTERN.findall(text)]
+        if existing:
+            if symbol not in existing:
+                raise ValueError(
+                    f"正文合约组件 {existing[0]} 与发布币种 {symbol} 不一致"
+                )
+            return text
+        return f"{text}\n\n{{future}}({symbol})"
+
+    return text
+
+
+def _publish(
+    settings: SelfHostedMCPSettings,
+    *,
+    content: str,
+    account_key: str,
+    coins: str,
+    image_base64: str,
+) -> dict[str, object]:
+    database, agent_settings, account = _load_account_context(account_key)
+    valid_cashtag_tokens = set(spot_asset_catalog.get())
+    valid_cashtag_tokens.update(
+        symbol.removesuffix("USDT") for symbol in futures_symbol_catalog.get()
+    )
+    publish_content = _ensure_trading_component(
+        content,
+        coins,
+        valid_cashtag_tokens=valid_cashtag_tokens,
+    )
+    if len(publish_content) > MAX_CONTENT_LENGTH:
+        raise ValueError("补充交易组件后 content 过长")
+    client = BinanceSquareOpenAPIClient(
+        str(account["square_openapi_key"]),
+        proxy_url=str(account.get("proxy_url") or ""),
+        timeout_seconds=settings.timeout_seconds,
+    )
+    reservation_id = database.reserve_publish_slot(
+        account_key,
+        hourly_limit=agent_settings.max_posts_per_account_per_hour,
+        daily_limit=agent_settings.max_posts_per_account_per_day,
+    )
+    try:
+        result = client.publish_text(
+            publish_content,
+            image_base64=image_base64,
+        )
+    except (BinanceSquareOpenAPIError, ValueError):
+        database.finalize_publish_slot(reservation_id, status="failed")
+        raise
+    except Exception:
+        database.finalize_publish_slot(reservation_id, status="unknown")
+        raise
+
+    rate_status = (
+        "published"
+        if result.success
+        else "unknown"
+        if result.outcome == "unknown"
+        else "failed"
+    )
+    database.finalize_publish_slot(
+        reservation_id,
+        status=rate_status,
+        post_id=result.post_id,
+    )
+    return result.as_dict()
+
+
+def _build_publish_payload(
+    result: dict[str, object],
+    *,
+    account_key: str,
+    coins: str,
 ) -> dict[str, object]:
     structured = {
-        "success": success,
-        "message": message,
+        **result,
+        "account_key": account_key,
         "coins": coins or None,
-        "proxy_url": mask_url_credentials(proxy_url) if proxy_url else None,
-        "post_url": post_url,
-        "debug_artifact": debug_artifact,
     }
     text = json.dumps(structured, ensure_ascii=False)
+    success = structured.get("success") is True
     return {
         "success": success,
-        "isError": not success,
+        "isError": structured.get("outcome") == "failed",
         "structuredContent": structured,
         "content": [{"type": "text", "text": text}],
     }
@@ -230,6 +346,7 @@ def root() -> dict[str, object]:
     return {
         "ok": True,
         "service": "bn-square-self-hosted-mcp",
+        "publisher": "binance-square-openapi",
         "tool": TOOL_NAME,
         "auth_enabled": bool(settings.auth_token),
     }
@@ -240,6 +357,7 @@ def healthz() -> dict[str, object]:
     settings = SelfHostedMCPSettings.from_env()
     return {
         "ok": True,
+        "publisher": "binance-square-openapi",
         "tool": TOOL_NAME,
         "auth_enabled": bool(settings.auth_token),
     }
@@ -276,42 +394,30 @@ async def handle_mcp(
 
     if method == "notifications/initialized":
         return JSONResponse({"ok": True}, headers={"mcp-session-id": session_id})
-
     if method == "initialize":
         return _jsonrpc_result(
             request_id,
             {
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {
-                        "listChanged": False,
-                    }
-                },
+                "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {
                     "name": "bn-square-self-hosted-mcp",
-                    "version": "0.1.0",
+                    "version": "0.2.0",
                 },
             },
             session_id=session_id,
         )
-
     if method == "tools/list":
         return _jsonrpc_result(
             request_id,
-            {
-                "tools": [_tool_definition()],
-            },
+            {"tools": [_tool_definition()]},
             session_id=session_id,
         )
-
     if method == "tools/call":
         params = payload.get("params") or {}
         if not isinstance(params, dict):
             return _jsonrpc_error(
-                request_id,
-                -32602,
-                "params 必须是 JSON 对象",
-                session_id=session_id,
+                request_id, -32602, "params 必须是 JSON 对象", session_id=session_id
             )
         tool_name = str(params.get("name") or "")
         arguments = params.get("arguments") or {}
@@ -329,31 +435,29 @@ async def handle_mcp(
                 f"unknown tool: {tool_name}",
                 session_id=session_id,
             )
-        cookie = str(arguments.get("cookie") or "")
         content = str(arguments.get("content") or "")
+        account_key = str(arguments.get("account_key") or "").strip()
         coins = str(arguments.get("coins") or "")
         image_base64 = str(arguments.get("image_base64") or "")
-        proxy_url = str(arguments.get("proxy_url") or "").strip()
-        if len(cookie) > MAX_COOKIE_LENGTH:
+        if not content.strip():
             return _jsonrpc_error(
-                request_id,
-                -32602,
-                "cookie 过长",
-                session_id=session_id,
+                request_id, -32602, "content 不能为空", session_id=session_id
+            )
+        if not account_key:
+            return _jsonrpc_error(
+                request_id, -32602, "account_key 不能为空", session_id=session_id
             )
         if len(content) > MAX_CONTENT_LENGTH:
             return _jsonrpc_error(
-                request_id,
-                -32602,
-                "content 过长",
-                session_id=session_id,
+                request_id, -32602, "content 过长", session_id=session_id
+            )
+        if len(account_key) > 128:
+            return _jsonrpc_error(
+                request_id, -32602, "account_key 过长", session_id=session_id
             )
         if len(image_base64) > MAX_IMAGE_BASE64_LENGTH:
             return _jsonrpc_error(
-                request_id,
-                -32602,
-                "image_base64 过大",
-                session_id=session_id,
+                request_id, -32602, "image_base64 过大", session_id=session_id
             )
         if coins and not COINS_PATTERN.fullmatch(coins):
             return _jsonrpc_error(
@@ -363,43 +467,56 @@ async def handle_mcp(
                 session_id=session_id,
             )
         try:
-            effective_proxy = normalize_proxy_url(
-                proxy_url or settings.default_proxy_url
-            ) if (proxy_url or settings.default_proxy_url) else ""
-        except ValueError as exc:
-            return _jsonrpc_error(
-                request_id,
-                -32602,
-                str(exc),
-                session_id=session_id,
+            result = await asyncio.to_thread(
+                _publish,
+                settings,
+                content=content,
+                account_key=account_key,
+                coins=coins,
+                image_base64=image_base64,
             )
-        publisher = BrowserBinanceSquarePublisher(
-            timeout_ms=settings.timeout_ms,
-            render_wait_ms=settings.render_wait_ms,
-            publish_wait_ms=settings.publish_wait_ms,
-            debug_dir=settings.debug_dir,
-        )
-        result = await asyncio.to_thread(
-            publisher.publish,
-            cookie=cookie,
-            content=content,
-            coins=coins,
-            image_base64=image_base64,
-            proxy_url=effective_proxy,
-        )
+        except PublishRateLimitError as exc:
+            result = {
+                "success": False,
+                "outcome": "rate_limited",
+                "message": str(exc),
+                "post_id": None,
+                "post_url": None,
+            }
+        except (KeyError, ValueError) as exc:
+            result = {
+                "success": False,
+                "outcome": "failed",
+                "message": str(exc),
+                "post_id": None,
+                "post_url": None,
+            }
+        except BinanceSquareOpenAPIError as exc:
+            result = {
+                "success": False,
+                "outcome": "failed",
+                "message": str(exc),
+                "api_code": exc.code,
+                "post_id": None,
+                "post_url": None,
+            }
+        except Exception as exc:
+            result = {
+                "success": False,
+                "outcome": "unknown",
+                "message": f"发布请求状态未知: {exc}",
+                "post_id": None,
+                "post_url": None,
+            }
         return _jsonrpc_result(
             request_id,
             _build_publish_payload(
-                success=result.success,
-                message=result.message,
+                result,
+                account_key=account_key,
                 coins=coins,
-                proxy_url=effective_proxy,
-                post_url=result.post_url,
-                debug_artifact=result.debug_artifact,
             ),
             session_id=session_id,
         )
-
     return _jsonrpc_error(
         request_id,
         -32601,

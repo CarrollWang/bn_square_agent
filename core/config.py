@@ -19,6 +19,8 @@ SETTING_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
     "MATERIAL_TTL_SECONDS": (60, 604_800),
     "MATERIAL_CONSUME_BATCH_SIZE": (1, 20),
     "PUBLISH_FAILURE_ALERT_THRESHOLD": (1, 100),
+    "MAX_POSTS_PER_ACCOUNT_PER_HOUR": (1, 5),
+    "MAX_POSTS_PER_ACCOUNT_PER_DAY": (1, 80),
     "SMTP_PORT": (1, 65_535),
 }
 
@@ -109,7 +111,7 @@ def normalize_openai_base_url(value: str) -> str:
 class AccountConfig:
     key: str
     name: str
-    cookie: str
+    square_openapi_key: str
     proxy_url: str = ""
     mcp_url: str = ""
     mcp_auth_token: str = ""
@@ -128,7 +130,7 @@ def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
             AccountConfig(
                 key=f"account_{index}",
                 name=f"account_{index}",
-                cookie=item.strip(),
+                square_openapi_key=item.strip(),
             )
             for index, item in enumerate(value.split(","), start=1)
             if item.strip()
@@ -139,7 +141,7 @@ def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
     for item in payload:
         if isinstance(item, str):
             key = f"account_{len(accounts) + 1}"
-            accounts.append(AccountConfig(key=key, name=key, cookie=item))
+            accounts.append(AccountConfig(key=key, name=key, square_openapi_key=item))
             continue
         if not isinstance(item, dict):
             raise ValueError("AGENT_ACCOUNTS 中的账号必须是字符串或对象")
@@ -150,7 +152,11 @@ def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
             AccountConfig(
                 key=key,
                 name=str(item.get("name") or key),
-                cookie=str(item.get("cookie") or "").strip(),
+                square_openapi_key=str(
+                    item.get("square_openapi_key")
+                    or item.get("openapi_key")
+                    or ""
+                ).strip(),
                 proxy_url=normalize_proxy_url(
                     str(item.get("proxy_url") or item.get("proxy") or "")
                 )
@@ -190,6 +196,8 @@ class Settings:
     auto_consume_materials: bool
     material_consume_batch_size: int
     publish_failure_alert_threshold: int
+    max_posts_per_account_per_hour: int
+    max_posts_per_account_per_day: int
     alert_email_enabled: bool
     alert_email_to: str
     smtp_host: str
@@ -259,8 +267,8 @@ class Settings:
             ),
             material_success_interval_seconds=_bounded_integer(
                 "MATERIAL_SUCCESS_INTERVAL_SECONDS",
-                os.getenv("MATERIAL_SUCCESS_INTERVAL_SECONDS", "600"),
-                600,
+                os.getenv("MATERIAL_SUCCESS_INTERVAL_SECONDS", "3600"),
+                3600,
             ),
             material_failure_interval_seconds=_bounded_integer(
                 "MATERIAL_FAILURE_INTERVAL_SECONDS",
@@ -278,13 +286,23 @@ class Settings:
             not in {"0", "false", "no", "off"},
             material_consume_batch_size=_bounded_integer(
                 "MATERIAL_CONSUME_BATCH_SIZE",
-                os.getenv("MATERIAL_CONSUME_BATCH_SIZE", "1"),
-                1,
+                os.getenv("MATERIAL_CONSUME_BATCH_SIZE", "5"),
+                5,
             ),
             publish_failure_alert_threshold=_bounded_integer(
                 "PUBLISH_FAILURE_ALERT_THRESHOLD",
                 os.getenv("PUBLISH_FAILURE_ALERT_THRESHOLD", "5"),
                 5,
+            ),
+            max_posts_per_account_per_hour=_bounded_integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_HOUR",
+                os.getenv("MAX_POSTS_PER_ACCOUNT_PER_HOUR", "5"),
+                5,
+            ),
+            max_posts_per_account_per_day=_bounded_integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_DAY",
+                os.getenv("MAX_POSTS_PER_ACCOUNT_PER_DAY", "80"),
+                80,
             ),
             alert_email_enabled=os.getenv("ALERT_EMAIL_ENABLED", "0")
             .strip()
@@ -353,9 +371,13 @@ class Settings:
         return ""
 
     def validate_for_publish(self) -> None:
-        missing = [account.key for account in self.accounts if not account.cookie]
+        missing = [
+            account.key for account in self.accounts if not account.square_openapi_key
+        ]
         if missing:
-            raise ValueError(f"以下账号缺少 cookie: {', '.join(missing)}")
+            raise ValueError(
+                f"以下账号缺少 Binance Square OpenAPI Key: {', '.join(missing)}"
+            )
 
     def with_overrides(self, values: dict[str, str]) -> "Settings":
         if not values:
@@ -436,6 +458,14 @@ class Settings:
             publish_failure_alert_threshold=integer(
                 "PUBLISH_FAILURE_ALERT_THRESHOLD",
                 self.publish_failure_alert_threshold,
+            ),
+            max_posts_per_account_per_hour=integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_HOUR",
+                self.max_posts_per_account_per_hour,
+            ),
+            max_posts_per_account_per_day=integer(
+                "MAX_POSTS_PER_ACCOUNT_PER_DAY",
+                self.max_posts_per_account_per_day,
             ),
             alert_email_enabled=boolean(
                 "ALERT_EMAIL_ENABLED",

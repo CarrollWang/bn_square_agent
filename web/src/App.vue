@@ -38,10 +38,8 @@
               <el-icon><FolderOpened /></el-icon>
               <span>素材中心</span>
             </template>
-            <el-menu-item index="/sources?section=config&type=techflow_newsletter">深潮源配置</el-menu-item>
-            <el-menu-item index="/sources?section=items&type=techflow_newsletter">深潮素材库</el-menu-item>
-            <el-menu-item index="/sources?section=config&type=binance_square">BN 广场源配置</el-menu-item>
-            <el-menu-item index="/sources?section=items&type=binance_square">BN 广场素材库</el-menu-item>
+            <el-menu-item index="/sources?section=config&type=news_feed">新闻源配置</el-menu-item>
+            <el-menu-item index="/sources?section=items&type=news_feed">新闻素材库</el-menu-item>
           </el-sub-menu>
           <el-sub-menu index="settings">
             <template #title>
@@ -100,7 +98,7 @@ const pageTitle = computed(() => {
 
 const activeMenu = computed(() => {
   if (route.name === "sources") {
-    return `/sources?section=${route.query.section || "config"}&type=${route.query.type || "binance_square"}`;
+    return `/sources?section=${route.query.section || "config"}&type=news_feed`;
   }
   if (route.name === "settings") {
     return `/settings?tab=${route.query.tab || "llm"}`;

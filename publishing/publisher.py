@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import re
 from typing import Any
 
 import httpx
@@ -81,20 +80,23 @@ class MCPPublisher:
         account: AccountConfig,
         generated: dict[str, Any],
     ) -> dict[str, Any]:
-        if not account.cookie:
-            raise RuntimeError(f"账号 {account.key} 缺少 Cookie，无法发布")
+        if not account.square_openapi_key:
+            raise RuntimeError(
+                f"账号 {account.key} 缺少 Binance Square OpenAPI Key，无法发布"
+            )
         tool_name = self.resolve_publish_tool(account)
         client = self._client_for_account(account)
         client.initialize()
-        content = re.sub(
-            r"\n*\{future\}\([A-Z0-9]{2,30}USDT\)\s*",
-            "",
-            generated["content"],
-            flags=re.IGNORECASE,
-        ).rstrip()
+        # Binance Square can render markers such as ``{future}(BTCUSDT)`` as
+        # clickable trading components.  Older browser-based publishers
+        # stripped the marker and passed the market separately, but the
+        # self-hosted OpenAPI publisher sends ``content`` as bodyTextOnly.
+        # Preserve the marker so it can reach Binance instead of silently
+        # degrading a futures component into plain text/cashtag content.
+        content = generated["content"].rstrip()
         arguments = {
-            "cookie": account.cookie,
             "content": content,
+            "account_key": account.key,
         }
         chart_text = "\n".join(
             item
@@ -109,8 +111,6 @@ class MCPPublisher:
         if target:
             coin = target.symbol.removesuffix("USDT")
             arguments["coins"] = f"{coin}:{target.market}"
-        if account.proxy_url:
-            arguments["proxy_url"] = account.proxy_url
         try:
             image_base64 = self.chart_images.image_for_text(
                 chart_text,
@@ -171,10 +171,34 @@ class PublishingService:
             self.db.mark_published(generated_id, result=result, success=False)
             return PublishResult(account.key, generated_id, False, result)
         if "outcome" not in result:
-            result["outcome"] = "published" if self._is_publish_success(result) else "failed"
+            result["outcome"] = self._publish_outcome(result) or (
+                "published" if self._is_publish_success(result) else "failed"
+            )
         success = self._is_publish_success(result)
         self.db.mark_published(generated_id, result=result, success=success)
         return PublishResult(account.key, generated_id, success, result)
+
+    @staticmethod
+    def _publish_outcome(result: dict[str, Any]) -> str | None:
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict) and structured.get("outcome"):
+            return str(structured["outcome"])
+
+        content = result.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    continue
+                try:
+                    payload = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(payload, dict) and payload.get("outcome"):
+                    return str(payload["outcome"])
+        return None
 
     @staticmethod
     def _is_publish_success(result: dict[str, Any]) -> bool:

@@ -113,6 +113,9 @@
             <div class="cell-title">{{ shortText(row.generated_content || "未生成终稿", 140) }}</div>
             <div class="muted">终稿#{{ row.generated_id || "-" }}，尝试 {{ row.attempt_count }} 次</div>
             <div class="result-text">{{ rowResultText(row) }}</div>
+            <el-link v-if="row.post_url" :href="row.post_url" target="_blank" type="success">
+              查看已发布帖子<span v-if="row.post_id"> #{{ row.post_id }}</span>
+            </el-link>
           </template>
         </el-table-column>
       </el-table>

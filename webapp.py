@@ -7,17 +7,15 @@ from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-import hashlib
 import json
 import ipaddress
 import logging
+import os
 import secrets
-import shutil
 from pathlib import Path
 import smtplib
-import tempfile
-from threading import Lock
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -27,6 +25,8 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .ai.llm import StructuredLLM
+from .ai.agents import MaterialAssessmentAgent
+from .ai.binance_symbols import futures_symbol_catalog
 from .ai.material_tagger import MaterialTagger
 from .core.config import (
     AccountConfig,
@@ -35,16 +35,11 @@ from .core.config import (
     normalize_proxy_url,
 )
 from .knowledge.style_rag import create_embeddings
-from .publishing.account_check import (
-    BINANCE_AUTH_PATH,
-    BINANCE_BASE_URL,
-    BinanceAccountChecker,
-)
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
-from .sources.binance_square import MaterialSourceService
+from .sources.service import MaterialSourceService
 from .storage.database import Database
-from .core.url_policy import validate_binance_url, validate_techflow_url
+from .core.url_policy import validate_binance_url, validate_news_feed_url
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -53,8 +48,6 @@ MONITOR_LOCK_NAME = "material_monitor"
 MONITOR_LOCK_LEASE_SECONDS = 30 * 60
 MONITOR_LOCK_RENEW_SECONDS = 5 * 60
 MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
-COOKIE_LOGIN_SESSION_TTL_SECONDS = 15 * 60
-MAX_COOKIE_LOGIN_SESSIONS = 2
 LOGGER = logging.getLogger(__name__)
 
 monitor_state: dict[str, Any] = {
@@ -75,66 +68,6 @@ monitor_state: dict[str, Any] = {
     "last_alert_sent": False,
     "account_queue_cursor": 0,
 }
-cookie_login_sessions: dict[str, dict[str, Any]] = {}
-cookie_login_sessions_lock = Lock()
-
-
-def _close_cookie_login_session(
-    session: dict[str, Any],
-    *,
-    cleanup_profile: bool = True,
-) -> None:
-    try:
-        session["context"].close()
-    except Exception:
-        pass
-    try:
-        session["browser"].close()
-    except Exception:
-        pass
-    try:
-        session["playwright"].stop()
-    except Exception:
-        pass
-    profile_dir = session.get("profile_dir")
-    if cleanup_profile and profile_dir:
-        shutil.rmtree(profile_dir, ignore_errors=True)
-
-
-def _cookie_import_profile_dir(account_key: str) -> Path:
-    digest = hashlib.sha256(account_key.encode("utf-8")).hexdigest()[:12]
-    profile_dir = Path(tempfile.gettempdir()) / f"bn-square-cookie-import-{digest}"
-    profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return profile_dir
-
-
-def _cleanup_expired_cookie_login_sessions() -> int:
-    now = datetime.now(timezone.utc)
-    expired: list[dict[str, Any]] = []
-    with cookie_login_sessions_lock:
-        for session_id, session in list(cookie_login_sessions.items()):
-            try:
-                created_at = datetime.fromisoformat(str(session["created_at"]))
-            except (KeyError, TypeError, ValueError):
-                created_at = datetime.min.replace(tzinfo=timezone.utc)
-            if (now - created_at).total_seconds() < COOKIE_LOGIN_SESSION_TTL_SECONDS:
-                continue
-            expired.append(cookie_login_sessions.pop(session_id))
-    for session in expired:
-        _close_cookie_login_session(session)
-    return len(expired)
-
-
-def _pop_cookie_login_session(session_id: str) -> dict[str, Any] | None:
-    with cookie_login_sessions_lock:
-        return cookie_login_sessions.pop(session_id, None)
-
-
-def _get_cookie_login_session(session_id: str) -> dict[str, Any] | None:
-    with cookie_login_sessions_lock:
-        return cookie_login_sessions.get(session_id)
-
-
 def _serialize_account_run(run: Any) -> dict[str, Any]:
     publish_result = getattr(run, "publish_result", None)
     return {
@@ -230,8 +163,8 @@ def _account_health(
     failed_count: int,
     skipped_count: int,
 ) -> tuple[str, str]:
-    if check_status == "invalid":
-        return "异常", "danger"
+    if check_status in {"invalid", "missing"}:
+        return "配置缺失", "danger"
     attempts = published_count + failed_count
     success_rate = published_count / attempts if attempts else 0.0
     if published_count >= 5 and success_rate >= 0.8:
@@ -250,6 +183,8 @@ def _account_health(
 def _consume_results_have_failure(consume_results: list[dict[str, Any]]) -> bool:
     for item in consume_results:
         for run in item.get("runs") or []:
+            if (run.get("publish_result") or {}).get("outcome") == "rate_limited":
+                continue
             if run.get("error") or run.get("publish_success") is False:
                 return True
     return False
@@ -263,6 +198,14 @@ def _consume_results_have_success(consume_results: list[dict[str, Any]]) -> bool
     return False
 
 
+def _consume_results_have_rate_limit(consume_results: list[dict[str, Any]]) -> bool:
+    for item in consume_results:
+        for run in item.get("runs") or []:
+            if (run.get("publish_result") or {}).get("outcome") == "rate_limited":
+                return True
+    return False
+
+
 def _consume_results_failure_count(consume_results: list[dict[str, Any]]) -> int:
     count = 0
     for item in consume_results:
@@ -270,6 +213,8 @@ def _consume_results_failure_count(consume_results: list[dict[str, Any]]) -> int
         if not runs and item.get("error"):
             count += 1
         for run in runs:
+            if (run.get("publish_result") or {}).get("outcome") == "rate_limited":
+                continue
             if run.get("error") or run.get("publish_success") is False:
                 count += 1
     return count
@@ -368,6 +313,8 @@ def _next_monitor_delay(settings: Settings, result: dict[str, Any]) -> tuple[int
     source_results = result.get("results") or []
     if _consume_results_have_failure(consume_results):
         return max(30, settings.material_failure_interval_seconds), "publish_failed"
+    if _consume_results_have_rate_limit(consume_results):
+        return 60 * 60, "rate_limited"
     if consume_results:
         return max(30, settings.material_success_interval_seconds), "published"
     if any(item.get("error") for item in source_results):
@@ -412,20 +359,52 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         monitor_state["current_stage"] = "采集素材源"
         # 每个采集器已有自己的网络超时。这里等待线程真实结束，避免 wait_for
         # 超时后后台线程仍继续写库并与下一轮任务重叠。
-        results = await asyncio.to_thread(MaterialSourceService(db).check_all)
+        results = await asyncio.to_thread(
+            MaterialSourceService(
+                db,
+                material_ttl_seconds=settings.material_ttl_seconds,
+            ).check_all
+        )
         monitor_state["last_results"] = results
         monitor_state["current_stage"] = "素材打标"
         tag_results: list[dict[str, Any]] = []
-        tagger = MaterialTagger()
-        for material in db.pending_material_items_for_tagging(
+        pending_materials = db.pending_material_items_for_tagging(
             limit=100,
             strategy=MaterialTagger.STRATEGY,
-        ):
+        )
+        tagger = (
+            MaterialTagger(valid_futures_symbols=futures_symbol_catalog.get())
+            if pending_materials
+            else MaterialTagger()
+        )
+        semantic_agent: MaterialAssessmentAgent | None = None
+        for material in pending_materials:
             try:
                 tag = tagger.tag(
                     title=material.get("title"),
                     content=material["content"],
                 )
+                if tagger.needs_semantic_review(tag):
+                    try:
+                        if semantic_agent is None:
+                            semantic_agent = MaterialAssessmentAgent(
+                                StructuredLLM(settings)
+                            )
+                        assessment = await asyncio.to_thread(
+                            semantic_agent.assess,
+                            title=material.get("title"),
+                            content=material["content"],
+                            source_name=material.get("source_name"),
+                            source_type=material.get("source_type"),
+                        )
+                        tag = tagger.apply_semantic_assessment(tag, assessment)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "素材 material#%s 语义判断失败，使用规则结果: %s",
+                            material["id"],
+                            exc,
+                        )
+                        tag = tagger.apply_semantic_fallback(tag, exc)
                 tag_status = "accepted" if tag.accepted else "rejected"
                 db.save_material_tag(
                     material["id"],
@@ -435,6 +414,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
                 tag_results.append(
                     {
                         "material_item_id": material["id"],
+                        "title": material.get("title"),
                         "tag_status": tag_status,
                         "tag": tag.to_dict(),
                     }
@@ -448,6 +428,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
                 tag_results.append(
                     {
                         "material_item_id": material["id"],
+                        "title": material.get("title"),
                         "tag_status": "failed",
                         "error": str(exc),
                     }
@@ -466,7 +447,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
                 queue_cursor = int(monitor_state.get("account_queue_cursor") or 0)
                 queue_runs = await asyncio.to_thread(
                     services.operator.run_pending_material_queue,
-                    limit_per_account=1,
+                    limit_per_account=max(1, settings.material_consume_batch_size),
                     account_offset=queue_cursor,
                     max_total_runs=max(1, settings.material_consume_batch_size),
                 )
@@ -510,7 +491,6 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
 
 async def material_monitor_loop() -> None:
     while True:
-        _cleanup_expired_cookie_login_sessions()
         settings = get_settings()
         if not settings.auto_monitor_enabled:
             monitor_state["running"] = False
@@ -548,11 +528,6 @@ async def lifespan(app_: FastAPI):
     try:
         yield
     finally:
-        with cookie_login_sessions_lock:
-            sessions = list(cookie_login_sessions.values())
-            cookie_login_sessions.clear()
-        for session in sessions:
-            _close_cookie_login_session(session, cleanup_profile=False)
         task.cancel()
         try:
             await task
@@ -645,20 +620,10 @@ async def protect_self_hosted_console(request: Request, call_next):
 class AccountPayload(BaseModel):
     account_key: str = Field(min_length=1, max_length=64)
     name: str | None = Field(default=None, max_length=120)
-    cookie: str | None = Field(default=None, max_length=200_000)
+    square_openapi_key: str | None = Field(default=None, max_length=8_192)
     proxy_url: str | None = Field(default=None, max_length=2_048)
     mcp_url: str | None = Field(default=None, max_length=2_048)
     mcp_auth_token: str | None = Field(default=None, max_length=8_192)
-
-
-class AccountCookieImportStartPayload(BaseModel):
-    account_key: str = Field(min_length=1, max_length=64)
-    name: str | None = Field(default=None, max_length=120)
-    login_url: str | None = Field(default=None, max_length=2_048)
-
-
-class AccountCookieImportFinishPayload(BaseModel):
-    session_id: str = Field(min_length=1, max_length=128)
 
 
 class RunPayload(BaseModel):
@@ -688,6 +653,8 @@ class SettingsPayload(BaseModel):
     material_ttl_seconds: int | None = Field(default=None, ge=60, le=604_800)
     material_consume_batch_size: int | None = Field(default=None, ge=1, le=20)
     publish_failure_alert_threshold: int | None = Field(default=None, ge=1, le=100)
+    max_posts_per_account_per_hour: int | None = Field(default=None, ge=1, le=5)
+    max_posts_per_account_per_day: int | None = Field(default=None, ge=1, le=80)
     alert_email_enabled: bool | None = None
     alert_email_to: str | None = Field(default=None, max_length=1_000)
     smtp_host: str | None = Field(default=None, max_length=253)
@@ -701,7 +668,7 @@ class SettingsPayload(BaseModel):
 class MaterialSourcePayload(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     url: str = Field(min_length=1, max_length=2_048)
-    source_type: str = "binance_square"
+    source_type: str = "news_feed"
     enabled: bool = True
 
 
@@ -721,6 +688,42 @@ def mask_secret(value: str | None) -> str:
     if len(value) <= 8:
         return "*" * len(value)
     return f"{value[:4]}{'*' * 8}{value[-4:]}"
+
+
+def publish_evidence(payload: Any) -> tuple[str | None, str | None]:
+    post_id: str | None = None
+    post_url: str | None = None
+
+    def visit(value: Any) -> None:
+        nonlocal post_id, post_url
+        if isinstance(value, dict):
+            for key, child in value.items():
+                lowered = str(key).lower()
+                if post_id is None and lowered in {"post_id", "postid"} and child:
+                    post_id = str(child)
+                if post_url is None and lowered in {
+                    "post_url",
+                    "posturl",
+                    "sharelink",
+                    "url",
+                } and child:
+                    post_url = str(child)
+                visit(child)
+            return
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if isinstance(value, str) and value.lstrip().startswith("{"):
+            try:
+                visit(json.loads(value))
+            except ValueError:
+                pass
+
+    visit(payload)
+    if post_id:
+        post_url = f"https://www.binance.com/zh-CN/square/post/{post_id}"
+    return post_id, post_url
 
 
 def is_masked_secret(value: str | None) -> bool:
@@ -777,7 +780,7 @@ def _account_from_row(row: dict[str, Any]) -> AccountConfig:
     return AccountConfig(
         key=row["account_key"],
         name=row["name"],
-        cookie=row.get("cookie") or "",
+        square_openapi_key=row.get("square_openapi_key") or "",
         proxy_url=row.get("proxy_url") or "",
         mcp_url=row.get("mcp_url") or "",
         mcp_auth_token=row.get("mcp_auth_token") or "",
@@ -809,12 +812,7 @@ def list_accounts() -> list[dict]:
             "account_key": row["account_key"],
             "name": row["name"],
             "enabled": bool(row["enabled"]),
-            "cookie_saved": bool(row["cookie"]),
-            "cookie_length": len(row["cookie"] or ""),
-            "cookie_names": [
-                item["name"]
-                for item in BinanceAccountChecker._parse_cookie_header(row["cookie"] or "")
-            ],
+            "square_openapi_key_configured": bool(row.get("square_openapi_key")),
             "check_status": row.get("check_status"),
             "checked_at": row.get("checked_at"),
             "check_error": row.get("check_error"),
@@ -843,7 +841,7 @@ def read_account(account_key: str) -> dict:
     return {
         "account_key": account["account_key"],
         "name": account["name"],
-        "cookie_saved": bool(account.get("cookie")),
+        "square_openapi_key_configured": bool(account.get("square_openapi_key")),
         "proxy_url": account.get("proxy_url") or "",
         "mcp_url": account.get("mcp_url") or "",
         "mcp_auth_token_configured": bool(account.get("mcp_auth_token")),
@@ -882,6 +880,8 @@ def read_settings() -> dict:
         "material_ttl_seconds": settings.material_ttl_seconds,
         "material_consume_batch_size": settings.material_consume_batch_size,
         "publish_failure_alert_threshold": settings.publish_failure_alert_threshold,
+        "max_posts_per_account_per_hour": settings.max_posts_per_account_per_hour,
+        "max_posts_per_account_per_day": settings.max_posts_per_account_per_day,
         "alert_email_enabled": settings.alert_email_enabled,
         "alert_email_to": settings.alert_email_to,
         "smtp_host": settings.smtp_host,
@@ -930,6 +930,8 @@ def save_settings(payload: SettingsPayload) -> dict:
         "material_ttl_seconds": "MATERIAL_TTL_SECONDS",
         "material_consume_batch_size": "MATERIAL_CONSUME_BATCH_SIZE",
         "publish_failure_alert_threshold": "PUBLISH_FAILURE_ALERT_THRESHOLD",
+        "max_posts_per_account_per_hour": "MAX_POSTS_PER_ACCOUNT_PER_HOUR",
+        "max_posts_per_account_per_day": "MAX_POSTS_PER_ACCOUNT_PER_DAY",
         "smtp_port": "SMTP_PORT",
     }
     data = payload.model_dump()
@@ -1012,7 +1014,11 @@ def save_account(payload: AccountPayload) -> dict:
         existing.get("name") if existing else key
     )
     name = raw_name.strip() if raw_name else key
-    cookie = payload.cookie.strip() if payload.cookie is not None else None
+    square_openapi_key = (
+        payload.square_openapi_key.strip()
+        if payload.square_openapi_key is not None
+        else None
+    )
     proxy_url = payload.proxy_url if payload.proxy_url is not None else None
     mcp_url = payload.mcp_url.strip() if payload.mcp_url is not None else None
     mcp_auth_token = (
@@ -1027,286 +1033,19 @@ def save_account(payload: AccountPayload) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not key:
         raise HTTPException(status_code=400, detail="账号标识必填")
-    if existing is None and not cookie:
-        raise HTTPException(status_code=400, detail="新账号必须提供 Cookie")
+    if existing is None and not square_openapi_key:
+        raise HTTPException(
+            status_code=400,
+            detail="新账号必须提供 Binance Square OpenAPI Key",
+        )
     db.upsert_account(
         account_key=key,
         name=name,
-        cookie=cookie,
+        square_openapi_key=square_openapi_key,
         proxy_url=proxy_url,
         mcp_url=mcp_url,
         mcp_auth_token=mcp_auth_token,
     )
-    return {"ok": True}
-
-
-BINANCE_AUTH_URL = f"{BINANCE_BASE_URL}{BINANCE_AUTH_PATH}"
-
-
-def _cookie_header_from_playwright_cookies(cookies: list[dict[str, Any]]) -> str:
-    target_host = "www.binance.com"
-    now = datetime.now(timezone.utc).timestamp()
-    selected: dict[str, tuple[tuple[int, int], str]] = {}
-    for cookie in cookies:
-        raw_domain = str(cookie.get("domain") or "").strip().lower()
-        domain = raw_domain.lstrip(".")
-        domain_matches = domain == target_host or (
-            raw_domain.startswith(".")
-            and (target_host == domain or target_host.endswith(f".{domain}"))
-        )
-        if not domain_matches:
-            continue
-        path = str(cookie.get("path") or "/")
-        if not BINANCE_AUTH_PATH.startswith(path):
-            continue
-        expires = float(cookie.get("expires") or -1)
-        if expires > 0 and expires <= now:
-            continue
-        name = str(cookie.get("name") or "")
-        value = cookie.get("value")
-        if not name or value is None:
-            continue
-        score = (len(path), 1 if domain == target_host else 0)
-        current = selected.get(name)
-        if current is None or score > current[0]:
-            selected[name] = (score, str(value))
-    return "; ".join(
-        f"{name}={selected[name][1]}"
-        for name in sorted(selected, key=str.lower)
-    )
-
-
-def _binance_login_status_from_page(page: Any) -> tuple[bool, str | None]:
-    page.goto(
-        f"{BINANCE_BASE_URL}/zh-CN/square",
-        wait_until="domcontentloaded",
-        timeout=60_000,
-    )
-    validate_binance_url(page.url, label="登录状态检查地址")
-    result = BinanceAccountChecker.probe_page_session(page)
-    if not result.valid:
-        attempts = result.raw.get("attempts") if isinstance(result.raw, dict) else None
-        LOGGER.warning(
-            "Binance page session probe failed: error=%s attempts=%s",
-            result.error or "unknown",
-            attempts or [],
-        )
-    return result.valid, result.error
-
-
-def _validate_exported_binance_cookie(
-    browser: Any,
-    cookie_header: str,
-) -> tuple[bool, str | None]:
-    validation_context = browser.new_context(locale="zh-CN")
-    try:
-        parsed = BinanceAccountChecker._parse_cookie_header(cookie_header)
-        if parsed:
-            validation_context.add_cookies(parsed)
-        return _binance_login_status_from_page(validation_context.new_page())
-    finally:
-        validation_context.close()
-
-
-@app.post("/api/accounts/import-cookie/start")
-def start_account_cookie_import(payload: AccountCookieImportStartPayload) -> dict:
-    _cleanup_expired_cookie_login_sessions()
-    key = payload.account_key.strip()
-    name = (payload.name or key).strip()
-    if not key:
-        raise HTTPException(status_code=400, detail="账号标识必填")
-
-    with cookie_login_sessions_lock:
-        existing_session = next(
-            (
-                (session_id, session)
-                for session_id, session in cookie_login_sessions.items()
-                if session.get("account_key") == key
-            ),
-            None,
-        )
-        if existing_session:
-            session_id, _ = existing_session
-            return {
-                "ok": True,
-                "session_id": session_id,
-                "message": "已恢复当前账号的登录窗口，请完成登录后点击完成导入。",
-            }
-        if len(cookie_login_sessions) >= MAX_COOKIE_LOGIN_SESSIONS:
-            raise HTTPException(
-                status_code=429,
-                detail="当前登录窗口过多，请先完成或取消已有导入会话",
-            )
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Playwright 不可用: {exc}") from exc
-
-    session_id = uuid4().hex
-    try:
-        login_url = validate_binance_url(
-            payload.login_url or "https://www.binance.com/zh-CN/login",
-            label="登录地址",
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    playwright = None
-    browser = None
-    context = None
-    profile_dir = _cookie_import_profile_dir(key)
-    for singleton_file in profile_dir.glob("Singleton*"):
-        try:
-            singleton_file.unlink()
-        except OSError:
-            pass
-    try:
-        playwright = sync_playwright().start()
-        context = playwright.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=False,
-            locale="zh-CN",
-            args=["--disable-blink-features=AutomationControlled"],
-            ignore_default_args=["--enable-automation"],
-        )
-        browser = context.browser
-        if browser is None:
-            raise RuntimeError("无法获取浏览器实例")
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
-        validate_binance_url(page.url, label="登录页重定向地址")
-    except Exception as exc:
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        if playwright is not None:
-            try:
-                playwright.stop()
-            except Exception:
-                pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"打开登录窗口失败: {exc}") from exc
-
-    with cookie_login_sessions_lock:
-        cookie_login_sessions[session_id] = {
-            "account_key": key,
-            "name": name,
-            "playwright": playwright,
-            "browser": browser,
-            "context": context,
-            "page": page,
-            "profile_dir": profile_dir,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "message": "登录窗口已打开。请在弹出的窗口里完成 Binance 登录后，回到本页点击完成导入。",
-    }
-
-
-@app.post("/api/accounts/import-cookie/finish")
-def finish_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
-    session = _get_cookie_login_session(payload.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="导入会话不存在或已结束")
-
-    browser = session["browser"]
-    context = session["context"]
-    page = session["page"]
-    try:
-        logged_in, login_error = _binance_login_status_from_page(page)
-        if not logged_in:
-            LOGGER.warning(
-                "Cookie import login probe failed for account=%s: %s",
-                session["account_key"],
-                login_error or "unknown",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Binance 登录态尚未生效。请确认登录窗口已显示账号头像并能打开广场后，"
-                    f"继续登录后再次点击完成导入。"
-                    f"{f' Binance 返回：{login_error}' if login_error else ''}"
-                ),
-            )
-        cookies = context.cookies([BINANCE_AUTH_URL])
-        cookie_header = _cookie_header_from_playwright_cookies(cookies)
-        if not cookie_header:
-            raise HTTPException(
-                status_code=400,
-                detail="未读取到 Binance Cookie。请确认已在弹出的窗口里完成登录。",
-            )
-        reusable, export_error = _validate_exported_binance_cookie(
-            browser,
-            cookie_header,
-        )
-        if not reusable:
-            LOGGER.warning(
-                "Cookie import reuse probe failed for account=%s: %s",
-                session["account_key"],
-                export_error or "unknown",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "登录窗口已登录，但导出的 Cookie 无法复用，请重新登录后再试。"
-                    f"{f' Binance 返回：{export_error}' if export_error else ''}"
-                ),
-            )
-        db = get_db()
-        db.upsert_account(
-            account_key=session["account_key"],
-            name=session["name"],
-            cookie=cookie_header,
-        )
-        db.update_account_check(
-            session["account_key"],
-            signature_key=None,
-            status="valid",
-        )
-        result = {
-            "ok": True,
-            "account_key": session["account_key"],
-            "cookie_length": len(cookie_header),
-            "cookie_names": [
-                item["name"]
-                for item in BinanceAccountChecker._parse_cookie_header(cookie_header)
-            ],
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"验证 Binance 登录状态失败: {exc}",
-        ) from exc
-
-    _pop_cookie_login_session(payload.session_id)
-    _close_cookie_login_session(session)
-    return result
-
-
-@app.post("/api/accounts/import-cookie/cancel")
-def cancel_account_cookie_import(payload: AccountCookieImportFinishPayload) -> dict:
-    session = _pop_cookie_login_session(payload.session_id)
-    if not session:
-        return {"ok": True}
-    try:
-        session["browser"].close()
-    except Exception:
-        pass
-    try:
-        session["playwright"].stop()
-    except Exception:
-        pass
     return {"ok": True}
 
 
@@ -1325,22 +1064,18 @@ def check_account(account_key: str) -> dict:
     )
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
-    if not account["cookie"]:
-        raise HTTPException(status_code=400, detail="账号缺少 Cookie")
-    result = BinanceAccountChecker().check(
-        account["cookie"],
-        proxy_url=account.get("proxy_url") or "",
-    )
-    status = "valid" if result.valid else "invalid"
+    configured = bool(account.get("square_openapi_key"))
+    error = None if configured else "未配置 Binance Square OpenAPI Key"
+    status = "configured" if configured else "missing"
     db.update_account_check(
         account_key,
-        signature_key=result.signature_key,
+        signature_key=None,
         status=status,
-        error=result.error,
+        error=error,
     )
     return {
-        "valid": result.valid,
-        "error": result.error,
+        "configured": configured,
+        "error": error,
     }
 
 
@@ -1388,7 +1123,10 @@ def run(payload: RunPayload) -> dict:
     try:
         accounts = [_account_from_row(row) for row in services.db.list_accounts()]
         if not accounts:
-            raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
+            raise HTTPException(
+                status_code=400,
+                detail="请先添加至少一个 Binance Square OpenAPI 账号",
+            )
         services.operator.accounts = tuple(accounts)
         services.operator.auto_publish = payload.auto_publish
         runs = services.operator.generate_for_all_accounts(
@@ -1408,14 +1146,10 @@ def list_material_sources() -> list[dict]:
 
 @app.post("/api/material-sources")
 def save_material_source(payload: MaterialSourcePayload) -> dict:
-    if payload.source_type not in {"binance_square", "techflow_newsletter"}:
-        raise HTTPException(status_code=400, detail="当前只支持 BN 广场和 TechFlow 快讯素材源")
+    if payload.source_type != "news_feed":
+        raise HTTPException(status_code=400, detail="当前只支持新闻源")
     try:
-        source_url = (
-            validate_binance_url(payload.url, label="BN 广场素材源")
-            if payload.source_type == "binance_square"
-            else validate_techflow_url(payload.url, label="TechFlow 素材源")
-        )
+        source_url = validate_news_feed_url(payload.url, label="新闻源")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     source_id = get_db().upsert_material_source(
@@ -1453,7 +1187,11 @@ def check_material_source(source_id: int) -> dict:
         )
         if not source:
             raise HTTPException(status_code=404, detail="素材源不存在")
-        return MaterialSourceService(db).check_source(source)
+        settings = get_settings()
+        return MaterialSourceService(
+            db,
+            material_ttl_seconds=settings.material_ttl_seconds,
+        ).check_source(source)
     finally:
         db.release_job_lock(MONITOR_LOCK_NAME, owner_id=owner_id)
 
@@ -1486,6 +1224,7 @@ def list_publish_history(
                 payload = json.loads(raw_payload)
             except ValueError:
                 payload = raw_payload
+        post_id, post_url = publish_evidence(payload)
         result.append(
             {
                 "material_item_id": row["material_item_id"],
@@ -1502,6 +1241,8 @@ def list_publish_history(
                 or row.get("updated_at"),
                 "error": row.get("error"),
                 "publish_result": payload,
+                "post_id": post_id,
+                "post_url": post_url,
                 "material_title": row.get("material_title"),
                 "material_content": row.get("material_content"),
                 "material_url": row.get("material_url"),
@@ -1664,14 +1405,14 @@ def account_performance_dashboard(days: int = 7) -> dict:
         )
 
         issue: dict[str, Any] | None = None
-        if account.check_status == "invalid":
+        if account.check_status in {"invalid", "missing"}:
             invalid_accounts += 1
             issue = {
                 "account_key": account.key,
                 "name": account.name,
                 "severity": "high",
                 "severity_label": "高",
-                "reason": "账号检测失效，建议先更新 Cookie",
+                "reason": "账号发布配置缺失，请检查 Square OpenAPI Key",
             }
         elif total_runs and published_count == 0:
             issue = {
@@ -1696,7 +1437,7 @@ def account_performance_dashboard(days: int = 7) -> dict:
                 "name": account.name,
                 "severity": "medium",
                 "severity_label": "中",
-                "reason": f"近 {window_days} 天被跳过 {skipped_count} 次，建议检查 Cookie / 策略限制",
+                "reason": f"近 {window_days} 天被跳过 {skipped_count} 次，建议检查 OpenAPI Key / 策略限制",
             }
         elif total_runs == 0:
             issue = {
@@ -1819,6 +1560,8 @@ def material_monitor_status() -> dict:
         "auto_monitor_enabled": settings.auto_monitor_enabled,
         "consume_batch_size": settings.material_consume_batch_size,
         "publish_failure_alert_threshold": settings.publish_failure_alert_threshold,
+        "max_posts_per_account_per_hour": settings.max_posts_per_account_per_hour,
+        "max_posts_per_account_per_day": settings.max_posts_per_account_per_day,
         "alert_email_enabled": settings.alert_email_enabled,
         "alert_email_configured": bool(
             settings.alert_email_to
@@ -1849,7 +1592,10 @@ def run_material_item(payload: RunMaterialPayload) -> dict:
     try:
         accounts = [_account_from_row(row) for row in services.db.list_accounts()]
         if not accounts:
-            raise HTTPException(status_code=400, detail="请先添加至少一个账号 Cookie")
+            raise HTTPException(
+                status_code=400,
+                detail="请先添加至少一个 Binance Square OpenAPI 账号",
+            )
         services.operator.accounts = tuple(accounts)
         services.operator.auto_publish = payload.auto_publish
         runs = services.operator.run_material_item_for_all_accounts(payload.material_item_id)
