@@ -293,6 +293,20 @@ class DatabaseRuntimeTests(unittest.TestCase):
             connection.executescript(
                 """
                 PRAGMA foreign_keys = ON;
+                CREATE TABLE accounts (
+                    account_key TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    square_openapi_key TEXT NOT NULL DEFAULT '',
+                    proxy_url TEXT NOT NULL DEFAULT '',
+                    mcp_url TEXT NOT NULL DEFAULT '',
+                    mcp_auth_token TEXT NOT NULL DEFAULT '',
+                    signature_key TEXT,
+                    check_status TEXT NOT NULL DEFAULT 'unchecked',
+                    checked_at TEXT,
+                    check_error TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE material_sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
@@ -327,6 +341,22 @@ class DatabaseRuntimeTests(unittest.TestCase):
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(source_id) REFERENCES material_sources(id)
                 );
+                CREATE TABLE material_account_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    material_item_id INTEGER NOT NULL,
+                    account_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    generated_id INTEGER,
+                    publish_json TEXT,
+                    error TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_attempted_at TEXT,
+                    published_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(material_item_id, account_key),
+                    FOREIGN KEY(material_item_id) REFERENCES material_items(id)
+                );
                 INSERT INTO material_sources VALUES
                     (1, 'TechFlow', 'techflow_newsletter', 'https://www.techflowpost.com/newsletter?is_hot=1', 1, NULL, NULL, 'now', 'now'),
                     (2, 'BN author', 'binance_square', 'https://www.binance.com/zh-CN/square/profile/demo', 1, NULL, NULL, 'now', 'now');
@@ -335,6 +365,12 @@ class DatabaseRuntimeTests(unittest.TestCase):
                 ) VALUES
                     (1, 1, 'news item', 'news-hash', 'new', 'pending', 'now', 'now'),
                     (2, 2, 'creator item', 'creator-hash', 'new', 'accepted', 'now', 'now');
+                INSERT INTO accounts (account_key, name, created_at)
+                VALUES ('main', 'Main', 'now');
+                INSERT INTO material_account_runs (
+                    id, material_item_id, account_key, status,
+                    attempt_count, created_at, updated_at
+                ) VALUES (1, 2, 'main', 'published', 1, 'now', 'now');
                 """
             )
             connection.commit()
@@ -354,9 +390,18 @@ class DatabaseRuntimeTests(unittest.TestCase):
                 creator_item = migrated.execute(
                     "SELECT source_id, status, error FROM material_items WHERE id = 2"
                 ).fetchone()
+                run_foreign_keys = migrated.execute(
+                    "PRAGMA foreign_key_list(material_account_runs)"
+                ).fetchall()
+                preserved_run = migrated.execute(
+                    "SELECT material_item_id, account_key, status FROM material_account_runs WHERE id = 1"
+                ).fetchone()
             self.assertIsNone(creator_item["source_id"])
             self.assertEqual(creator_item["status"], "ignored")
             self.assertEqual(creator_item["error"], "binance_square_source_removed")
+            self.assertIn("material_items", {row["table"] for row in run_foreign_keys})
+            self.assertNotIn("material_items_old", {row["table"] for row in run_foreign_keys})
+            self.assertEqual(tuple(preserved_run), (2, "main", "published"))
 
     @staticmethod
     def _database(root: Path) -> Database:

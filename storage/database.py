@@ -320,6 +320,7 @@ class Database:
         material_columns = self._columns(connection, "material_items")
         self._ensure_material_source_types(connection)
         self._ensure_material_items_source_fk(connection)
+        self._ensure_material_account_runs_item_fk(connection)
         if "tag_status" not in material_columns:
             connection.execute(
                 "ALTER TABLE material_items ADD COLUMN tag_status TEXT NOT NULL DEFAULT 'pending'"
@@ -596,6 +597,59 @@ class Database:
                 tag_error, tagged_at, error, created_at, updated_at
             FROM material_items_old;
             DROP TABLE material_items_old;
+            CREATE INDEX IF NOT EXISTS idx_material_items_status_tag_created
+                ON material_items(status, tag_status, created_at DESC, id DESC);
+            PRAGMA foreign_keys = ON;
+            """
+        )
+
+    def _ensure_material_account_runs_item_fk(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(material_account_runs)"
+        ).fetchall()
+        if not any(str(row["table"]) == "material_items_old" for row in foreign_keys):
+            return
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            ALTER TABLE material_account_runs RENAME TO material_account_runs_old;
+            CREATE TABLE material_account_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_item_id INTEGER NOT NULL,
+                account_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('published', 'failed', 'skipped')
+                ),
+                generated_id INTEGER,
+                publish_json TEXT,
+                error TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempted_at TEXT,
+                published_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(material_item_id, account_key),
+                FOREIGN KEY(material_item_id) REFERENCES material_items(id),
+                FOREIGN KEY(account_key) REFERENCES accounts(account_key),
+                FOREIGN KEY(generated_id) REFERENCES generated_posts(id)
+            );
+            INSERT INTO material_account_runs (
+                id, material_item_id, account_key, status, generated_id,
+                publish_json, error, attempt_count, last_attempted_at,
+                published_at, created_at, updated_at
+            )
+            SELECT
+                id, material_item_id, account_key, status, generated_id,
+                publish_json, error, attempt_count, last_attempted_at,
+                published_at, created_at, updated_at
+            FROM material_account_runs_old;
+            DROP TABLE material_account_runs_old;
+            CREATE INDEX IF NOT EXISTS idx_material_account_runs_material_status
+                ON material_account_runs(material_item_id, status, account_key);
             PRAGMA foreign_keys = ON;
             """
         )
