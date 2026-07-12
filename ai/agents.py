@@ -8,6 +8,7 @@ from ..models.schemas import (
     Candidate,
     CandidateSet,
     ContentReview,
+    MaterialAssessment,
     PostAnalysis,
     ProfileBatchSummary,
     StyleProfile,
@@ -38,6 +39,39 @@ class AnalysisAgent:
             ),
             user_prompt=f"分析以下目标作者历史文章：\n\n{content}",
             response_model=PostAnalysis,
+        )
+
+
+class MaterialAssessmentAgent:
+    def __init__(self, llm: StructuredLLM):
+        self.llm = llm
+
+    def assess(
+        self,
+        *,
+        title: str | None,
+        content: str,
+        source_name: str | None = None,
+        source_type: str | None = None,
+    ) -> MaterialAssessment:
+        return self.llm.invoke(
+            system_prompt=(
+                "你是 Binance Square 素材价值判断 Agent，只判断一条素材是否值得进入"
+                "后续写作，不生成帖子。有效素材不要求明确看多或看空，但必须与加密市场、"
+                "Web3 或重要 AI 行业动态相关，并包含可核实的具体事件、数据、公告、链上"
+                "变化、监管变化或明确市场观点。拒绝广告、加群引流、返佣推广、空泛口号、"
+                "只有标题没有事实、与主题无关的传统市场消息，以及信息密度过低的内容。"
+                "不得补充素材没有的事实，不得把潜在影响写成确定结果。accepted=true 时"
+                " relevance_score 必须至少 60，information_density 必须至少 50。"
+            ),
+            user_prompt=(
+                f"来源名称：{source_name or '未知'}\n"
+                f"来源类型：{source_type or '未知'}\n"
+                f"标题：{title or ''}\n\n"
+                f"正文：\n{content}"
+            ),
+            response_model=MaterialAssessment,
+            retries=1,
         )
 
 

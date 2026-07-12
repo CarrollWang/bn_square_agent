@@ -25,6 +25,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .ai.llm import StructuredLLM
+from .ai.agents import MaterialAssessmentAgent
 from .ai.binance_symbols import futures_symbol_catalog
 from .ai.material_tagger import MaterialTagger
 from .core.config import (
@@ -371,12 +372,34 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
             if pending_materials
             else MaterialTagger()
         )
+        semantic_agent: MaterialAssessmentAgent | None = None
         for material in pending_materials:
             try:
                 tag = tagger.tag(
                     title=material.get("title"),
                     content=material["content"],
                 )
+                if tagger.needs_semantic_review(tag):
+                    try:
+                        if semantic_agent is None:
+                            semantic_agent = MaterialAssessmentAgent(
+                                StructuredLLM(settings)
+                            )
+                        assessment = await asyncio.to_thread(
+                            semantic_agent.assess,
+                            title=material.get("title"),
+                            content=material["content"],
+                            source_name=material.get("source_name"),
+                            source_type=material.get("source_type"),
+                        )
+                        tag = tagger.apply_semantic_assessment(tag, assessment)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "素材 material#%s 语义判断失败，使用规则结果: %s",
+                            material["id"],
+                            exc,
+                        )
+                        tag = tagger.apply_semantic_fallback(tag, exc)
                 tag_status = "accepted" if tag.accepted else "rejected"
                 db.save_material_tag(
                     material["id"],

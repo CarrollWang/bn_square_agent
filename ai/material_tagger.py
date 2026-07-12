@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, replace
+
+from ..models.schemas import MaterialAssessment
 
 
 TOKEN_RE = re.compile(
@@ -36,13 +38,15 @@ class MaterialTag:
     has_chart_symbol: bool
     reasons: list[str]
     strategy: str
+    decision_source: str
+    semantic_review: dict | None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 class MaterialTagger:
-    STRATEGY = "editorial_v2"
+    STRATEGY = "hybrid_semantic_v3"
     MIN_EDITORIAL_LENGTH = 24
 
     CRYPTO_PATTERNS = (
@@ -84,6 +88,19 @@ class MaterialTagger:
         "deepseek",
         "智谱",
     )
+    PROMOTIONAL_PATTERNS = (
+        "加群",
+        "进群",
+        "私聊",
+        "邀请码",
+        "注册链接",
+        "返佣",
+        "带单",
+        "跟单",
+        "稳赚",
+        "保证收益",
+        "保本收益",
+    )
 
     def __init__(
         self,
@@ -109,6 +126,8 @@ class MaterialTagger:
             reasons.append("empty_content")
         if not topics:
             reasons.append("missing_relevant_topic")
+        if any(pattern in text for pattern in self.PROMOTIONAL_PATTERNS):
+            reasons.append("promotional_content")
         compact_length = len(re.sub(r"\s+", "", text))
         directional_brief = bool(
             token and direction in {"long", "short"} and compact_length >= 12
@@ -124,6 +143,7 @@ class MaterialTagger:
             text
             and topics
             and (compact_length >= self.MIN_EDITORIAL_LENGTH or directional_brief)
+            and "promotional_content" not in reasons
         )
         if accepted:
             reasons.append("ready_for_editorial_consume")
@@ -137,6 +157,56 @@ class MaterialTagger:
             has_chart_symbol=bool(symbol),
             reasons=reasons,
             strategy=self.STRATEGY,
+            decision_source="rules",
+            semantic_review=None,
+        )
+
+    @staticmethod
+    def needs_semantic_review(tag: MaterialTag) -> bool:
+        if any(
+            reason in tag.reasons
+            for reason in ("empty_content", "content_too_short", "promotional_content")
+        ):
+            return False
+        return not (
+            tag.accepted
+            and tag.symbol
+            and tag.direction in {"long", "short"}
+            and "conflicting_direction" not in tag.reasons
+        )
+
+    @staticmethod
+    def apply_semantic_assessment(
+        tag: MaterialTag,
+        assessment: MaterialAssessment,
+    ) -> MaterialTag:
+        accepted = bool(
+            assessment.accepted
+            and assessment.relevance_score >= 60
+            and assessment.information_density >= 50
+        )
+        reasons = [
+            reason
+            for reason in tag.reasons
+            if reason != "ready_for_editorial_consume"
+        ]
+        reasons.append(
+            "semantic_review_accepted" if accepted else "semantic_review_rejected"
+        )
+        return replace(
+            tag,
+            accepted=accepted,
+            reasons=reasons,
+            decision_source="llm",
+            semantic_review=assessment.model_dump(),
+        )
+
+    @staticmethod
+    def apply_semantic_fallback(tag: MaterialTag, error: Exception) -> MaterialTag:
+        return replace(
+            tag,
+            decision_source="rules_fallback",
+            semantic_review={"error_type": type(error).__name__},
         )
 
     def _extract_topics(self, text: str, *, token: str | None) -> list[str]:

@@ -76,3 +76,22 @@ class ContentReview(BaseModel):
             and self.scores.originality >= 7
             and self.scores.expression_quality >= 7
         )
+
+
+class MaterialAssessment(BaseModel):
+    accepted: bool
+    category: Literal[
+        "trading_signal",
+        "market_news",
+        "project_update",
+        "exchange_announcement",
+        "onchain_data",
+        "regulation",
+        "ai_industry",
+        "general",
+    ]
+    relevance_score: int = Field(ge=0, le=100)
+    information_density: int = Field(ge=0, le=100)
+    time_sensitivity: Literal["high", "medium", "low", "unknown"]
+    impact: Literal["positive", "negative", "neutral", "mixed", "unclear"]
+    reason: str

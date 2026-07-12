@@ -9,6 +9,7 @@ from bn_square_agent.ai.binance_symbols import (
     BinanceSpotAssetCatalog,
 )
 from bn_square_agent.ai.material_tagger import MaterialTagger
+from bn_square_agent.models.schemas import MaterialAssessment
 from bn_square_agent.core.url_policy import (
     validate_binance_url,
     validate_techflow_url,
@@ -57,6 +58,67 @@ class MaterialTaggerTests(unittest.TestCase):
         self.assertEqual(tag.direction, "unknown")
         self.assertIn("direction_not_explicit", tag.reasons)
         self.assertIn("crypto", tag.topics)
+        self.assertTrue(MaterialTagger.needs_semantic_review(tag))
+
+    def test_explicit_directional_signal_skips_semantic_review(self) -> None:
+        tag = MaterialTagger().tag(
+            title="$BTC 继续看多",
+            content="关注回踩机会，跌破关键支撑后观点失效。",
+        )
+        self.assertTrue(tag.accepted)
+        self.assertFalse(MaterialTagger.needs_semantic_review(tag))
+        self.assertEqual(tag.decision_source, "rules")
+
+    def test_semantic_review_can_accept_specific_news(self) -> None:
+        tag = MaterialTagger().tag(
+            title="某协议公布季度数据",
+            content="项目公布季度收入、活跃用户和后续主网升级时间，但标题没有币种代码。",
+        )
+        self.assertTrue(MaterialTagger.needs_semantic_review(tag))
+        reviewed = MaterialTagger.apply_semantic_assessment(
+            tag,
+            MaterialAssessment(
+                accepted=True,
+                category="project_update",
+                relevance_score=82,
+                information_density=76,
+                time_sensitivity="medium",
+                impact="neutral",
+                reason="包含具体项目数据和升级计划",
+            ),
+        )
+        self.assertTrue(reviewed.accepted)
+        self.assertEqual(reviewed.decision_source, "llm")
+        self.assertIn("semantic_review_accepted", reviewed.reasons)
+
+    def test_semantic_review_rejects_vague_material(self) -> None:
+        tag = MaterialTagger().tag(
+            title="加密市场迎来新时代",
+            content="行业正在发生巨大变化，未来值得所有人持续关注和期待。",
+        )
+        reviewed = MaterialTagger.apply_semantic_assessment(
+            tag,
+            MaterialAssessment(
+                accepted=False,
+                category="general",
+                relevance_score=55,
+                information_density=18,
+                time_sensitivity="unknown",
+                impact="unclear",
+                reason="没有具体事件、数据或来源",
+            ),
+        )
+        self.assertFalse(reviewed.accepted)
+        self.assertIn("semantic_review_rejected", reviewed.reasons)
+
+    def test_promotional_material_is_rejected_without_llm(self) -> None:
+        tag = MaterialTagger().tag(
+            title="$BTC 看多机会",
+            content="保证收益，填写邀请码后进群跟单，今天一起抓住行情。",
+        )
+        self.assertFalse(tag.accepted)
+        self.assertIn("promotional_content", tag.reasons)
+        self.assertFalse(MaterialTagger.needs_semantic_review(tag))
 
     def test_supports_direction_variants_without_requiring_direction(self) -> None:
         short_tag = MaterialTagger().tag(
