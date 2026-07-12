@@ -28,9 +28,11 @@ Web 管理台
 
 语义判断只决定素材是否进入 Writer，不生成帖子，也不会把新闻影响自动改成做多或做空指令。
 
+Binance Square 创作者主页只用于离线风格对标，不进入自动素材采集；生产素材源仅接受经过域名白名单校验的新闻链接和 RSS。
+
 - 多账号独立 Square OpenAPI Key。
 - 多账号独立代理、MCP 地址和 MCP Token。
-- 素材源采集、去重、打标和队列消费。
+- 多新闻源采集、去重、打标和队列消费；TechFlow、PANews、CoinDesk、Cointelegraph 统一按 `news_feed` 配置。
 - LLM 多候选生成、审核与重写。
 - 账号轮转、失败重试、发布历史和表现看板。
 - 文本发布与单图发布。

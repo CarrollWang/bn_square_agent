@@ -37,9 +37,9 @@ from .core.config import (
 from .knowledge.style_rag import create_embeddings
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
-from .sources.binance_square import MaterialSourceService
+from .sources.service import MaterialSourceService
 from .storage.database import Database
-from .core.url_policy import validate_binance_url, validate_techflow_url
+from .core.url_policy import validate_binance_url, validate_news_feed_url
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -668,7 +668,7 @@ class SettingsPayload(BaseModel):
 class MaterialSourcePayload(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     url: str = Field(min_length=1, max_length=2_048)
-    source_type: str = "binance_square"
+    source_type: str = "news_feed"
     enabled: bool = True
 
 
@@ -1146,14 +1146,10 @@ def list_material_sources() -> list[dict]:
 
 @app.post("/api/material-sources")
 def save_material_source(payload: MaterialSourcePayload) -> dict:
-    if payload.source_type not in {"binance_square", "techflow_newsletter"}:
-        raise HTTPException(status_code=400, detail="当前只支持 BN 广场和 TechFlow 快讯素材源")
+    if payload.source_type != "news_feed":
+        raise HTTPException(status_code=400, detail="当前只支持新闻源")
     try:
-        source_url = (
-            validate_binance_url(payload.url, label="BN 广场素材源")
-            if payload.source_type == "binance_square"
-            else validate_techflow_url(payload.url, label="TechFlow 素材源")
-        )
+        source_url = validate_news_feed_url(payload.url, label="新闻源")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     source_id = get_db().upsert_material_source(

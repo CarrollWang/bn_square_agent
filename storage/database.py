@@ -190,7 +190,7 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 source_type TEXT NOT NULL CHECK(
-                    source_type IN ('binance_square', 'techflow_newsletter')
+                    source_type IN ('news_feed')
                 ),
                 url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -558,6 +558,7 @@ class Database:
         ).fetchall()
         if not any(str(row["table"]) == "material_sources_old" for row in foreign_keys):
             return
+        connection.commit()
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
             """
@@ -604,17 +605,29 @@ class Database:
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'material_sources'"
         ).fetchone()
         table_sql = str(row["sql"] if row else "")
-        if "techflow_newsletter" in table_sql:
+        if "'news_feed'" in table_sql:
             return
+        connection.commit()
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
             """
+            UPDATE material_items
+            SET status = CASE WHEN status = 'new' THEN 'ignored' ELSE status END,
+                error = CASE
+                    WHEN status = 'new' THEN 'binance_square_source_removed'
+                    ELSE error
+                END,
+                source_id = NULL,
+                updated_at = datetime('now')
+            WHERE source_id IN (
+                SELECT id FROM material_sources WHERE source_type = 'binance_square'
+            );
             ALTER TABLE material_sources RENAME TO material_sources_old;
             CREATE TABLE material_sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 source_type TEXT NOT NULL CHECK(
-                    source_type IN ('binance_square', 'techflow_newsletter')
+                    source_type IN ('news_feed')
                 ),
                 url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -629,9 +642,10 @@ class Database:
                 last_error, created_at, updated_at
             )
             SELECT
-                id, name, source_type, url, enabled, last_checked_at,
+                id, name, 'news_feed', url, enabled, last_checked_at,
                 last_error, created_at, updated_at
-            FROM material_sources_old;
+            FROM material_sources_old
+            WHERE source_type IN ('techflow_newsletter', 'news_feed');
             DROP TABLE material_sources_old;
             PRAGMA foreign_keys = ON;
             """

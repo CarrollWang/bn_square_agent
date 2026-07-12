@@ -12,8 +12,10 @@ from bn_square_agent.ai.material_tagger import MaterialTagger
 from bn_square_agent.models.schemas import MaterialAssessment
 from bn_square_agent.core.url_policy import (
     validate_binance_url,
+    validate_news_feed_url,
     validate_techflow_url,
 )
+from bn_square_agent.sources.news_feed import RSSNewsMonitor
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,38 @@ class UrlPolicyTests(unittest.TestCase):
         ):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_binance_url(value)
+
+    def test_news_feed_hosts_are_allowlisted(self) -> None:
+        self.assertEqual(
+            validate_news_feed_url("https://www.panewslab.com/rss.xml"),
+            "https://www.panewslab.com/rss.xml",
+        )
+        with self.assertRaises(ValueError):
+            validate_news_feed_url("https://example.com/rss.xml")
+
+
+class RSSNewsMonitorTests(unittest.TestCase):
+    def test_parses_rss_items_into_material_articles(self) -> None:
+        payload = b"""<?xml version='1.0' encoding='UTF-8'?>
+        <rss version='2.0'><channel><title>Demo News</title>
+          <item>
+            <title>Ethereum upgrade scheduled</title>
+            <description><![CDATA[Developers published the rollout date and scope.]]></description>
+            <link>https://www.coindesk.com/example</link>
+            <guid>demo-1</guid>
+            <pubDate>Sun, 12 Jul 2026 08:00:00 GMT</pubDate>
+          </item>
+        </channel></rss>"""
+
+        articles = RSSNewsMonitor.parse(
+            payload,
+            source_url="https://www.coindesk.com/arc/outboundfeeds/rss/",
+        )
+
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0].external_id, "demo-1")
+        self.assertIn("rollout date", articles[0].content)
+        self.assertEqual(articles[0].author, "Demo News")
 
 
 class MaterialTaggerTests(unittest.TestCase):

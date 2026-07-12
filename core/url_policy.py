@@ -41,3 +41,19 @@ def validate_techflow_url(value: str, *, label: str = "TechFlow 地址") -> str:
         domains=("techflowpost.com",),
         label=label,
     )
+
+
+NEWS_FEED_DOMAINS = (
+    "techflowpost.com",
+    "panewslab.com",
+    "coindesk.com",
+    "cointelegraph.com",
+)
+
+
+def validate_news_feed_url(value: str, *, label: str = "新闻源地址") -> str:
+    return validate_https_url_for_domains(
+        value,
+        domains=NEWS_FEED_DOMAINS,
+        label=label,
+    )

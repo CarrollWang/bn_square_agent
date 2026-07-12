@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,7 @@ from bn_square_agent.publishing.self_hosted_mcp import (
     _publish,
 )
 from bn_square_agent.storage.database import Database, PublishRateLimitError
-from bn_square_agent.sources.binance_square import MaterialSourceService
+from bn_square_agent.sources.service import MaterialSourceService
 from bn_square_agent.sources.models import MaterialArticle
 from bn_square_agent.workflows.operator import AccountContentRun, MultiAccountOperator
 
@@ -284,6 +285,79 @@ class SourceRuntimeTests(unittest.TestCase):
 
 
 class DatabaseRuntimeTests(unittest.TestCase):
+    def test_migrates_legacy_sources_to_news_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "legacy.db"
+            connection = sqlite3.connect(database_path)
+            connection.executescript(
+                """
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE material_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    source_type TEXT NOT NULL CHECK(
+                        source_type IN ('binance_square', 'techflow_newsletter')
+                    ),
+                    url TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_checked_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_type, url)
+                );
+                CREATE TABLE material_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER,
+                    external_id TEXT,
+                    author TEXT,
+                    title TEXT,
+                    content TEXT NOT NULL,
+                    url TEXT,
+                    source_created_at TEXT,
+                    hash TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'new',
+                    tag_status TEXT NOT NULL DEFAULT 'pending',
+                    tag_json TEXT,
+                    tag_error TEXT,
+                    tagged_at TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(source_id) REFERENCES material_sources(id)
+                );
+                INSERT INTO material_sources VALUES
+                    (1, 'TechFlow', 'techflow_newsletter', 'https://www.techflowpost.com/newsletter?is_hot=1', 1, NULL, NULL, 'now', 'now'),
+                    (2, 'BN author', 'binance_square', 'https://www.binance.com/zh-CN/square/profile/demo', 1, NULL, NULL, 'now', 'now');
+                INSERT INTO material_items (
+                    id, source_id, content, hash, status, tag_status, created_at, updated_at
+                ) VALUES
+                    (1, 1, 'news item', 'news-hash', 'new', 'pending', 'now', 'now'),
+                    (2, 2, 'creator item', 'creator-hash', 'new', 'accepted', 'now', 'now');
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            database = Database(
+                database_path,
+                secret_store=SecretStore.from_values(
+                    app_secret_key="",
+                    secret_key_path=root / "secret.key",
+                ),
+            )
+
+            sources = database.list_material_sources(include_disabled=True)
+            self.assertEqual([(row["id"], row["source_type"]) for row in sources], [(1, "news_feed")])
+            with database.connect() as migrated:
+                creator_item = migrated.execute(
+                    "SELECT source_id, status, error FROM material_items WHERE id = 2"
+                ).fetchone()
+            self.assertIsNone(creator_item["source_id"])
+            self.assertEqual(creator_item["status"], "ignored")
+            self.assertEqual(creator_item["error"], "binance_square_source_removed")
+
     @staticmethod
     def _database(root: Path) -> Database:
         store = SecretStore.from_values(
@@ -425,7 +499,7 @@ class DatabaseRuntimeTests(unittest.TestCase):
             database = Database(root / "test.db", secret_store=store)
             source_id = database.upsert_material_source(
                 name="TechFlow",
-                source_type="techflow_newsletter",
+                source_type="news_feed",
                 url="https://www.techflowpost.com/newsletter?is_hot=1",
             )
             item_id, _ = database.add_material_item(
@@ -457,9 +531,9 @@ class DatabaseRuntimeTests(unittest.TestCase):
                 ),
             )
             source_id = database.upsert_material_source(
-                name="测试作者",
-                source_type="binance_square",
-                url="https://www.binance.com/zh-CN/square/profile/test-author",
+                name="测试新闻源",
+                source_type="news_feed",
+                url="https://www.panewslab.com/rss.xml",
             )
             source = next(
                 row for row in database.list_material_sources() if row["id"] == source_id
@@ -468,7 +542,7 @@ class DatabaseRuntimeTests(unittest.TestCase):
                 database,
                 material_ttl_seconds=86_400,
             )
-            service.binance_square.fetch = MagicMock(
+            service.news_feed.fetch = MagicMock(
                 return_value=[
                     MaterialArticle(
                         title="旧闻",

@@ -13,8 +13,7 @@ export function shortText(value?: string | null, maxLength = 22) {
 export function sourceTypeLabel(sourceType?: string) {
   return (
     {
-      binance_square: "BN 广场作者",
-      techflow_newsletter: "TechFlow 深潮快讯",
+      news_feed: "新闻源",
     }[sourceType || ""] || sourceType || "-"
   );
 }
