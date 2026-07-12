@@ -189,13 +189,14 @@ def _load_account_context(
 
 
 def _ensure_trading_component(content: str, coins: str) -> str:
-    """Keep the trading component explicit at the OpenAPI boundary.
+    """Keep cashtags and trading components explicit at the OpenAPI boundary.
 
     ``coins`` used to be consumed by the remote browser publisher.  The
     self-hosted publisher calls Square OpenAPI directly, so it must translate
-    that metadata back into the bodyTextOnly marker instead of merely logging
-    it.  Existing explicit markers are preserved and conflicting symbols are
-    rejected to avoid publishing a BTC article with an ETH trading component.
+    that metadata into the visible ``$TOKEN`` cashtag and, for futures, the
+    bodyTextOnly marker. Existing explicit markers are preserved and
+    conflicting symbols are rejected to avoid publishing a BTC article with
+    an ETH trading component.
     """
 
     text = content.strip()
@@ -205,6 +206,15 @@ def _ensure_trading_component(content: str, coins: str) -> str:
     coin, market = coins.split(":", 1)
     coin = coin.upper()
     market = market.lower()
+    cashtag = coin.removesuffix("USDT")
+    bare_token = re.compile(
+        rf"(?<![A-Za-z0-9$]){re.escape(cashtag)}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    text, _ = bare_token.subn(f"${cashtag}", text)
+    if not re.search(rf"\${re.escape(cashtag)}\b", text, re.IGNORECASE):
+        text = f"${cashtag} {text}".strip()
+
     if market == "future":
         symbol = coin if coin.endswith("USDT") else f"{coin}USDT"
         existing = [match.upper() for match in FUTURE_MARKER_PATTERN.findall(text)]
@@ -216,10 +226,7 @@ def _ensure_trading_component(content: str, coins: str) -> str:
             return text
         return f"{text}\n\n{{future}}({symbol})"
 
-    cashtag = coin.removesuffix("USDT")
-    if re.search(rf"\${re.escape(cashtag)}\b", text, re.IGNORECASE):
-        return text
-    return f"{text}\n\n${cashtag}"
+    return text
 
 
 def _publish(

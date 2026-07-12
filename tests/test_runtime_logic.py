@@ -90,8 +90,32 @@ class PublisherLogicTests(unittest.TestCase):
             with self.subTest(coin=coin):
                 self.assertEqual(
                     _ensure_trading_component("等待突破确认。", f"{coin}:future"),
-                    f"等待突破确认。\n\n{{future}}({coin}USDT)",
+                    f"${coin} 等待突破确认。\n\n{{future}}({coin}USDT)",
                 )
+
+    def test_mcp_boundary_marks_bare_primary_coin_mentions_as_cashtags(self) -> None:
+        self.assertEqual(
+            _ensure_trading_component(
+                "LAB 庄家转移 1850 万枚 LAB。\n\n{future}(LABUSDT)",
+                "LAB:future",
+            ),
+            "$LAB 庄家转移 1850 万枚 $LAB。\n\n{future}(LABUSDT)",
+        )
+
+    def test_mcp_boundary_does_not_duplicate_existing_cashtags(self) -> None:
+        self.assertEqual(
+            _ensure_trading_component(
+                "$LAB 庄家转移 $LAB。\n\n{future}(LABUSDT)",
+                "LAB:future",
+            ),
+            "$LAB 庄家转移 $LAB。\n\n{future}(LABUSDT)",
+        )
+
+    def test_spot_coin_metadata_also_normalizes_bare_mentions(self) -> None:
+        self.assertEqual(
+            _ensure_trading_component("关注 SOL 和 SOL 生态。", "SOL:spot"),
+            "关注 $SOL 和 $SOL 生态。",
+        )
 
     def test_mcp_boundary_rejects_conflicting_future_marker(self) -> None:
         with self.assertRaisesRegex(ValueError, "不一致"):
@@ -197,7 +221,7 @@ class PublisherLogicTests(unittest.TestCase):
             post_id="123",
         )
         client.publish_text.assert_called_once_with(
-            "关注 ETH 升级。\n\n{future}(ETHUSDT)",
+            "关注 $ETH 升级。\n\n{future}(ETHUSDT)",
             image_base64="",
         )
         self.assertTrue(result["success"])

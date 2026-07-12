@@ -82,7 +82,8 @@ Playwright 仍用于素材采集和行情截图，不参与登录或发布。如
 
 - `content`：必填，发布正文。
 - `account_key`：必填，账号标识。
-- `coins`：可选，仅用于结果记录。
+- `coins`：可选，形如 `LAB:future`；发布边界会确保正文中的主币种使用
+  `$LAB` Cashtag，并为合约补充 `{future}(LABUSDT)` 组件。
 - `image_base64`：可选，一张图片的 data URL 或纯 base64。
 
 工具不接受 OpenAPI Key、Cookie 或代理参数。MCP 从加密数据库读取 Key 和账号代理。
