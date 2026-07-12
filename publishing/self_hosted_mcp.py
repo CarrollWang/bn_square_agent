@@ -12,6 +12,7 @@ import uuid
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from ..ai.binance_symbols import futures_symbol_catalog, spot_asset_catalog
 from ..core.config import Settings as AgentSettings
 from ..storage.database import Database, PublishRateLimitError
 from .binance_square_openapi import (
@@ -29,6 +30,12 @@ COINS_PATTERN = re.compile(r"^[A-Z0-9]{2,20}:(?:future|spot)$", re.IGNORECASE)
 FUTURE_MARKER_PATTERN = re.compile(
     r"\{future\}\(([A-Z0-9]{2,30}USDT)\)",
     re.IGNORECASE,
+)
+BARE_CASHTAG_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9$])([A-Z][A-Z0-9]{1,19})(?![A-Za-z0-9])"
+)
+CASHTAG_STOPWORDS = frozenset(
+    {"AI", "API", "CEO", "CFO", "DEX", "ETF", "SEC", "USD", "USDT"}
 )
 
 
@@ -124,7 +131,10 @@ def _tool_definition() -> dict[str, object]:
                 },
                 "coins": {
                     "type": "string",
-                    "description": "可选，形如 BTC:future；仅用于发布结果记录",
+                    "description": (
+                        "可选，形如 SOL:future；用于选择主合约，正文其他有效币种"
+                        "会按 Binance 现货目录规范为 $TOKEN"
+                    ),
                     "maxLength": 32,
                 },
                 "image_base64": {
@@ -188,7 +198,12 @@ def _load_account_context(
     return database, effective_settings, account
 
 
-def _ensure_trading_component(content: str, coins: str) -> str:
+def _ensure_trading_component(
+    content: str,
+    coins: str,
+    *,
+    valid_cashtag_tokens: set[str] | frozenset[str] | None = None,
+) -> str:
     """Keep cashtags and trading components explicit at the OpenAPI boundary.
 
     ``coins`` used to be consumed by the remote browser publisher.  The
@@ -212,6 +227,21 @@ def _ensure_trading_component(content: str, coins: str) -> str:
         re.IGNORECASE,
     )
     text, _ = bare_token.subn(f"${cashtag}", text)
+    valid_tokens = {
+        str(token).strip().upper()
+        for token in (valid_cashtag_tokens or ())
+        if str(token).strip()
+    }
+
+    def normalize_secondary(match: re.Match[str]) -> str:
+        token = match.group(1).upper()
+        if token == cashtag:
+            return f"${token}"
+        if token in valid_tokens and token not in CASHTAG_STOPWORDS:
+            return f"${token}"
+        return match.group(0)
+
+    text = BARE_CASHTAG_TOKEN_PATTERN.sub(normalize_secondary, text)
     if not re.search(rf"\${re.escape(cashtag)}\b", text, re.IGNORECASE):
         text = f"${cashtag} {text}".strip()
 
@@ -238,7 +268,15 @@ def _publish(
     image_base64: str,
 ) -> dict[str, object]:
     database, agent_settings, account = _load_account_context(account_key)
-    publish_content = _ensure_trading_component(content, coins)
+    valid_cashtag_tokens = set(spot_asset_catalog.get())
+    valid_cashtag_tokens.update(
+        symbol.removesuffix("USDT") for symbol in futures_symbol_catalog.get()
+    )
+    publish_content = _ensure_trading_component(
+        content,
+        coins,
+        valid_cashtag_tokens=valid_cashtag_tokens,
+    )
     if len(publish_content) > MAX_CONTENT_LENGTH:
         raise ValueError("补充交易组件后 content 过长")
     client = BinanceSquareOpenAPIClient(

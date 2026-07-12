@@ -4,7 +4,10 @@ from pathlib import Path
 import re
 import unittest
 
-from bn_square_agent.ai.binance_symbols import BinanceFuturesSymbolCatalog
+from bn_square_agent.ai.binance_symbols import (
+    BinanceFuturesSymbolCatalog,
+    BinanceSpotAssetCatalog,
+)
 from bn_square_agent.ai.material_tagger import MaterialTagger
 from bn_square_agent.core.url_policy import (
     validate_binance_url,
@@ -162,6 +165,52 @@ class BinanceFuturesSymbolCatalogTests(unittest.TestCase):
             }
         )
         self.assertEqual(symbols, frozenset({"LABUSDT"}))
+
+
+class BinanceSpotAssetCatalogTests(unittest.TestCase):
+    def test_parses_trading_spot_assets_across_supported_quotes(self) -> None:
+        assets = BinanceSpotAssetCatalog.parse(
+            {
+                "symbols": [
+                    {
+                        "symbol": "SOLUSDT",
+                        "status": "TRADING",
+                        "baseAsset": "SOL",
+                        "quoteAsset": "USDT",
+                        "isSpotTradingAllowed": True,
+                    },
+                    {
+                        "symbol": "USDCUSDT",
+                        "status": "TRADING",
+                        "baseAsset": "USDC",
+                        "quoteAsset": "USDT",
+                        "isSpotTradingAllowed": True,
+                    },
+                    {
+                        "symbol": "BNBFDUSD",
+                        "status": "TRADING",
+                        "baseAsset": "BNB",
+                        "quoteAsset": "FDUSD",
+                        "isSpotTradingAllowed": True,
+                    },
+                    {
+                        "symbol": "OLDUSDT",
+                        "status": "BREAK",
+                        "baseAsset": "OLD",
+                        "quoteAsset": "USDT",
+                        "isSpotTradingAllowed": True,
+                    },
+                    {
+                        "symbol": "NOSPOTUSDT",
+                        "status": "TRADING",
+                        "baseAsset": "NOSPOT",
+                        "quoteAsset": "USDT",
+                        "isSpotTradingAllowed": False,
+                    },
+                ]
+            }
+        )
+        self.assertEqual(assets, frozenset({"SOL", "USDC", "BNB"}))
 
 
 class StaticAssetTests(unittest.TestCase):

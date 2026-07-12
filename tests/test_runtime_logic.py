@@ -117,6 +117,19 @@ class PublisherLogicTests(unittest.TestCase):
             "关注 $SOL 和 $SOL 生态。",
         )
 
+    def test_mcp_boundary_marks_secondary_spot_assets_but_not_generic_acronyms(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _ensure_trading_component(
+                "SOL 链上新增 USDC，AI API 与 DEX 数据同步更新。",
+                "SOL:future",
+                valid_cashtag_tokens={"SOL", "USDC", "AI"},
+            ),
+            "$SOL 链上新增 $USDC，AI API 与 DEX 数据同步更新。"
+            "\n\n{future}(SOLUSDT)",
+        )
+
     def test_mcp_boundary_rejects_conflicting_future_marker(self) -> None:
         with self.assertRaisesRegex(ValueError, "不一致"):
             _ensure_trading_component(
@@ -196,6 +209,14 @@ class PublisherLogicTests(unittest.TestCase):
             patch(
                 "bn_square_agent.publishing.self_hosted_mcp.BinanceSquareOpenAPIClient",
                 return_value=client,
+            ),
+            patch(
+                "bn_square_agent.publishing.self_hosted_mcp.spot_asset_catalog.get",
+                return_value=frozenset({"ETH"}),
+            ),
+            patch(
+                "bn_square_agent.publishing.self_hosted_mcp.futures_symbol_catalog.get",
+                return_value=frozenset({"ETHUSDT"}),
             ),
         ):
             result = _publish(
