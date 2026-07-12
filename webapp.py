@@ -359,7 +359,12 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         monitor_state["current_stage"] = "采集素材源"
         # 每个采集器已有自己的网络超时。这里等待线程真实结束，避免 wait_for
         # 超时后后台线程仍继续写库并与下一轮任务重叠。
-        results = await asyncio.to_thread(MaterialSourceService(db).check_all)
+        results = await asyncio.to_thread(
+            MaterialSourceService(
+                db,
+                material_ttl_seconds=settings.material_ttl_seconds,
+            ).check_all
+        )
         monitor_state["last_results"] = results
         monitor_state["current_stage"] = "素材打标"
         tag_results: list[dict[str, Any]] = []
@@ -1186,7 +1191,11 @@ def check_material_source(source_id: int) -> dict:
         )
         if not source:
             raise HTTPException(status_code=404, detail="素材源不存在")
-        return MaterialSourceService(db).check_source(source)
+        settings = get_settings()
+        return MaterialSourceService(
+            db,
+            material_ttl_seconds=settings.material_ttl_seconds,
+        ).check_source(source)
     finally:
         db.release_job_lock(MONITOR_LOCK_NAME, owner_id=owner_id)
 

@@ -20,6 +20,8 @@ from bn_square_agent.publishing.self_hosted_mcp import (
     _publish,
 )
 from bn_square_agent.storage.database import Database, PublishRateLimitError
+from bn_square_agent.sources.binance_square import MaterialSourceService
+from bn_square_agent.sources.models import MaterialArticle
 from bn_square_agent.workflows.operator import AccountContentRun, MultiAccountOperator
 
 
@@ -443,6 +445,55 @@ class DatabaseRuntimeTests(unittest.TestCase):
 
             queue = database.list_material_queue_for_account("main", limit=10)
             self.assertEqual([item["id"] for item in queue], [item_id])
+
+    def test_material_source_skips_articles_older_than_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = Database(
+                root / "test.db",
+                secret_store=SecretStore.from_values(
+                    app_secret_key="",
+                    secret_key_path=root / "secret.key",
+                ),
+            )
+            source_id = database.upsert_material_source(
+                name="测试作者",
+                source_type="binance_square",
+                url="https://www.binance.com/zh-CN/square/profile/test-author",
+            )
+            source = next(
+                row for row in database.list_material_sources() if row["id"] == source_id
+            )
+            service = MaterialSourceService(
+                database,
+                material_ttl_seconds=86_400,
+            )
+            service.binance_square.fetch = MagicMock(
+                return_value=[
+                    MaterialArticle(
+                        title="旧闻",
+                        content="这是一条两天前发布的加密市场旧闻，不应重新进入自动发布队列。",
+                        external_id="old",
+                        source_created_at=(
+                            datetime.now(timezone.utc) - timedelta(days=2)
+                        ).isoformat(),
+                    ),
+                    MaterialArticle(
+                        title="新消息",
+                        content="这是一条刚刚发布的加密市场新消息，可以进入后续素材判断。",
+                        external_id="fresh",
+                        source_created_at=datetime.now(timezone.utc).isoformat(),
+                    ),
+                ]
+            )
+
+            result = service.check_source(source)
+
+            self.assertEqual(result["found"], 2)
+            self.assertEqual(result["stale_skipped"], 1)
+            self.assertEqual(result["inserted"], 1)
+            items = database.list_material_items(status="new")
+            self.assertEqual([item["external_id"] for item in items], ["fresh"])
 
     def test_openapi_key_remains_encrypted_and_can_be_rotated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

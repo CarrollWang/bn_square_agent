@@ -1003,7 +1003,8 @@ class Database:
                     error = 'expired_after_ttl',
                     updated_at = ?
                 WHERE status = 'new'
-                    AND datetime(created_at) <= datetime('now', ?)
+                    AND datetime(COALESCE(source_created_at, created_at))
+                        <= datetime('now', ?)
                 """,
                 (utc_now(), f"-{ttl_seconds} seconds"),
             )
