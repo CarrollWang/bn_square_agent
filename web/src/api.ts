@@ -10,8 +10,39 @@ import type {
   Settings,
 } from "./types";
 
+function appBasePath(): string {
+  const pathname = window.location.pathname || "/";
+  if (pathname === "/") {
+    return "/";
+  }
+  return pathname.endsWith("/")
+    ? pathname
+    : pathname.replace(/\/[^/]*$/, "/");
+}
+
+function apiBasePath(): string {
+  const base = appBasePath();
+  return `${base}api/`;
+}
+
+function resolveApiUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  if (path.startsWith("/api/")) {
+    return `${apiBasePath()}${path.slice(5)}`;
+  }
+  if (path.startsWith("api/")) {
+    return `${apiBasePath()}${path.slice(4)}`;
+  }
+  if (path.startsWith("/")) {
+    return path;
+  }
+  return `${apiBasePath()}${path}`;
+}
+
 async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, {
+  const response = await fetch(resolveApiUrl(url), {
     headers: { "Content-Type": "application/json" },
     ...options,
   });

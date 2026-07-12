@@ -132,6 +132,19 @@ Playwright 仍用于素材采集和行情截图，不参与登录或发布。如
 
 MCP 和 Web 应使用相同的 `DATABASE_PATH` 与 `SECRET_KEY_PATH`，否则 MCP 无法读取 Web 保存的账号 Key。
 
+推荐不要再为 BN Square Agent 单独开放公网域名，而是作为个人工作台里的一个子模块接入，例如：
+
+```text
+https://dashboard.alphatools.site/ticktick/bn-square/
+```
+
+部署要点：
+
+- 由工作台首页或导航进入 BN Square，不再保留旧的独立公网入口。
+- nginx 通过子路径反向代理到 `127.0.0.1:8787`，并用带 `/` 结尾的 `proxy_pass` 去掉前缀。
+- Web 前端已改成相对静态资源路径和相对子路径 API，可直接工作在 `/ticktick/bn-square/` 之类的挂载点。
+- 建议单独加一条 `/ticktick/bn-square/api/` 代理规则到 `127.0.0.1:8787/api/`。
+
 默认保持以下开关关闭，完成一条真实首帖后再逐级开启：
 
 ```text
