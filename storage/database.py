@@ -233,7 +233,10 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 source_type TEXT NOT NULL CHECK(
-                    source_type IN ('binance_square', 'techflow_newsletter')
+                    source_type IN (
+                        'binance_square', 'techflow_newsletter', 'rss_feed',
+                        'wallstreetcn_live', 'chaincatcher_flash'
+                    )
                 ),
                 url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -657,7 +660,15 @@ class Database:
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'material_sources'"
         ).fetchone()
         table_sql = str(row["sql"] if row else "")
-        if "techflow_newsletter" in table_sql:
+        if all(
+            source_type in table_sql
+            for source_type in (
+                "techflow_newsletter",
+                "rss_feed",
+                "wallstreetcn_live",
+                "chaincatcher_flash",
+            )
+        ):
             return
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
@@ -667,7 +678,10 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 source_type TEXT NOT NULL CHECK(
-                    source_type IN ('binance_square', 'techflow_newsletter')
+                    source_type IN (
+                        'binance_square', 'techflow_newsletter', 'rss_feed',
+                        'wallstreetcn_live', 'chaincatcher_flash'
+                    )
                 ),
                 url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -802,6 +816,7 @@ class Database:
         *,
         status: str | None = "new",
         tag_status: str | None = None,
+        source_type: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         query = """
@@ -817,6 +832,10 @@ class Database:
             query += " AND" if params else " WHERE"
             query += " i.tag_status = ?"
             params.append(tag_status)
+        if source_type:
+            query += " AND" if params else " WHERE"
+            query += " s.source_type = ?"
+            params.append(source_type)
         query += " ORDER BY i.created_at DESC, i.id DESC LIMIT ?"
         params.append(limit)
         with self.connect() as connection:

@@ -121,8 +121,11 @@ export const api = {
     requestJson<any>("/api/material-sources/check", { method: "POST" }),
   checkMaterialSource: (sourceId: number) =>
     requestJson<any>(`/api/material-sources/${sourceId}/check`, { method: "POST" }),
-  materialItems: (limit = 80) =>
-    requestJson<MaterialItem[]>(`/api/material-items?status=new&limit=${limit}`),
+  materialItems: (limit = 80, sourceType?: string) => {
+    const search = new URLSearchParams({ status: "new", limit: String(limit) });
+    if (sourceType) search.set("source_type", sourceType);
+    return requestJson<MaterialItem[]>(`/api/material-items?${search.toString()}`);
+  },
   publishHistory: (params: { limit?: number; account_key?: string; status?: string } = {}) => {
     const search = new URLSearchParams();
     if (params.limit) search.set("limit", String(params.limit));

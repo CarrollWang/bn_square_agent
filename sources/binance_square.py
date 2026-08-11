@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from ..core.url_policy import validate_binance_url
 from ..storage.database import Database
 from .models import MaterialArticle
+from .news_feeds import ChainCatcherMonitor, RssFeedMonitor, WallStreetCNMonitor
 from .techflow import TechFlowNewsletterMonitor
 
 
@@ -175,6 +176,9 @@ class MaterialSourceService:
         self.db = db
         self.binance_square = BinanceSquareMonitor()
         self.techflow_newsletter = TechFlowNewsletterMonitor()
+        self.rss_feed = RssFeedMonitor()
+        self.wallstreetcn_live = WallStreetCNMonitor()
+        self.chaincatcher_flash = ChainCatcherMonitor()
 
     def check_source(self, source: dict[str, Any]) -> dict[str, Any]:
         source_type = source["source_type"]
@@ -183,6 +187,12 @@ class MaterialSourceService:
                 articles = self.binance_square.fetch(source["url"])
             elif source_type == "techflow_newsletter":
                 articles = self.techflow_newsletter.fetch(source["url"])
+            elif source_type == "rss_feed":
+                articles = self.rss_feed.fetch(source["url"])
+            elif source_type == "wallstreetcn_live":
+                articles = self.wallstreetcn_live.fetch(source["url"])
+            elif source_type == "chaincatcher_flash":
+                articles = self.chaincatcher_flash.fetch(source["url"])
             else:
                 raise ValueError(f"不支持的素材源类型: {source_type}")
             inserted = 0

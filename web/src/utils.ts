@@ -15,6 +15,9 @@ export function sourceTypeLabel(sourceType?: string) {
     {
       binance_square: "BN 广场作者",
       techflow_newsletter: "TechFlow 深潮快讯",
+      rss_feed: "RSS / Atom 消息源",
+      wallstreetcn_live: "华尔街见闻 7×24",
+      chaincatcher_flash: "ChainCatcher 快讯",
     }[sourceType || ""] || sourceType || "-"
   );
 }

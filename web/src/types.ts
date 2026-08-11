@@ -1,4 +1,9 @@
-export type SourceType = "binance_square" | "techflow_newsletter";
+export type SourceType =
+  | "binance_square"
+  | "techflow_newsletter"
+  | "rss_feed"
+  | "wallstreetcn_live"
+  | "chaincatcher_flash";
 
 export interface Account {
   account_key: string;

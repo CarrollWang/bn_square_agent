@@ -51,6 +51,7 @@ from .publishing.account_check import (
 from .publishing.mcp_client import RemoteMCPClient
 from .services import build_services
 from .sources.binance_square import MaterialSourceService
+from .sources.news_feeds import validate_news_source_url
 from .storage.database import Database
 from .core.url_policy import validate_binance_url, validate_techflow_url
 
@@ -1693,14 +1694,22 @@ def list_material_sources() -> list[dict]:
 
 @app.post("/api/material-sources")
 def save_material_source(payload: MaterialSourcePayload) -> dict:
-    if payload.source_type not in {"binance_square", "techflow_newsletter"}:
-        raise HTTPException(status_code=400, detail="当前只支持 BN 广场和 TechFlow 快讯素材源")
+    supported_types = {
+        "binance_square",
+        "techflow_newsletter",
+        "rss_feed",
+        "wallstreetcn_live",
+        "chaincatcher_flash",
+    }
+    if payload.source_type not in supported_types:
+        raise HTTPException(status_code=400, detail="不支持的素材源类型")
     try:
-        source_url = (
-            validate_binance_url(payload.url, label="BN 广场素材源")
-            if payload.source_type == "binance_square"
-            else validate_techflow_url(payload.url, label="TechFlow 素材源")
-        )
+        if payload.source_type == "binance_square":
+            source_url = validate_binance_url(payload.url, label="BN 广场素材源")
+        elif payload.source_type == "techflow_newsletter":
+            source_url = validate_techflow_url(payload.url, label="TechFlow 素材源")
+        else:
+            source_url = validate_news_source_url(payload.source_type, payload.url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     source_id = get_db().upsert_material_source(
@@ -1744,9 +1753,14 @@ def check_material_source(source_id: int) -> dict:
 
 
 @app.get("/api/material-items")
-def list_material_items(status: str | None = "new", limit: int = 50) -> list[dict]:
+def list_material_items(
+    status: str | None = "new",
+    source_type: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
     return get_db().list_material_items(
         status=status,
+        source_type=source_type.strip() if source_type else None,
         limit=max(1, min(limit, 300)),
     )
 
