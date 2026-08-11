@@ -95,11 +95,12 @@ export interface MaterialItem {
 }
 
 export interface PublishHistoryItem {
+  run_id: number;
   material_item_id: number;
   account_key: string;
   account_name: string;
   account_check_status?: string | null;
-  status: "published" | "failed" | "skipped";
+  status: "published" | "failed" | "skipped" | "unknown";
   generated_id?: number | null;
   attempt_count: number;
   published_at?: string | null;
@@ -127,6 +128,7 @@ export interface PublishAccountSummary {
   published_count: number;
   failed_count: number;
   skipped_count: number;
+  unknown_count: number;
   last_published_at?: string | null;
   last_activity_at?: string | null;
 }

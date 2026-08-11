@@ -6,6 +6,16 @@ import re
 from typing import Any
 
 from ..core.config import AccountConfig
+from ..core.delivery import (
+    PUBLISH_FAILED_RETRYABLE,
+    PUBLISH_PUBLISHED,
+    PUBLISH_QUEUED,
+    PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+    RUN_FAILED,
+    RUN_PUBLISHED,
+    RUN_SKIPPED,
+    RUN_UNKNOWN,
+)
 from ..storage.database import Database
 from ..publishing.publisher import PublishingService, PublishResult
 
@@ -160,18 +170,26 @@ class MultiAccountOperator:
                     account=account,
                     generated_id=run.approved_generated_id,
                 )
-                run.status = "published" if run.publish_result.success else "failed"
-                if not run.publish_result.success:
+                publish_status = run.publish_result.publish_status
+                if publish_status == PUBLISH_PUBLISHED:
+                    run.status = RUN_PUBLISHED
+                elif publish_status == PUBLISH_UNKNOWN_MANUAL_RECOVERY:
+                    run.status = RUN_UNKNOWN
+                elif publish_status == PUBLISH_QUEUED:
+                    run.status = RUN_SKIPPED
+                    run.skipped_reason = "终稿已进入发布队列"
+                else:
+                    run.status = RUN_FAILED
+                if publish_status in {
+                    PUBLISH_FAILED_RETRYABLE,
+                    PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+                }:
                     result = run.publish_result.result
-                    detail = str(
+                    run.error = str(
                         result.get("error")
                         or result.get("message")
                         or "发布失败"
                     )
-                    if result.get("outcome") == "unknown":
-                        run.error = f"publish_outcome_unknown: {detail}"
-                    else:
-                        run.error = detail
             else:
                 run.status = "generated"
         except Exception as exc:
@@ -205,6 +223,11 @@ class MultiAccountOperator:
                     int(record.get("generated_id") or 0),
                     False,
                     payload,
+                    (
+                        PUBLISH_UNKNOWN_MANUAL_RECOVERY
+                        if status == RUN_UNKNOWN
+                        else PUBLISH_FAILED_RETRYABLE
+                    ),
                 )
         return run
 
@@ -231,6 +254,17 @@ class MultiAccountOperator:
                 generated_id=run.approved_generated_id,
                 error=run.skipped_reason,
                 increment_attempts=False,
+            )
+            return
+        if run.status == RUN_UNKNOWN:
+            self.db.save_material_account_run(
+                material_item_id,
+                account_key=run.account_key,
+                status=RUN_UNKNOWN,
+                generated_id=run.approved_generated_id,
+                publish_result=run.publish_result.result if run.publish_result else None,
+                error=run.error,
+                increment_attempts=True,
             )
             return
         if run.status == "already_published":
@@ -273,6 +307,10 @@ class MultiAccountOperator:
                 if len(detail) > 300:
                     detail = f"{detail[:300]}..."
                 errors.append(f"{account.key}: {detail or '未完成发布'}")
+                continue
+            if status == RUN_UNKNOWN:
+                detail = str(record.get("error") or "发布结果未知")
+                errors.append(f"{account.key}: 结果未知，需人工确认（{detail}）")
                 continue
             pending.append(account.key)
 
@@ -330,7 +368,11 @@ class MultiAccountOperator:
         runs: list[AccountContentRun] = []
         for account in self.accounts:
             existing = self.db.get_material_account_run(material_item_id, account.key)
-            if existing and str(existing.get("status") or "") in {"published", "skipped"}:
+            if existing and str(existing.get("status") or "") in {
+                RUN_PUBLISHED,
+                RUN_SKIPPED,
+                RUN_UNKNOWN,
+            }:
                 runs.append(
                     self._restore_material_run(
                         account_key=account.key,
@@ -357,7 +399,11 @@ class MultiAccountOperator:
     ) -> AccountContentRun:
         account = self._account_by_key(account_key)
         existing = self.db.get_material_account_run(material_item_id, account.key)
-        if existing and str(existing.get("status") or "") in {"published", "skipped"}:
+        if existing and str(existing.get("status") or "") in {
+            RUN_PUBLISHED,
+            RUN_SKIPPED,
+            RUN_UNKNOWN,
+        }:
             return self._restore_material_run(account_key=account.key, record=existing)
         item = self.db.get_material_item(material_item_id)
         symbol = self._symbol_from_material(item)

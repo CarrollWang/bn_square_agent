@@ -8,6 +8,16 @@ from typing import Any
 import httpx
 
 from ..core.config import AccountConfig, Settings
+from ..core.delivery import (
+    OUTCOME_FAILED,
+    OUTCOME_PUBLISHED,
+    OUTCOME_UNKNOWN,
+    PUBLISH_FAILED_RETRYABLE,
+    PUBLISH_PUBLISHED,
+    PUBLISH_QUEUED,
+    PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+    classify_publish_outcome,
+)
 from ..storage.database import Database
 from .chart_image import ChartImageService
 from .mcp_client import MCPTool, RemoteMCPClient
@@ -23,6 +33,7 @@ class PublishResult:
     generated_id: int
     success: bool
     result: dict[str, Any]
+    publish_status: str
 
 
 class MCPPublisher:
@@ -154,11 +165,49 @@ class PublishingService:
             )
         if generated["status"] != "approved":
             raise ValueError(f"只有 approved 终稿可以发布，当前状态: {generated['status']}")
-        if generated.get("publish_status") == "published":
+        existing_publish_status = str(generated.get("publish_status") or "")
+        if existing_publish_status in {
+            PUBLISH_PUBLISHED,
+            PUBLISH_QUEUED,
+            PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+        }:
             result = self._decode_publish_result(generated.get("publish_json"))
-            if not result:
-                result = {"success": True, "message": "终稿已发布，已跳过重复发布"}
-            return PublishResult(account.key, generated_id, True, result)
+            if existing_publish_status == PUBLISH_PUBLISHED:
+                if not result:
+                    result = {"success": True, "message": "终稿已发布，已跳过重复发布"}
+                result.setdefault("outcome", OUTCOME_PUBLISHED)
+                result["publish_status"] = existing_publish_status
+                return PublishResult(
+                    account.key,
+                    generated_id,
+                    True,
+                    result,
+                    existing_publish_status,
+                )
+            if existing_publish_status == PUBLISH_QUEUED:
+                result.update(
+                    {
+                        "success": False,
+                        "error": "终稿已进入发布队列，普通调用不会重复发送",
+                        "publish_status": existing_publish_status,
+                    }
+                )
+            else:
+                result.update(
+                    {
+                        "success": False,
+                        "outcome": OUTCOME_UNKNOWN,
+                        "error": "发布状态未知，需人工确认后再处理",
+                        "publish_status": existing_publish_status,
+                    }
+                )
+            return PublishResult(
+                account.key,
+                generated_id,
+                False,
+                result,
+                existing_publish_status,
+            )
         try:
             result = self.publisher.publish(account=account, generated=generated)
         except Exception as exc:
@@ -168,13 +217,44 @@ class PublishingService:
                 else "failed"
             )
             result = {"success": False, "outcome": outcome, "error": str(exc)}
-            self.db.mark_published(generated_id, result=result, success=False)
-            return PublishResult(account.key, generated_id, False, result)
-        if "outcome" not in result:
-            result["outcome"] = "published" if self._is_publish_success(result) else "failed"
-        success = self._is_publish_success(result)
-        self.db.mark_published(generated_id, result=result, success=success)
-        return PublishResult(account.key, generated_id, success, result)
+            publish_status = classify_publish_outcome(result)
+            result["publish_status"] = publish_status
+            self.db.mark_published(
+                generated_id,
+                result=result,
+                publish_status=publish_status,
+            )
+            return PublishResult(
+                account.key,
+                generated_id,
+                False,
+                result,
+                publish_status,
+            )
+        result = dict(result)
+        publish_status = classify_publish_outcome(result)
+        result.setdefault(
+            "outcome",
+            {
+                PUBLISH_PUBLISHED: OUTCOME_PUBLISHED,
+                PUBLISH_FAILED_RETRYABLE: OUTCOME_FAILED,
+                PUBLISH_UNKNOWN_MANUAL_RECOVERY: OUTCOME_UNKNOWN,
+            }[publish_status],
+        )
+        result["publish_status"] = publish_status
+        success = publish_status == PUBLISH_PUBLISHED
+        self.db.mark_published(
+            generated_id,
+            result=result,
+            publish_status=publish_status,
+        )
+        return PublishResult(
+            account.key,
+            generated_id,
+            success,
+            result,
+            publish_status,
+        )
 
     @staticmethod
     def _is_publish_success(result: dict[str, Any]) -> bool:

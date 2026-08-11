@@ -219,6 +219,30 @@ class ProfileApiTests(unittest.TestCase):
         self.assertEqual(db.job_name, "profile_build:writer")
         self.assertTrue(db.released)
 
+    def test_unknown_publish_run_can_be_resolved(self) -> None:
+        class FakeDatabase:
+            def resolve_unknown_material_run(self, run_id, *, resolution):
+                self.call = (run_id, resolution)
+                return {
+                    "status": resolution,
+                    "generated_publish_status": (
+                        "published" if resolution == "published" else "failed_retryable"
+                    ),
+                    "resolution": resolution,
+                    "resolved_at": "2026-08-11T10:00:00+00:00",
+                    "changed": True,
+                }
+
+        db = FakeDatabase()
+        with patch("bn_square_agent.webapp.get_db", return_value=db):
+            response = self.client.post(
+                "/api/history/runs/12/resolve",
+                json={"resolution": "failed"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(db.call, (12, "failed"))
+        self.assertEqual(response.json()["generated_publish_status"], "failed_retryable")
+
 
 if __name__ == "__main__":
     unittest.main()

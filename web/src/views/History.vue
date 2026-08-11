@@ -12,6 +12,7 @@
         <el-select v-model="filters.status" placeholder="全部状态" clearable style="width: 160px">
           <el-option label="已发布" value="published" />
           <el-option label="失败" value="failed" />
+          <el-option label="结果未知" value="unknown" />
           <el-option label="跳过" value="skipped" />
         </el-select>
         <el-button plain @click="loadHistory">筛选</el-button>
@@ -36,6 +37,10 @@
       <div class="metric-card">
         <strong>{{ totalSkipped }}</strong>
         <span>累计跳过</span>
+      </div>
+      <div class="metric-card">
+        <strong>{{ totalUnknown }}</strong>
+        <span>待人工恢复</span>
       </div>
     </div>
 
@@ -65,6 +70,7 @@
         <el-table-column prop="published_count" label="成功" width="100" />
         <el-table-column prop="failed_count" label="失败" width="100" />
         <el-table-column prop="skipped_count" label="跳过" width="100" />
+        <el-table-column prop="unknown_count" label="未知" width="100" />
         <el-table-column label="最近成功" width="180">
           <template #default="{ row }">{{ formatTime(row.last_published_at) }}</template>
         </el-table-column>
@@ -115,13 +121,26 @@
             <div class="result-text">{{ rowResultText(row) }}</div>
           </template>
         </el-table-column>
+        <el-table-column label="操作" width="190" fixed="right">
+          <template #default="{ row }">
+            <el-space v-if="row.status === 'unknown'" wrap>
+              <el-button size="small" type="success" plain @click="resolveRun(row, 'published')">
+                标记已发布
+              </el-button>
+              <el-button size="small" type="danger" plain @click="resolveRun(row, 'failed')">
+                标记失败
+              </el-button>
+            </el-space>
+            <span v-else class="muted">无需处理</span>
+          </template>
+        </el-table-column>
       </el-table>
     </el-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, reactive, ref } from "vue";
 
 import { api } from "@/api";
@@ -145,12 +164,16 @@ const totalFailed = computed(() =>
 const totalSkipped = computed(() =>
   summaries.value.reduce((sum, item) => sum + item.skipped_count, 0),
 );
+const totalUnknown = computed(() =>
+  summaries.value.reduce((sum, item) => sum + item.unknown_count, 0),
+);
 
 function publishStatusLabel(status: string) {
   return (
     {
       published: "已发布",
       failed: "失败",
+      unknown: "结果未知",
       skipped: "跳过",
     }[status] || status || "-"
   );
@@ -161,7 +184,8 @@ function publishStatusType(status: string) {
     {
       published: "success",
       failed: "danger",
-      skipped: "warning",
+      unknown: "warning",
+      skipped: "info",
     }[status] || "info"
   );
 }
@@ -182,6 +206,9 @@ function rowResultText(row: PublishHistoryItem) {
   }
   if (row.status === "skipped") {
     return row.error || "账号当前被跳过";
+  }
+  if (row.status === "unknown") {
+    return row.error || "发布结果未知，禁止自动重试，请人工确认";
   }
   if (row.error) {
     return row.error;
@@ -223,6 +250,21 @@ async function resetFilters() {
   filters.account_key = "";
   filters.status = "";
   await loadHistory();
+}
+
+async function resolveRun(
+  row: PublishHistoryItem,
+  resolution: "published" | "failed",
+) {
+  const label = resolution === "published" ? "已发布" : "失败并允许重试";
+  await ElMessageBox.confirm(
+    `确认把终稿#${row.generated_id || "-"}标记为“${label}”？此操作只用于人工收敛结果未知状态。`,
+    "人工恢复发布状态",
+    { type: "warning" },
+  );
+  await api.resolvePublishRun(row.run_id, resolution);
+  await refreshAll();
+  ElMessage.success(`已标记为${label}`);
 }
 
 onMounted(refreshAll);

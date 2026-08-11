@@ -17,7 +17,7 @@ from pathlib import Path
 import smtplib
 import tempfile
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -276,6 +276,25 @@ def _consume_results_failure_count(consume_results: list[dict[str, Any]]) -> int
     return count
 
 
+def _consume_results_failure_breakdown(
+    consume_results: list[dict[str, Any]],
+) -> tuple[int, int]:
+    confirmed_failed = 0
+    unknown = 0
+    for item in consume_results:
+        runs = item.get("runs") or []
+        if not runs and item.get("error"):
+            confirmed_failed += 1
+        for run in runs:
+            if not (run.get("error") or run.get("publish_success") is False):
+                continue
+            if run.get("status") == "unknown":
+                unknown += 1
+            else:
+                confirmed_failed += 1
+    return confirmed_failed, unknown
+
+
 def _send_publish_failure_alert_email(
     settings: Settings,
     failure_count: int,
@@ -295,20 +314,23 @@ def _send_publish_failure_alert_email(
     if missing:
         return False, f"邮件提醒缺少配置: {', '.join(missing)}"
 
+    confirmed_failed, unknown = _consume_results_failure_breakdown(consume_results)
     lines = [
-        f"BN Square Agent 已连续 {failure_count} 次发文失效，自动循环已暂停。",
+        f"BN Square Agent 已连续 {failure_count} 次发文异常，自动循环已暂停。",
+        f"本轮确认失败 {confirmed_failed} 条，结果未知 {unknown} 条。",
         "",
-        "最近失败记录：",
+        "最近异常记录：",
     ]
     for item in consume_results[:5]:
         title = item.get("title") or f"material#{item.get('material_item_id')}"
         lines.append(f"- {title}")
         for run in item.get("runs") or []:
             error = run.get("error") or run.get("publish_result") or "未知错误"
-            lines.append(f"  账号 {run.get('account_key')}: {error}")
+            label = "结果未知，需人工恢复" if run.get("status") == "unknown" else "确认失败"
+            lines.append(f"  账号 {run.get('account_key')} [{label}]: {error}")
 
     message = EmailMessage()
-    message["Subject"] = f"BN Square Agent 连续 {failure_count} 次发文失效"
+    message["Subject"] = f"BN Square Agent 连续 {failure_count} 次发文异常"
     message["From"] = settings.smtp_from or settings.smtp_username
     message["To"] = settings.alert_email_to
     message.set_content("\n".join(lines))
@@ -332,17 +354,19 @@ def _update_publish_failure_guard(
 ) -> None:
     if not consume_results:
         return
-    if _consume_results_have_success(consume_results):
-        monitor_state["consecutive_publish_failures"] = 0
-        monitor_state["last_alert_error"] = None
-        monitor_state["last_alert_sent"] = False
-        return
-
     failed_count = _consume_results_failure_count(consume_results)
     if not failed_count:
+        if _consume_results_have_success(consume_results):
+            monitor_state["consecutive_publish_failures"] = 0
+            monitor_state["last_alert_error"] = None
+            monitor_state["last_alert_sent"] = False
         return
 
-    current_count = int(monitor_state.get("consecutive_publish_failures") or 0)
+    current_count = (
+        0
+        if _consume_results_have_success(consume_results)
+        else int(monitor_state.get("consecutive_publish_failures") or 0)
+    )
     current_count += failed_count
     monitor_state["consecutive_publish_failures"] = current_count
 
@@ -361,7 +385,10 @@ def _update_publish_failure_guard(
     monitor_state["last_alert_error"] = error
     monitor_state["next_run_after_seconds"] = _paused_monitor_delay(settings)
     monitor_state["next_run_reason"] = "paused_after_failures"
-    monitor_state["current_stage"] = "连续发文失效，自动循环已暂停"
+    confirmed_failed, unknown = _consume_results_failure_breakdown(consume_results)
+    monitor_state["current_stage"] = (
+        f"连续发文异常，自动循环已暂停（确认失败 {confirmed_failed}，结果未知 {unknown}）"
+    )
 
 
 def _next_monitor_delay(settings: Settings, result: dict[str, Any]) -> tuple[int, str]:
@@ -671,6 +698,10 @@ class ReferencePostPayload(BaseModel):
 
 class ReferencePostsPayload(BaseModel):
     posts: list[ReferencePostPayload] = Field(min_length=1, max_length=200)
+
+
+class ResolvePublishRunPayload(BaseModel):
+    resolution: Literal["published", "failed"]
 
 
 class RunPayload(BaseModel):
@@ -1575,6 +1606,7 @@ def list_publish_history(
         result.append(
             {
                 "material_item_id": row["material_item_id"],
+                "run_id": row["id"],
                 "account_key": row["account_key"],
                 "account_name": row.get("account_name") or row["account_key"],
                 "account_check_status": row.get("account_check_status"),
@@ -1602,6 +1634,28 @@ def list_publish_history(
     return result
 
 
+@app.post("/api/history/runs/{run_id}/resolve")
+def resolve_publish_history_run(run_id: int, payload: ResolvePublishRunPayload) -> dict:
+    try:
+        result = get_db().resolve_unknown_material_run(
+            run_id,
+            resolution=payload.resolution,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "status": result["status"],
+        "generated_publish_status": result["generated_publish_status"],
+        "resolution": result["resolution"],
+        "resolved_at": result.get("resolved_at"),
+        "changed": bool(result.get("changed")),
+    }
+
+
 @app.get("/api/history/accounts")
 def publish_account_summaries() -> list[dict]:
     rows = get_db().publish_account_summaries()
@@ -1615,6 +1669,7 @@ def publish_account_summaries() -> list[dict]:
             "published_count": int(row.get("published_count") or 0),
             "failed_count": int(row.get("failed_count") or 0),
             "skipped_count": int(row.get("skipped_count") or 0),
+            "unknown_count": int(row.get("unknown_count") or 0),
             "last_published_at": row.get("last_published_at"),
             "last_activity_at": row.get("last_activity_at"),
         }

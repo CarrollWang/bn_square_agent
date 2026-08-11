@@ -9,6 +9,17 @@ import sqlite3
 import time
 from typing import Any, Iterator
 
+from ..core.delivery import (
+    PUBLISH_FAILED_RETRYABLE,
+    PUBLISH_NOT_PUBLISHED,
+    PUBLISH_PUBLISHED,
+    PUBLISH_QUEUED,
+    PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+    RUN_FAILED,
+    RUN_PUBLISHED,
+    RUN_SKIPPED,
+    RUN_UNKNOWN,
+)
 from ..core.secret_store import SecretStore
 from ..models.schemas import ContentReview, PostAnalysis, StyleProfile
 
@@ -140,6 +151,35 @@ class Database:
         if "published_at" not in generated_columns:
             connection.execute("ALTER TABLE generated_posts ADD COLUMN published_at TEXT")
 
+        connection.execute(
+            """
+            UPDATE generated_posts
+            SET publish_status = CASE
+                WHEN publish_status IN ('unknown', 'unknown_manual_recovery')
+                    THEN ?
+                WHEN publish_status = 'publish_failed'
+                    AND COALESCE(publish_json, '') LIKE '%"outcome"%unknown%'
+                    THEN ?
+                WHEN publish_status IN ('publish_failed', 'failed')
+                    THEN ?
+                WHEN publish_status IN (?, ?, ?, ?, ?)
+                    THEN publish_status
+                ELSE ?
+            END
+            """,
+            (
+                PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+                PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+                PUBLISH_FAILED_RETRYABLE,
+                PUBLISH_NOT_PUBLISHED,
+                PUBLISH_QUEUED,
+                PUBLISH_PUBLISHED,
+                PUBLISH_FAILED_RETRYABLE,
+                PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+                PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+            ),
+        )
+
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS accounts (
@@ -213,7 +253,7 @@ class Database:
                 material_item_id INTEGER NOT NULL,
                 account_key TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(
-                    status IN ('published', 'failed', 'skipped')
+                    status IN ('published', 'failed', 'skipped', 'unknown')
                 ),
                 generated_id INTEGER,
                 publish_json TEXT,
@@ -269,6 +309,7 @@ class Database:
         material_columns = self._columns(connection, "material_items")
         self._ensure_material_source_types(connection)
         self._ensure_material_items_source_fk(connection)
+        self._ensure_material_account_run_statuses(connection)
         if "tag_status" not in material_columns:
             connection.execute(
                 "ALTER TABLE material_items ADD COLUMN tag_status TEXT NOT NULL DEFAULT 'pending'"
@@ -280,6 +321,76 @@ class Database:
         if "tagged_at" not in material_columns:
             connection.execute("ALTER TABLE material_items ADD COLUMN tagged_at TEXT")
         self._migrate_secret_storage(connection)
+
+    def _ensure_material_account_run_statuses(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'material_account_runs'"
+        ).fetchone()
+        table_sql = str(row["sql"] or "") if row else ""
+        if "'unknown'" in table_sql:
+            return
+
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            ALTER TABLE material_account_runs RENAME TO material_account_runs_old;
+            CREATE TABLE material_account_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                material_item_id INTEGER NOT NULL,
+                account_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('published', 'failed', 'skipped', 'unknown')
+                ),
+                generated_id INTEGER,
+                publish_json TEXT,
+                error TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempted_at TEXT,
+                published_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(material_item_id, account_key),
+                FOREIGN KEY(material_item_id) REFERENCES material_items(id),
+                FOREIGN KEY(account_key) REFERENCES accounts(account_key),
+                FOREIGN KEY(generated_id) REFERENCES generated_posts(id)
+            );
+            INSERT INTO material_account_runs (
+                id, material_item_id, account_key, status, generated_id, publish_json,
+                error, attempt_count, last_attempted_at, published_at, created_at, updated_at
+            )
+            SELECT
+                id,
+                material_item_id,
+                account_key,
+                CASE
+                    WHEN status = 'failed'
+                        AND COALESCE(error, '') LIKE 'publish_outcome_unknown:%'
+                    THEN 'unknown'
+                    ELSE status
+                END,
+                generated_id,
+                publish_json,
+                CASE
+                    WHEN status = 'failed'
+                        AND COALESCE(error, '') LIKE 'publish_outcome_unknown:%'
+                    THEN TRIM(SUBSTR(error, INSTR(error, ':') + 1))
+                    ELSE error
+                END,
+                attempt_count,
+                last_attempted_at,
+                published_at,
+                created_at,
+                updated_at
+            FROM material_account_runs_old;
+            DROP TABLE material_account_runs_old;
+            CREATE INDEX IF NOT EXISTS idx_material_account_runs_material_status
+                ON material_account_runs(material_item_id, status, account_key);
+            """
+        )
+        connection.execute("PRAGMA foreign_keys = ON")
 
     def _migrate_secret_storage(self, connection: sqlite3.Connection) -> None:
         for column in ACCOUNT_SECRET_COLUMNS:
@@ -739,6 +850,7 @@ class Database:
                         r.status IS NULL
                         OR (
                             r.status = 'failed'
+                            -- Legacy prefix remains excluded during rolling upgrades.
                             AND COALESCE(r.error, '') NOT LIKE 'publish_outcome_unknown:%'
                         )
                     )
@@ -1356,6 +1468,7 @@ class Database:
                     COALESCE(SUM(CASE WHEN r.status = 'published' THEN 1 ELSE 0 END), 0) AS published_count,
                     COALESCE(SUM(CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
                     COALESCE(SUM(CASE WHEN r.status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped_count,
+                    COALESCE(SUM(CASE WHEN r.status = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_count,
                     MAX(r.published_at) AS last_published_at,
                     MAX(COALESCE(r.last_attempted_at, r.updated_at)) AS last_activity_at
                 FROM accounts a
@@ -1393,8 +1506,14 @@ class Database:
         generated_id: int,
         *,
         result: dict[str, Any],
-        success: bool,
+        publish_status: str,
     ) -> None:
+        if publish_status not in {
+            PUBLISH_PUBLISHED,
+            PUBLISH_FAILED_RETRYABLE,
+            PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+        }:
+            raise ValueError(f"无效发布结果状态: {publish_status}")
         with self.connect() as connection:
             connection.execute(
                 """
@@ -1406,13 +1525,108 @@ class Database:
                 WHERE id = ?
                 """,
                 (
-                    "published" if success else "publish_failed",
+                    publish_status,
                     json.dumps(result, ensure_ascii=False),
-                    utc_now() if success else None,
+                    utc_now() if publish_status == PUBLISH_PUBLISHED else None,
                     utc_now(),
                     generated_id,
                 ),
             )
+
+    def resolve_unknown_material_run(
+        self,
+        run_id: int,
+        *,
+        resolution: str,
+    ) -> dict[str, Any]:
+        if resolution not in {RUN_PUBLISHED, RUN_FAILED}:
+            raise ValueError("resolution 只能是 published 或 failed")
+        target_publish_status = (
+            PUBLISH_PUBLISHED if resolution == RUN_PUBLISHED else PUBLISH_FAILED_RETRYABLE
+        )
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT r.*, g.publish_status AS generated_publish_status,
+                    g.publish_json AS generated_publish_json
+                FROM material_account_runs r
+                LEFT JOIN generated_posts g ON g.id = r.generated_id
+                WHERE r.id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"发布记录不存在: {run_id}")
+            record = dict(row)
+            if record.get("generated_id") is None:
+                raise ValueError("结果未知记录没有关联终稿，不能自动收敛")
+            current_status = str(record.get("status") or "")
+            if current_status == resolution:
+                if record.get("generated_publish_status") != target_publish_status:
+                    raise ValueError("发布记录与终稿状态不一致，需要人工检查数据库")
+                record["changed"] = False
+                record["resolution"] = resolution
+                return record
+            if current_status != RUN_UNKNOWN:
+                raise ValueError(f"只有 unknown 记录可人工恢复，当前状态: {current_status}")
+
+            def resolved_payload(raw: Any) -> str:
+                payload: dict[str, Any]
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        decoded = json.loads(raw)
+                    except ValueError:
+                        decoded = {"raw_result": raw}
+                    payload = decoded if isinstance(decoded, dict) else {"raw_result": decoded}
+                else:
+                    payload = {}
+                payload["manual_resolution"] = {
+                    "resolution": resolution,
+                    "resolved_at": now,
+                }
+                return json.dumps(payload, ensure_ascii=False)
+
+            run_payload = resolved_payload(record.get("publish_json"))
+            generated_payload = resolved_payload(record.get("generated_publish_json"))
+            connection.execute(
+                """
+                UPDATE material_account_runs
+                SET status = ?, publish_json = ?, error = ?, published_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'unknown'
+                """,
+                (
+                    resolution,
+                    run_payload,
+                    None if resolution == RUN_PUBLISHED else record.get("error"),
+                    now if resolution == RUN_PUBLISHED else None,
+                    now,
+                    run_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE generated_posts
+                SET publish_status = ?, publish_json = ?, published_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    target_publish_status,
+                    generated_payload,
+                    now if resolution == RUN_PUBLISHED else None,
+                    now,
+                    record["generated_id"],
+                ),
+            )
+        return {
+            **record,
+            "status": resolution,
+            "generated_publish_status": target_publish_status,
+            "resolution": resolution,
+            "resolved_at": now,
+            "changed": True,
+        }
 
     def update_generated_content(self, generated_id: int, content: str) -> None:
         with self.connect() as connection:

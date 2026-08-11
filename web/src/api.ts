@@ -129,6 +129,19 @@ export const api = {
   },
   publishAccountSummaries: () =>
     requestJson<PublishAccountSummary[]>("/api/history/accounts"),
+  resolvePublishRun: (runId: number, resolution: "published" | "failed") =>
+    requestJson<{
+      ok: boolean;
+      run_id: number;
+      status: "published" | "failed";
+      generated_publish_status: string;
+      resolution: "published" | "failed";
+      resolved_at?: string | null;
+      changed: boolean;
+    }>(`/api/history/runs/${runId}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ resolution }),
+    }),
   accountPerformance: (days = 7) =>
     requestJson<AccountPerformanceDashboard>(`/api/performance/accounts?days=${days}`),
   monitor: () => requestJson<MonitorStatus>("/api/material-monitor"),
