@@ -124,6 +124,12 @@
           <el-form-item label="每轮消费数量">
             <el-input-number v-model="form.material_consume_batch_size" :min="1" />
           </el-form-item>
+          <el-form-item label="账号发布最小间隔 分钟">
+            <el-input-number v-model="form.publish_min_interval_minutes" :min="0" :max="1440" />
+          </el-form-item>
+          <el-form-item label="账号每日发布配额">
+            <el-input-number v-model="form.publish_daily_quota_per_account" :min="1" :max="1000" />
+          </el-form-item>
         </el-form>
       </el-tab-pane>
     </el-tabs>
@@ -174,6 +180,8 @@ const form = reactive<Record<string, any>>({
   material_ttl_seconds: 7200,
   material_consume_batch_size: 1,
   publish_failure_alert_threshold: 5,
+  publish_min_interval_minutes: 20,
+  publish_daily_quota_per_account: 30,
   alert_email_enabled: false,
   alert_email_to: "",
   smtp_host: "",
@@ -209,6 +217,8 @@ function applySettings(data: Settings) {
   form.material_ttl_seconds = data.material_ttl_seconds || 7200;
   form.material_consume_batch_size = data.material_consume_batch_size || 1;
   form.publish_failure_alert_threshold = data.publish_failure_alert_threshold || 5;
+  form.publish_min_interval_minutes = data.publish_min_interval_minutes ?? 20;
+  form.publish_daily_quota_per_account = data.publish_daily_quota_per_account || 30;
   form.alert_email_enabled = Boolean(data.alert_email_enabled);
   form.alert_email_to = data.alert_email_to || "";
   form.smtp_host = data.smtp_host || "";
@@ -247,6 +257,8 @@ function payload() {
     material_ttl_seconds: form.material_ttl_seconds,
     material_consume_batch_size: form.material_consume_batch_size,
     publish_failure_alert_threshold: form.publish_failure_alert_threshold,
+    publish_min_interval_minutes: form.publish_min_interval_minutes,
+    publish_daily_quota_per_account: form.publish_daily_quota_per_account,
     alert_email_enabled: form.alert_email_enabled,
     alert_email_to: form.alert_email_to,
     smtp_host: form.smtp_host,

@@ -63,11 +63,20 @@ class ReviewScores(BaseModel):
     expression_quality: int = Field(ge=0, le=10)
 
 
+GateStatus = Literal["ok", "manual_review", "blocked"]
+
+
+class GateDecision(BaseModel):
+    status: GateStatus
+    reasons: list[str] = Field(default_factory=list)
+
+
 class ContentReview(BaseModel):
     passed: bool
     scores: ReviewScores
     issues: list[str] = Field(default_factory=list)
     rewrite_instructions: list[str] = Field(default_factory=list)
+    gate: GateDecision | None = None
 
     def meets_threshold(self) -> bool:
         return (

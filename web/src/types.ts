@@ -4,6 +4,7 @@ export interface Account {
   account_key: string;
   name: string;
   enabled: boolean;
+  require_manual_review: boolean;
   cookie_saved: boolean;
   cookie_length: number;
   cookie_names: string[];
@@ -24,6 +25,7 @@ export interface AccountDetail {
   proxy_url: string;
   mcp_url: string;
   mcp_auth_token_configured: boolean;
+  require_manual_review: boolean;
 }
 
 export interface StyleProfileData {
@@ -55,6 +57,66 @@ export interface ProfileBuildResult {
   analyzed_count: number;
   failed_count: number;
   source_count: number;
+}
+
+export interface GateDecision {
+  status: "ok" | "manual_review" | "blocked";
+  reasons: string[];
+}
+
+export interface ReviewScores {
+  factual_fidelity: number;
+  style_match: number;
+  originality: number;
+  expression_quality: number;
+}
+
+export interface ReviewItem {
+  generated_id: number;
+  account_key: string;
+  material_item_id?: number | null;
+  material_title?: string | null;
+  material_content?: string | null;
+  material_url?: string | null;
+  source_name?: string | null;
+  source_type?: SourceType | null;
+  content: string;
+  status: string;
+  review: {
+    passed?: boolean;
+    scores?: ReviewScores;
+    issues?: string[];
+    rewrite_instructions?: string[];
+    gate?: GateDecision;
+  };
+  gate: GateDecision;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PublishQueueItem {
+  generated_id: number;
+  account_key: string;
+  material_item_id?: number | null;
+  material_title?: string | null;
+  source_name?: string | null;
+  content: string;
+  scheduled_at?: string | null;
+  created_at: string;
+  used: number;
+  quota: number;
+}
+
+export interface PublishQueueResponse {
+  items: PublishQueueItem[];
+  quota: Record<string, { used: number; quota: number }>;
+}
+
+export interface QuotaUsage {
+  account_key: string;
+  name: string;
+  used: number;
+  quota: number;
 }
 
 export interface CookieImportStartResult {
@@ -226,6 +288,7 @@ export interface MonitorStatus {
   last_results: any[];
   last_tag_results: any[];
   last_consume_results: any[];
+  last_publish_queue_results: any[];
 }
 
 export interface Settings {
@@ -253,6 +316,8 @@ export interface Settings {
   material_ttl_seconds: number;
   material_consume_batch_size: number;
   publish_failure_alert_threshold: number;
+  publish_min_interval_minutes: number;
+  publish_daily_quota_per_account: number;
   alert_email_enabled: boolean;
   alert_email_to: string;
   smtp_host: string;

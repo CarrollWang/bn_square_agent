@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import random
 import sqlite3
 import time
 from typing import Any, Iterator
@@ -19,6 +20,9 @@ from ..core.delivery import (
     RUN_PUBLISHED,
     RUN_SKIPPED,
     RUN_UNKNOWN,
+    content_fingerprint,
+    next_scheduled_time,
+    parse_iso_datetime,
 )
 from ..core.secret_store import SecretStore
 from ..models.schemas import ContentReview, PostAnalysis, StyleProfile
@@ -103,14 +107,22 @@ class Database:
                     original_content TEXT NOT NULL,
                     content TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(
-                        status IN ('pending', 'approved', 'rejected', 'failed')
+                        status IN ('pending', 'pending_review', 'approved', 'rejected', 'failed')
                     ),
                     review_json TEXT,
                     rewrite_count INTEGER NOT NULL DEFAULT 0,
+                    account_key TEXT NOT NULL DEFAULT 'default',
+                    material_item_id INTEGER,
+                    publish_status TEXT NOT NULL DEFAULT 'not_published',
+                    publish_json TEXT,
+                    published_at TEXT,
+                    approval_hash TEXT,
+                    scheduled_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(source_post_id, candidate_index),
-                    FOREIGN KEY(source_post_id) REFERENCES source_posts(id)
+                    FOREIGN KEY(source_post_id) REFERENCES source_posts(id),
+                    FOREIGN KEY(material_item_id) REFERENCES material_items(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS job_locks (
@@ -150,6 +162,12 @@ class Database:
             connection.execute("ALTER TABLE generated_posts ADD COLUMN publish_json TEXT")
         if "published_at" not in generated_columns:
             connection.execute("ALTER TABLE generated_posts ADD COLUMN published_at TEXT")
+        if "approval_hash" not in generated_columns:
+            connection.execute("ALTER TABLE generated_posts ADD COLUMN approval_hash TEXT")
+        if "scheduled_at" not in generated_columns:
+            connection.execute("ALTER TABLE generated_posts ADD COLUMN scheduled_at TEXT")
+        if "material_item_id" not in generated_columns:
+            connection.execute("ALTER TABLE generated_posts ADD COLUMN material_item_id INTEGER")
 
         connection.execute(
             """
@@ -194,6 +212,7 @@ class Database:
                 checked_at TEXT,
                 check_error TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                require_manual_review INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
 
@@ -306,9 +325,14 @@ class Database:
             connection.execute("ALTER TABLE accounts ADD COLUMN checked_at TEXT")
         if "check_error" not in account_columns:
             connection.execute("ALTER TABLE accounts ADD COLUMN check_error TEXT")
+        if "require_manual_review" not in account_columns:
+            connection.execute(
+                "ALTER TABLE accounts ADD COLUMN require_manual_review INTEGER NOT NULL DEFAULT 1"
+            )
         material_columns = self._columns(connection, "material_items")
         self._ensure_material_source_types(connection)
         self._ensure_material_items_source_fk(connection)
+        self._ensure_generated_post_statuses(connection)
         self._ensure_material_account_run_statuses(connection)
         if "tag_status" not in material_columns:
             connection.execute(
@@ -321,6 +345,77 @@ class Database:
         if "tagged_at" not in material_columns:
             connection.execute("ALTER TABLE material_items ADD COLUMN tagged_at TEXT")
         self._migrate_secret_storage(connection)
+
+    def _ensure_generated_post_statuses(self, connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'generated_posts'"
+        ).fetchone()
+        table_sql = str(row["sql"] or "") if row else ""
+        if "'pending_review'" in table_sql:
+            return
+
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("PRAGMA legacy_alter_table = ON")
+        connection.executescript(
+            """
+            ALTER TABLE generated_posts RENAME TO generated_posts_old;
+            CREATE TABLE generated_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_post_id INTEGER NOT NULL,
+                candidate_index INTEGER NOT NULL,
+                original_content TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN ('pending', 'pending_review', 'approved', 'rejected', 'failed')
+                ),
+                review_json TEXT,
+                rewrite_count INTEGER NOT NULL DEFAULT 0,
+                account_key TEXT NOT NULL DEFAULT 'default',
+                material_item_id INTEGER,
+                publish_status TEXT NOT NULL DEFAULT 'not_published',
+                publish_json TEXT,
+                published_at TEXT,
+                approval_hash TEXT,
+                scheduled_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(source_post_id, candidate_index),
+                FOREIGN KEY(source_post_id) REFERENCES source_posts(id),
+                FOREIGN KEY(material_item_id) REFERENCES material_items(id)
+            );
+            INSERT INTO generated_posts (
+                id, source_post_id, candidate_index, original_content, content, status,
+                review_json, rewrite_count, account_key, publish_status, publish_json,
+                published_at, approval_hash, scheduled_at, material_item_id, created_at, updated_at
+            )
+            SELECT
+                id,
+                source_post_id,
+                candidate_index,
+                original_content,
+                content,
+                CASE WHEN status = 'pending' THEN 'pending_review' ELSE status END,
+                review_json,
+                rewrite_count,
+                account_key,
+                publish_status,
+                publish_json,
+                published_at,
+                approval_hash,
+                scheduled_at,
+                material_item_id,
+                created_at,
+                updated_at
+            FROM generated_posts_old;
+            DROP TABLE generated_posts_old;
+            CREATE INDEX IF NOT EXISTS idx_generated_posts_account_status_created
+                ON generated_posts(account_key, status, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_generated_posts_publish_status
+                ON generated_posts(publish_status, published_at DESC, id DESC);
+            """
+        )
+        connection.execute("PRAGMA legacy_alter_table = OFF")
+        connection.execute("PRAGMA foreign_keys = ON")
 
     def _ensure_material_account_run_statuses(
         self,
@@ -710,7 +805,7 @@ class Database:
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         query = """
-            SELECT i.*, s.name AS source_name, s.source_type
+            SELECT i.*, s.name AS source_name, s.source_type, s.enabled AS source_enabled
             FROM material_items i
             LEFT JOIN material_sources s ON s.id = i.source_id
         """
@@ -732,7 +827,7 @@ class Database:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT i.*, s.name AS source_name, s.source_type
+                SELECT i.*, s.name AS source_name, s.source_type, s.enabled AS source_enabled
                 FROM material_items i
                 LEFT JOIN material_sources s ON s.id = i.source_id
                 WHERE i.id = ?
@@ -847,19 +942,27 @@ class Database:
                         OR i.tag_json LIKE '%"direction": "short"%'
                     )
                     AND (
-                        r.status IS NULL
+                    r.status IS NULL
                         OR (
                             r.status = 'failed'
                             -- Legacy prefix remains excluded during rolling upgrades.
                             AND COALESCE(r.error, '') NOT LIKE 'publish_outcome_unknown:%'
                         )
                     )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM generated_posts g
+                        WHERE g.material_item_id = i.id
+                            AND g.account_key = ?
+                            AND g.status IN ('pending_review', 'approved')
+                            AND g.publish_status IN ('not_published', 'queued')
+                    )
                 ORDER BY
                     COALESCE(i.source_created_at, i.created_at) ASC,
                     i.id ASC
                 LIMIT ?
                 """,
-                (account_key, limit),
+                (account_key, account_key, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -993,6 +1096,7 @@ class Database:
         proxy_url: str | None = None,
         mcp_url: str | None = None,
         mcp_auth_token: str | None = None,
+        require_manual_review: bool | None = None,
     ) -> None:
         encrypted_cookie = self._encrypt_secret(cookie)
         encrypted_proxy_url = self._encrypt_secret(proxy_url)
@@ -1002,9 +1106,9 @@ class Database:
                 """
                 INSERT INTO accounts (
                     account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
-                    enabled, created_at
+                    enabled, require_manual_review, created_at
                 )
-                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), 1, ?)
+                VALUES (?, ?, COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), COALESCE(?, ''), 1, COALESCE(?, 1), ?)
                 ON CONFLICT(account_key) DO UPDATE SET
                     name = excluded.name,
                     cookie = CASE
@@ -1039,6 +1143,10 @@ class Database:
                         WHEN ? IS NULL THEN accounts.check_error
                         ELSE NULL
                     END,
+                    require_manual_review = CASE
+                        WHEN ? IS NULL THEN accounts.require_manual_review
+                        ELSE excluded.require_manual_review
+                    END,
                     enabled = 1
                 """,
                 (
@@ -1048,6 +1156,7 @@ class Database:
                     encrypted_proxy_url,
                     mcp_url,
                     encrypted_mcp_auth_token,
+                    None if require_manual_review is None else (1 if require_manual_review else 0),
                     utc_now(),
                     encrypted_cookie,
                     encrypted_proxy_url,
@@ -1057,13 +1166,15 @@ class Database:
                     encrypted_cookie,
                     encrypted_cookie,
                     encrypted_cookie,
+                    None if require_manual_review is None else (1 if require_manual_review else 0),
                 ),
             )
 
     def list_accounts(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
         query = """
             SELECT account_key, name, cookie, proxy_url, mcp_url, mcp_auth_token,
-                signature_key, check_status, checked_at, check_error, enabled, created_at
+                signature_key, check_status, checked_at, check_error, enabled,
+                require_manual_review, created_at
             FROM accounts
         """
         params: tuple[Any, ...] = ()
@@ -1342,6 +1453,8 @@ class Database:
         review: ContentReview,
         rewrite_count: int,
         account_key: str = "default",
+        approval_hash: str | None = None,
+        material_item_id: int | None = None,
     ) -> int:
         now = utc_now()
         with self.connect() as connection:
@@ -1349,8 +1462,9 @@ class Database:
                 """
                 INSERT INTO generated_posts (
                     account_key, source_post_id, candidate_index, original_content, content,
-                    status, review_json, rewrite_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, review_json, rewrite_count, approval_hash, material_item_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_post_id, candidate_index) DO UPDATE SET
                     account_key = excluded.account_key,
                     original_content = excluded.original_content,
@@ -1358,6 +1472,12 @@ class Database:
                     status = excluded.status,
                     review_json = excluded.review_json,
                     rewrite_count = excluded.rewrite_count,
+                    approval_hash = excluded.approval_hash,
+                    material_item_id = excluded.material_item_id,
+                    publish_status = 'not_published',
+                    publish_json = NULL,
+                    published_at = NULL,
+                    scheduled_at = NULL,
                     updated_at = excluded.updated_at
                 RETURNING id
                 """,
@@ -1370,6 +1490,8 @@ class Database:
                     status,
                     review.model_dump_json(),
                     rewrite_count,
+                    approval_hash,
+                    material_item_id,
                     now,
                     now,
                 ),
@@ -1639,44 +1761,304 @@ class Database:
                 (content, utc_now(), generated_id),
             )
 
-    def approve_generated(self, generated_id: int, final_content: str) -> dict[str, Any]:
+    @staticmethod
+    def _json_object(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                return {"raw": raw}
+            return value if isinstance(value, dict) else {"raw": value}
+        return {}
+
+    def list_review_items(
+        self,
+        *,
+        account_key: str | None = None,
+        status: str = "pending_review",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                g.*,
+                COALESCE(m.title, s.title) AS material_title,
+                COALESCE(m.content, s.content) AS material_content,
+                COALESCE(m.url, s.url) AS material_url,
+                ms.name AS source_name,
+                ms.source_type
+            FROM generated_posts g
+            JOIN source_posts s ON s.id = g.source_post_id
+            LEFT JOIN material_items m ON m.id = g.material_item_id
+            LEFT JOIN material_sources ms ON ms.id = m.source_id
+            WHERE g.status = ?
+        """
+        params: list[Any] = [status]
+        if account_key:
+            query += " AND g.account_key = ?"
+            params.append(account_key)
+        query += " ORDER BY g.created_at, g.id LIMIT ?"
+        params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def edit_review_item(self, generated_id: int, content: str) -> dict[str, Any]:
+        normalized = content.strip()
+        if not normalized:
+            raise ValueError("稿件正文不能为空")
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM generated_posts WHERE id = ?", (generated_id,)
+                "SELECT * FROM generated_posts WHERE id = ?",
+                (generated_id,),
             ).fetchone()
             if not row:
                 raise KeyError(f"候选稿不存在: {generated_id}")
-            if row["status"] != "pending":
-                raise ValueError("只有待审核候选稿可以批准")
-            now = utc_now()
+            if row["status"] != "pending_review":
+                raise ValueError("只有待审核稿件可以编辑")
             connection.execute(
                 """
                 UPDATE generated_posts
-                SET content = ?, status = 'approved', updated_at = ?
+                SET content = ?, approval_hash = NULL, publish_status = ?,
+                    publish_json = NULL, scheduled_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (final_content, now, generated_id),
+                (normalized, PUBLISH_NOT_PUBLISHED, utc_now(), generated_id),
             )
-            connection.execute(
-                """
-                UPDATE generated_posts
-                SET status = 'rejected', updated_at = ?
-                WHERE source_post_id = ? AND id != ? AND status = 'pending'
-                """,
-                (now, row["source_post_id"], generated_id),
-            )
-            approved = connection.execute(
-                "SELECT * FROM generated_posts WHERE id = ?", (generated_id,)
-            ).fetchone()
-        return dict(approved)
+        return self.get_generated(generated_id)
 
-    def reject_generated(self, generated_id: int) -> None:
+    def reject_review_item(
+        self,
+        generated_id: int,
+        *,
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM generated_posts WHERE id = ?",
+                (generated_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"候选稿不存在: {generated_id}")
+            if row["status"] == "rejected":
+                result = dict(row)
+                result["changed"] = False
+                return result
+            if row["status"] != "pending_review":
+                raise ValueError("只有待审核稿件可以驳回")
+            review = self._json_object(row["review_json"])
+            review["manual_review"] = {
+                "decision": "rejected",
+                "comment": (comment or "").strip(),
+                "decided_at": now,
+            }
             connection.execute(
                 """
                 UPDATE generated_posts
-                SET status = 'rejected', updated_at = ?
-                WHERE id = ? AND status = 'pending'
+                SET status = 'rejected', review_json = ?, approval_hash = NULL,
+                    publish_status = ?, publish_json = NULL, scheduled_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
                 """,
-                (utc_now(), generated_id),
+                (
+                    json.dumps(review, ensure_ascii=False),
+                    PUBLISH_NOT_PUBLISHED,
+                    now,
+                    generated_id,
+                ),
             )
+        result = self.get_generated(generated_id)
+        result["changed"] = True
+        return result
+
+    def approve_generated_for_queue(
+        self,
+        generated_id: int,
+        *,
+        min_interval_minutes: int,
+        jitter_minutes: int | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        local_now = now or datetime.now().astimezone()
+        jitter = random.randint(0, 10) if jitter_minutes is None else jitter_minutes
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM generated_posts WHERE id = ?",
+                (generated_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"候选稿不存在: {generated_id}")
+            current = dict(row)
+            fingerprint = content_fingerprint(current["account_key"], current["content"])
+            if current["publish_status"] == PUBLISH_QUEUED:
+                if current.get("approval_hash") != fingerprint:
+                    raise ValueError("content_modified_after_approval")
+                current["changed"] = False
+                return current
+            if current["status"] not in {"pending_review", "approved"}:
+                raise ValueError(f"当前稿件状态不能进入队列: {current['status']}")
+
+            timing_rows = connection.execute(
+                """
+                SELECT scheduled_at, published_at
+                FROM generated_posts
+                WHERE account_key = ? AND id != ?
+                    AND (scheduled_at IS NOT NULL OR published_at IS NOT NULL)
+                """,
+                (current["account_key"], generated_id),
+            ).fetchall()
+            candidates = []
+            for timing in timing_rows:
+                for key in ("scheduled_at", "published_at"):
+                    parsed = parse_iso_datetime(timing[key])
+                    if parsed is not None:
+                        candidates.append(parsed)
+            latest_at = max(candidates).isoformat() if candidates else None
+            scheduled_at = next_scheduled_time(
+                latest_at=latest_at,
+                min_interval_minutes=min_interval_minutes,
+                jitter_minutes=jitter,
+                now=local_now,
+            )
+            connection.execute(
+                """
+                UPDATE generated_posts
+                SET status = 'approved', approval_hash = ?, publish_status = ?,
+                    scheduled_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    fingerprint,
+                    PUBLISH_QUEUED,
+                    scheduled_at,
+                    utc_now(),
+                    generated_id,
+                ),
+            )
+        queued = self.get_generated(generated_id)
+        queued["changed"] = True
+        return queued
+
+    def list_publish_queue(
+        self,
+        *,
+        account_key: str | None = None,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT
+                g.*,
+                COALESCE(m.title, s.title) AS material_title,
+                ms.name AS source_name,
+                ms.source_type
+            FROM generated_posts g
+            JOIN source_posts s ON s.id = g.source_post_id
+            LEFT JOIN material_items m ON m.id = g.material_item_id
+            LEFT JOIN material_sources ms ON ms.id = m.source_id
+            WHERE g.publish_status = ?
+        """
+        params: list[Any] = [PUBLISH_QUEUED]
+        if account_key:
+            query += " AND g.account_key = ?"
+            params.append(account_key)
+        query += " ORDER BY g.scheduled_at, g.id LIMIT ?"
+        params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_due_publish_queue(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        local_now = now or datetime.now().astimezone()
+        due = []
+        for row in self.list_publish_queue(limit=max(limit * 5, 100)):
+            scheduled = parse_iso_datetime(row.get("scheduled_at"))
+            if scheduled is None:
+                continue
+            if scheduled.astimezone(local_now.tzinfo) <= local_now:
+                due.append(row)
+            if len(due) >= limit:
+                break
+        return due
+
+    def cancel_publish_queue_item(self, generated_id: int) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM generated_posts WHERE id = ?",
+                (generated_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"候选稿不存在: {generated_id}")
+            if row["publish_status"] == PUBLISH_NOT_PUBLISHED and row["status"] == "approved":
+                result = dict(row)
+                result["changed"] = False
+                return result
+            if row["publish_status"] != PUBLISH_QUEUED:
+                raise ValueError("只有队列中的稿件可以移出")
+            connection.execute(
+                """
+                UPDATE generated_posts
+                SET status = 'approved', publish_status = ?, scheduled_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (PUBLISH_NOT_PUBLISHED, utc_now(), generated_id),
+            )
+        result = self.get_generated(generated_id)
+        result["changed"] = True
+        return result
+
+    def daily_published_count(
+        self,
+        account_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        local_now = now or datetime.now().astimezone()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT published_at
+                FROM generated_posts
+                WHERE account_key = ? AND publish_status = ? AND published_at IS NOT NULL
+                """,
+                (account_key, PUBLISH_PUBLISHED),
+            ).fetchall()
+        count = 0
+        for row in rows:
+            published_at = parse_iso_datetime(row["published_at"])
+            if (
+                published_at is not None
+                and published_at.astimezone(local_now.tzinfo).date() == local_now.date()
+            ):
+                count += 1
+        return count
+
+    def pending_delivery_for_material(
+        self,
+        material_item_id: int,
+        account_key: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, status, publish_status, scheduled_at
+                FROM generated_posts
+                WHERE material_item_id = ? AND account_key = ?
+                    AND status IN ('pending_review', 'approved')
+                    AND publish_status IN ('not_published', 'queued')
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (material_item_id, account_key),
+            ).fetchone()
+        return dict(row) if row else None

@@ -33,6 +33,14 @@
             <el-icon><Document /></el-icon>
             <span>发文历史</span>
           </el-menu-item>
+          <el-menu-item index="/review">
+            <el-icon><CircleCheck /></el-icon>
+            <span>待审核</span>
+          </el-menu-item>
+          <el-menu-item index="/queue">
+            <el-icon><Timer /></el-icon>
+            <span>待发布</span>
+          </el-menu-item>
           <el-sub-menu index="sources">
             <template #title>
               <el-icon><FolderOpened /></el-icon>
@@ -76,10 +84,12 @@ import { computed } from "vue";
 import { useRoute } from "vue-router";
 import {
   DataAnalysis,
+  CircleCheck,
   Document,
   FolderOpened,
   Monitor,
   Setting,
+  Timer,
   User,
 } from "@element-plus/icons-vue";
 import zhCn from "element-plus/es/locale/lang/zh-cn";
@@ -92,6 +102,8 @@ const pageTitle = computed(() => {
     accounts: "账号管理",
     performance: "账号表现",
     history: "发文历史",
+    review: "待审核",
+    queue: "待发布",
     sources: "素材中心",
     settings: "系统设置",
   };

@@ -25,6 +25,16 @@ export const router = createRouter({
       component: () => import("@/views/History.vue"),
     },
     {
+      path: "/review",
+      name: "review",
+      component: () => import("@/views/Review.vue"),
+    },
+    {
+      path: "/queue",
+      name: "queue",
+      component: () => import("@/views/Queue.vue"),
+    },
+    {
       path: "/sources",
       name: "sources",
       component: () => import("@/views/Sources.vue"),

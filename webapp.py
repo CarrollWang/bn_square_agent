@@ -34,6 +34,14 @@ from .core.config import (
     mask_url_credentials,
     normalize_proxy_url,
 )
+from .core.delivery import (
+    PUBLISH_FAILED_RETRYABLE,
+    PUBLISH_PUBLISHED,
+    PUBLISH_UNKNOWN_MANUAL_RECOVERY,
+    RUN_FAILED,
+    RUN_PUBLISHED,
+    RUN_UNKNOWN,
+)
 from .knowledge.style_rag import create_embeddings
 from .publishing.account_check import (
     BINANCE_AUTH_PATH,
@@ -64,6 +72,7 @@ monitor_state: dict[str, Any] = {
     "last_finished_at": None,
     "last_results": [],
     "last_consume_results": [],
+    "last_publish_queue_results": [],
     "last_tag_results": [],
     "last_error": None,
     "expired_count": 0,
@@ -407,6 +416,31 @@ def _paused_monitor_delay(settings: Settings) -> int:
     return max(10, min(settings.material_poll_interval_seconds, 60))
 
 
+async def _process_due_publish_queue(db: Database, services: Any = None) -> list[dict[str, Any]]:
+    due_items = db.list_due_publish_queue(limit=50)
+    if not due_items:
+        return []
+    active_services = services or await asyncio.to_thread(build_services)
+    results: list[dict[str, Any]] = []
+    for generated in due_items:
+        try:
+            result = await asyncio.to_thread(
+                _publish_queue_item,
+                active_services,
+                int(generated["id"]),
+            )
+        except Exception as exc:
+            result = {
+                "generated_id": generated["id"],
+                "account_key": generated["account_key"],
+                "success": False,
+                "error": str(exc),
+            }
+        results.append(result)
+        monitor_state["last_publish_queue_results"] = results
+    return results
+
+
 async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str, Any]:
     settings = get_settings()
     db = get_db()
@@ -483,6 +517,7 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
         monitor_state["last_tag_results"] = tag_results
         monitor_state["current_stage"] = "等待消费素材"
         consume_results: list[dict[str, Any]] = []
+        services = None
         if settings.auto_consume_materials:
             queue_candidates = db.list_material_items(
                 status="new",
@@ -505,20 +540,49 @@ async def run_material_monitor_once(*, fail_if_locked: bool = False) -> dict[str
                     )
                     consume_results.append(_serialize_consume_result(item))
                     monitor_state["last_consume_results"] = consume_results
+        monitor_state["current_stage"] = "处理发布队列"
+        publish_queue_results = await _process_due_publish_queue(db, services)
         monitor_state.update(
             {
                 "last_results": results,
                 "last_tag_results": tag_results,
                 "last_consume_results": consume_results,
+                "last_publish_queue_results": publish_queue_results,
                 "last_error": None,
                 "expired_count": expired_count,
             }
         )
-        _update_publish_failure_guard(settings, db, consume_results)
+        queue_guard_results = []
+        for item in publish_queue_results:
+            if item.get("skipped"):
+                continue
+            publish_status = item.get("publish_status")
+            queue_guard_results.append(
+                {
+                    "material_item_id": item.get("material_item_id"),
+                    "runs": [
+                        {
+                            "account_key": item.get("account_key"),
+                            "status": (
+                                "published"
+                                if item.get("success") is True
+                                else "unknown"
+                                if publish_status == PUBLISH_UNKNOWN_MANUAL_RECOVERY
+                                else "failed"
+                            ),
+                            "publish_success": item.get("success"),
+                            "error": item.get("error")
+                            or _decode_json_object(item.get("result")).get("error"),
+                        }
+                    ],
+                }
+            )
+        _update_publish_failure_guard(settings, db, consume_results + queue_guard_results)
         return {
             "expired_count": expired_count,
             "results": results,
             "consume_results": consume_results,
+            "publish_queue_results": publish_queue_results,
         }
     except Exception as exc:
         monitor_state["last_error"] = str(exc)
@@ -677,6 +741,7 @@ class AccountPayload(BaseModel):
     proxy_url: str | None = Field(default=None, max_length=2_048)
     mcp_url: str | None = Field(default=None, max_length=2_048)
     mcp_auth_token: str | None = Field(default=None, max_length=8_192)
+    require_manual_review: bool | None = None
 
 
 class AccountCookieImportStartPayload(BaseModel):
@@ -702,6 +767,18 @@ class ReferencePostsPayload(BaseModel):
 
 class ResolvePublishRunPayload(BaseModel):
     resolution: Literal["published", "failed"]
+
+
+class ReviewRejectPayload(BaseModel):
+    comment: str | None = Field(default=None, max_length=2_000)
+
+
+class ReviewEditPayload(BaseModel):
+    content: str = Field(min_length=1, max_length=50_000)
+
+
+class BatchApprovePayload(BaseModel):
+    generated_ids: list[int] = Field(min_length=1, max_length=200)
 
 
 class RunPayload(BaseModel):
@@ -731,6 +808,8 @@ class SettingsPayload(BaseModel):
     material_ttl_seconds: int | None = Field(default=None, ge=60, le=604_800)
     material_consume_batch_size: int | None = Field(default=None, ge=1, le=20)
     publish_failure_alert_threshold: int | None = Field(default=None, ge=1, le=100)
+    publish_min_interval_minutes: int | None = Field(default=None, ge=0, le=1_440)
+    publish_daily_quota_per_account: int | None = Field(default=None, ge=1, le=1_000)
     alert_email_enabled: bool | None = None
     alert_email_to: str | None = Field(default=None, max_length=1_000)
     smtp_host: str | None = Field(default=None, max_length=253)
@@ -826,6 +905,7 @@ def _account_from_row(row: dict[str, Any]) -> AccountConfig:
         mcp_auth_token=row.get("mcp_auth_token") or "",
         check_status=row.get("check_status") or "unchecked",
         enabled=bool(row.get("enabled", 1)),
+        require_manual_review=bool(row.get("require_manual_review", 1)),
     )
 
 
@@ -841,6 +921,86 @@ def _require_account(db: Database, account_key: str) -> dict[str, Any]:
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
     return account
+
+
+def _account_config_for_key(db: Database, account_key: str) -> AccountConfig:
+    return _account_from_row(_require_account(db, account_key))
+
+
+def _decode_json_object(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return {"raw": raw}
+        return value if isinstance(value, dict) else {"raw": value}
+    return {}
+
+
+def _persist_queue_publish_result(services: Any, generated: dict[str, Any], result: Any) -> None:
+    material_item_id = generated.get("material_item_id")
+    if not material_item_id:
+        return
+    if result.publish_status == PUBLISH_PUBLISHED:
+        run_status = RUN_PUBLISHED
+        error = None
+    elif result.publish_status == PUBLISH_UNKNOWN_MANUAL_RECOVERY:
+        run_status = RUN_UNKNOWN
+        error = str(result.result.get("error") or "发布结果未知")
+    else:
+        run_status = RUN_FAILED
+        error = str(result.result.get("error") or result.result.get("message") or "发布失败")
+    services.db.save_material_account_run(
+        int(material_item_id),
+        account_key=generated["account_key"],
+        status=run_status,
+        generated_id=generated["id"],
+        publish_result=result.result,
+        error=error,
+        increment_attempts=True,
+    )
+    services.operator.finalize_material_item(int(material_item_id))
+
+
+def _publish_queue_item(
+    services: Any,
+    generated_id: int,
+    *,
+    ignore_quota: bool = False,
+) -> dict[str, Any]:
+    generated = services.db.get_generated(generated_id)
+    settings = services.settings
+    used = services.db.daily_published_count(generated["account_key"])
+    quota = settings.publish_daily_quota_per_account
+    if not ignore_quota and used >= quota:
+        return {
+            "generated_id": generated_id,
+            "account_key": generated["account_key"],
+            "material_item_id": generated.get("material_item_id"),
+            "skipped": True,
+            "reason": "daily_quota_reached",
+            "used": used,
+            "quota": quota,
+        }
+    account = _account_config_for_key(services.db, generated["account_key"])
+    result = services.publishing_service.publish_generated(
+        account=account,
+        generated_id=generated_id,
+        allow_queued=True,
+    )
+    _persist_queue_publish_result(services, generated, result)
+    return {
+        "generated_id": generated_id,
+        "account_key": generated["account_key"],
+        "material_item_id": generated.get("material_item_id"),
+        "success": result.success,
+        "publish_status": result.publish_status,
+        "result": result.result,
+        "used": used + (1 if result.success else 0),
+        "quota": quota,
+    }
 
 
 @app.get("/")
@@ -866,6 +1026,7 @@ def list_accounts() -> list[dict]:
             "account_key": row["account_key"],
             "name": row["name"],
             "enabled": bool(row["enabled"]),
+            "require_manual_review": bool(row.get("require_manual_review", 1)),
             "cookie_saved": bool(row["cookie"]),
             "cookie_length": len(row["cookie"] or ""),
             "cookie_names": [
@@ -895,6 +1056,7 @@ def read_account(account_key: str) -> dict:
         "proxy_url": account.get("proxy_url") or "",
         "mcp_url": account.get("mcp_url") or "",
         "mcp_auth_token_configured": bool(account.get("mcp_auth_token")),
+        "require_manual_review": bool(account.get("require_manual_review", 1)),
     }
 
 
@@ -999,6 +1161,8 @@ def read_settings() -> dict:
         "material_ttl_seconds": settings.material_ttl_seconds,
         "material_consume_batch_size": settings.material_consume_batch_size,
         "publish_failure_alert_threshold": settings.publish_failure_alert_threshold,
+        "publish_min_interval_minutes": settings.publish_min_interval_minutes,
+        "publish_daily_quota_per_account": settings.publish_daily_quota_per_account,
         "alert_email_enabled": settings.alert_email_enabled,
         "alert_email_to": settings.alert_email_to,
         "smtp_host": settings.smtp_host,
@@ -1047,6 +1211,8 @@ def save_settings(payload: SettingsPayload) -> dict:
         "material_ttl_seconds": "MATERIAL_TTL_SECONDS",
         "material_consume_batch_size": "MATERIAL_CONSUME_BATCH_SIZE",
         "publish_failure_alert_threshold": "PUBLISH_FAILURE_ALERT_THRESHOLD",
+        "publish_min_interval_minutes": "PUBLISH_MIN_INTERVAL_MINUTES",
+        "publish_daily_quota_per_account": "PUBLISH_DAILY_QUOTA_PER_ACCOUNT",
         "smtp_port": "SMTP_PORT",
     }
     data = payload.model_dump()
@@ -1067,7 +1233,8 @@ def save_settings(payload: SettingsPayload) -> dict:
     for field, key in int_fields.items():
         value = data.get(field)
         if value is not None:
-            values[key] = str(max(1, int(value)))
+            minimum = 0 if key == "PUBLISH_MIN_INTERVAL_MINUTES" else 1
+            values[key] = str(max(minimum, int(value)))
     get_db().set_app_settings(values)
     return {"ok": True, "saved": sorted(values)}
 
@@ -1153,6 +1320,7 @@ def save_account(payload: AccountPayload) -> dict:
         proxy_url=proxy_url,
         mcp_url=mcp_url,
         mcp_auth_token=mcp_auth_token,
+        require_manual_review=payload.require_manual_review,
     )
     return {"ok": True}
 
@@ -1654,6 +1822,181 @@ def resolve_publish_history_run(run_id: int, payload: ResolvePublishRunPayload) 
         "resolved_at": result.get("resolved_at"),
         "changed": bool(result.get("changed")),
     }
+
+
+def _serialize_review_item(row: dict[str, Any]) -> dict[str, Any]:
+    review = _decode_json_object(row.get("review_json"))
+    return {
+        "generated_id": row["id"],
+        "account_key": row["account_key"],
+        "material_item_id": row.get("material_item_id"),
+        "material_title": row.get("material_title"),
+        "material_content": row.get("material_content"),
+        "material_url": row.get("material_url"),
+        "source_name": row.get("source_name"),
+        "source_type": row.get("source_type"),
+        "content": row["content"],
+        "status": row["status"],
+        "review": review,
+        "gate": review.get("gate") or {"status": "manual_review", "reasons": []},
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.get("/api/review/items")
+def list_review_items(
+    account_key: str | None = None,
+    status: str = "pending_review",
+) -> list[dict[str, Any]]:
+    if status not in {"pending_review", "approved", "rejected", "failed"}:
+        raise HTTPException(status_code=400, detail="不支持的审核状态")
+    rows = get_db().list_review_items(
+        account_key=account_key.strip() if account_key else None,
+        status=status,
+    )
+    return [_serialize_review_item(row) for row in rows]
+
+
+@app.post("/api/review/items/{generated_id}/approve")
+def approve_review_item(generated_id: int) -> dict[str, Any]:
+    settings = get_settings()
+    try:
+        row = get_db().approve_generated_for_queue(
+            generated_id,
+            min_interval_minutes=settings.publish_min_interval_minutes,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "generated_id": generated_id,
+        "status": row["status"],
+        "publish_status": row["publish_status"],
+        "scheduled_at": row["scheduled_at"],
+        "changed": bool(row.get("changed")),
+    }
+
+
+@app.post("/api/review/items/{generated_id}/reject")
+def reject_review_item(generated_id: int, payload: ReviewRejectPayload) -> dict[str, Any]:
+    db = get_db()
+    try:
+        row = db.reject_review_item(generated_id, comment=payload.comment)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if row.get("material_item_id"):
+        db.mark_material_item(int(row["material_item_id"]), status="new", error=None)
+    return {"ok": True, "generated_id": generated_id, "changed": bool(row.get("changed"))}
+
+
+@app.post("/api/review/items/{generated_id}/edit")
+def edit_review_item(generated_id: int, payload: ReviewEditPayload) -> dict[str, Any]:
+    try:
+        row = get_db().edit_review_item(generated_id, payload.content)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "generated_id": generated_id, "content": row["content"]}
+
+
+@app.post("/api/review/batch-approve")
+def batch_approve_review_items(payload: BatchApprovePayload) -> dict[str, Any]:
+    settings = get_settings()
+    db = get_db()
+    results = []
+    for generated_id in dict.fromkeys(payload.generated_ids):
+        try:
+            row = db.approve_generated_for_queue(
+                generated_id,
+                min_interval_minutes=settings.publish_min_interval_minutes,
+            )
+            results.append(
+                {
+                    "generated_id": generated_id,
+                    "ok": True,
+                    "scheduled_at": row["scheduled_at"],
+                }
+            )
+        except Exception as exc:
+            results.append({"generated_id": generated_id, "ok": False, "error": str(exc)})
+    return {
+        "results": results,
+        "approved": sum(1 for item in results if item["ok"]),
+        "failed": sum(1 for item in results if not item["ok"]),
+    }
+
+
+@app.get("/api/publish-queue")
+def list_publish_queue(account_key: str | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    db = get_db()
+    rows = db.list_publish_queue(account_key=account_key.strip() if account_key else None)
+    quota_by_account = {
+        row["account_key"]: {
+            "used": db.daily_published_count(row["account_key"]),
+            "quota": settings.publish_daily_quota_per_account,
+        }
+        for row in rows
+    }
+    return {
+        "items": [
+            {
+                "generated_id": row["id"],
+                "account_key": row["account_key"],
+                "material_item_id": row.get("material_item_id"),
+                "material_title": row.get("material_title"),
+                "source_name": row.get("source_name"),
+                "content": row["content"],
+                "scheduled_at": row.get("scheduled_at"),
+                "created_at": row["created_at"],
+                **quota_by_account[row["account_key"]],
+            }
+            for row in rows
+        ],
+        "quota": quota_by_account,
+    }
+
+
+@app.post("/api/publish-queue/{generated_id}/cancel")
+def cancel_publish_queue_item(generated_id: int) -> dict[str, Any]:
+    try:
+        row = get_db().cancel_publish_queue_item(generated_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "generated_id": generated_id, "changed": bool(row.get("changed"))}
+
+
+@app.post("/api/publish-queue/{generated_id}/publish-now")
+def publish_queue_item_now(generated_id: int, ignore_quota: bool = False) -> dict[str, Any]:
+    services = build_services()
+    owner_id = _acquire_pipeline_lock_or_raise(services.db)
+    try:
+        return _publish_queue_item(services, generated_id, ignore_quota=ignore_quota)
+    finally:
+        services.db.release_job_lock(MONITOR_LOCK_NAME, owner_id=owner_id)
+
+
+@app.get("/api/dashboard/quota")
+def dashboard_quota() -> list[dict[str, Any]]:
+    settings = get_settings()
+    db = get_db()
+    return [
+        {
+            "account_key": row["account_key"],
+            "name": row["name"],
+            "used": db.daily_published_count(row["account_key"]),
+            "quota": settings.publish_daily_quota_per_account,
+        }
+        for row in db.list_accounts()
+    ]
 
 
 @app.get("/api/history/accounts")

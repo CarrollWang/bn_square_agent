@@ -41,6 +41,28 @@
       </div>
     </div>
 
+    <el-card class="page-card" shadow="never">
+      <template #header>
+        <div class="toolbar">
+          <div class="toolbar-title">
+            <strong>今日发布配额</strong>
+            <span>按账号、本地自然日统计已确认发布数量</span>
+          </div>
+          <el-button text @click="loadQuota">刷新</el-button>
+        </div>
+      </template>
+      <div class="quota-grid">
+        <div v-for="item in quota" :key="item.account_key" class="quota-item">
+          <div class="quota-title">
+            <strong>{{ item.name }}</strong>
+            <span>{{ item.used }} / {{ item.quota }}</span>
+          </div>
+          <el-progress :percentage="quotaPercent(item.used, item.quota)" :status="item.used >= item.quota ? 'warning' : undefined" />
+        </div>
+        <el-empty v-if="!quota.length" description="暂无账号" :image-size="64" />
+      </div>
+    </el-card>
+
     <el-card class="page-card log-card" shadow="never">
       <template #header>
         <div class="toolbar">
@@ -65,10 +87,11 @@ import { ElMessage } from "element-plus";
 import { onMounted, onUnmounted, ref } from "vue";
 
 import { api } from "@/api";
-import type { MonitorStatus } from "@/types";
+import type { MonitorStatus, QuotaUsage } from "@/types";
 import { formatMonitorLogs, nextRunLabel, shortText } from "@/utils";
 
 const monitor = ref<MonitorStatus | null>(null);
+const quota = ref<QuotaUsage[]>([]);
 const runningOnce = ref(false);
 const checkingMcp = ref(false);
 const mcpDialogVisible = ref(false);
@@ -77,6 +100,14 @@ let timer: number | undefined;
 
 async function loadMonitor() {
   monitor.value = await api.monitor();
+}
+
+async function loadQuota() {
+  quota.value = await api.dashboardQuota();
+}
+
+function quotaPercent(used: number, total: number) {
+  return total ? Math.min(100, Math.round((used / total) * 100)) : 0;
 }
 
 async function toggleMonitor() {
@@ -111,8 +142,11 @@ async function checkMcp() {
 }
 
 onMounted(() => {
-  loadMonitor();
-  timer = window.setInterval(() => loadMonitor().catch(() => undefined), 30000);
+  Promise.all([loadMonitor(), loadQuota()]);
+  timer = window.setInterval(() => {
+    loadMonitor().catch(() => undefined);
+    loadQuota().catch(() => undefined);
+  }, 30000);
 });
 
 onUnmounted(() => {
@@ -128,6 +162,26 @@ onUnmounted(() => {
 
 .log-card :deep(.el-card__header) {
   padding-bottom: 0;
+}
+
+.quota-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.quota-item {
+  padding: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.quota-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
 }
 
 .dialog-json {

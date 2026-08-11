@@ -11,6 +11,9 @@ import type {
   PublishAccountSummary,
   PublishHistoryItem,
   ProfileBuildResult,
+  PublishQueueResponse,
+  QuotaUsage,
+  ReviewItem,
   Settings,
 } from "./types";
 
@@ -37,6 +40,7 @@ export const api = {
     proxy_url?: string;
     mcp_url?: string;
     mcp_auth_token?: string | null;
+    require_manual_review?: boolean;
   }) =>
     requestJson<{ ok: boolean }>("/api/accounts", {
       method: "POST",
@@ -142,6 +146,42 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ resolution }),
     }),
+  reviewItems: (params: { account_key?: string; status?: string } = {}) => {
+    const search = new URLSearchParams();
+    if (params.account_key) search.set("account_key", params.account_key);
+    if (params.status) search.set("status", params.status);
+    const query = search.toString();
+    return requestJson<ReviewItem[]>(`/api/review/items${query ? `?${query}` : ""}`);
+  },
+  approveReviewItem: (generatedId: number) =>
+    requestJson<any>(`/api/review/items/${generatedId}/approve`, { method: "POST" }),
+  rejectReviewItem: (generatedId: number, comment = "") =>
+    requestJson<any>(`/api/review/items/${generatedId}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ comment }),
+    }),
+  editReviewItem: (generatedId: number, content: string) =>
+    requestJson<any>(`/api/review/items/${generatedId}/edit`, {
+      method: "POST",
+      body: JSON.stringify({ content }),
+    }),
+  batchApproveReviewItems: (generated_ids: number[]) =>
+    requestJson<{ approved: number; failed: number; results: any[] }>("/api/review/batch-approve", {
+      method: "POST",
+      body: JSON.stringify({ generated_ids }),
+    }),
+  publishQueue: (accountKey?: string) =>
+    requestJson<PublishQueueResponse>(
+      `/api/publish-queue${accountKey ? `?account_key=${encodeURIComponent(accountKey)}` : ""}`,
+    ),
+  cancelPublishQueueItem: (generatedId: number) =>
+    requestJson<any>(`/api/publish-queue/${generatedId}/cancel`, { method: "POST" }),
+  publishQueueItemNow: (generatedId: number, ignoreQuota = false) =>
+    requestJson<any>(
+      `/api/publish-queue/${generatedId}/publish-now?ignore_quota=${ignoreQuota ? "true" : "false"}`,
+      { method: "POST" },
+    ),
+  dashboardQuota: () => requestJson<QuotaUsage[]>("/api/dashboard/quota"),
   accountPerformance: (days = 7) =>
     requestJson<AccountPerformanceDashboard>(`/api/performance/accounts?days=${days}`),
   monitor: () => requestJson<MonitorStatus>("/api/material-monitor"),

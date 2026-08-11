@@ -8,10 +8,8 @@ from typing import Any
 from ..core.config import AccountConfig
 from ..core.delivery import (
     PUBLISH_FAILED_RETRYABLE,
-    PUBLISH_PUBLISHED,
     PUBLISH_QUEUED,
     PUBLISH_UNKNOWN_MANUAL_RECOVERY,
-    RUN_FAILED,
     RUN_PUBLISHED,
     RUN_SKIPPED,
     RUN_UNKNOWN,
@@ -40,12 +38,14 @@ class MultiAccountOperator:
         content_graph: Any,
         publishing_service: PublishingService | None = None,
         auto_publish: bool = True,
+        publish_min_interval_minutes: int = 20,
     ):
         self.db = db
         self.accounts = accounts
         self.content_graph = content_graph
         self.publishing_service = publishing_service
         self.auto_publish = auto_publish
+        self.publish_min_interval_minutes = publish_min_interval_minutes
         for account in accounts:
             self.db.upsert_account(
                 account_key=account.key,
@@ -84,6 +84,18 @@ class MultiAccountOperator:
         if marker in content or re.search(r"\{future\}\([A-Z0-9]{2,30}USDT\)", content):
             return content
         return f"{content.rstrip()}\n\n{marker}"
+
+    @staticmethod
+    def _direction_from_material(item: dict[str, Any]) -> str | None:
+        raw = item.get("tag_json")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            tag = json.loads(raw)
+        except ValueError:
+            return None
+        direction = str(tag.get("direction") or "").strip().lower()
+        return direction if direction in {"long", "short"} else None
 
     def _attach_future_marker(
         self,
@@ -139,6 +151,9 @@ class MultiAccountOperator:
         title: str | None,
         url: str | None,
         future_symbol: str | None,
+        material_item_id: int | None = None,
+        direction: str | None = None,
+        source_enabled: bool | None = None,
     ) -> AccountContentRun:
         run = AccountContentRun(account_key=account.key)
         blocker = self._publish_blocker(account)
@@ -153,6 +168,10 @@ class MultiAccountOperator:
                     "content": content,
                     "title": title,
                     "url": url,
+                    "material_item_id": material_item_id,
+                    "direction": direction,
+                    "source_enabled": source_enabled,
+                    "require_manual_review": account.require_manual_review,
                 }
             )
             run.generated_ids = state.get("generated_ids", [])
@@ -165,31 +184,17 @@ class MultiAccountOperator:
                 run.status = "failed"
                 run.error = "未生成通过审核的终稿"
                 return run
-            if self.auto_publish and self.publishing_service:
-                run.publish_result = self.publishing_service.publish_generated(
-                    account=account,
-                    generated_id=run.approved_generated_id,
+            generated = self.db.get_generated(run.approved_generated_id)
+            if generated["status"] == "pending_review":
+                run.status = "pending_review"
+                run.skipped_reason = "等待人工审核"
+            elif self.auto_publish and self.publishing_service:
+                self.db.approve_generated_for_queue(
+                    run.approved_generated_id,
+                    min_interval_minutes=self.publish_min_interval_minutes,
                 )
-                publish_status = run.publish_result.publish_status
-                if publish_status == PUBLISH_PUBLISHED:
-                    run.status = RUN_PUBLISHED
-                elif publish_status == PUBLISH_UNKNOWN_MANUAL_RECOVERY:
-                    run.status = RUN_UNKNOWN
-                elif publish_status == PUBLISH_QUEUED:
-                    run.status = RUN_SKIPPED
-                    run.skipped_reason = "终稿已进入发布队列"
-                else:
-                    run.status = RUN_FAILED
-                if publish_status in {
-                    PUBLISH_FAILED_RETRYABLE,
-                    PUBLISH_UNKNOWN_MANUAL_RECOVERY,
-                }:
-                    result = run.publish_result.result
-                    run.error = str(
-                        result.get("error")
-                        or result.get("message")
-                        or "发布失败"
-                    )
+                run.status = "queued"
+                run.skipped_reason = "等待定时发布"
             else:
                 run.status = "generated"
         except Exception as exc:
@@ -269,7 +274,7 @@ class MultiAccountOperator:
             return
         if run.status == "already_published":
             return
-        if run.status == "generated":
+        if run.status in {"generated", "pending_review", "queued"}:
             return
         self.db.save_material_account_run(
             material_item_id,
@@ -292,9 +297,20 @@ class MultiAccountOperator:
         errors = []
         skips = []
         pending = []
+        waiting_review = []
+        waiting_publish = []
         for account in target_accounts:
             record = records.get(account.key)
             if record is None:
+                delivery = self.db.pending_delivery_for_material(material_item_id, account.key)
+                if delivery:
+                    if delivery["status"] == "pending_review":
+                        waiting_review.append(account.key)
+                    elif delivery["publish_status"] == PUBLISH_QUEUED:
+                        waiting_publish.append(account.key)
+                    else:
+                        pending.append(account.key)
+                    continue
                 pending.append(account.key)
                 continue
             status = str(record.get("status") or "")
@@ -327,6 +343,19 @@ class MultiAccountOperator:
             )
             return
 
+        if waiting_review or waiting_publish:
+            messages = []
+            if waiting_review:
+                messages.append(f"等待审核: {', '.join(waiting_review[:8])}")
+            if waiting_publish:
+                messages.append(f"等待发布: {', '.join(waiting_publish[:8])}")
+            self.db.mark_material_item(
+                material_item_id,
+                status="new",
+                error="; ".join(messages),
+            )
+            return
+
         if pending:
             self.db.mark_material_item(
                 material_item_id,
@@ -338,6 +367,9 @@ class MultiAccountOperator:
         message = "; ".join(skips) if skips else None
         self.db.mark_material_item(material_item_id, status="used", error=message)
 
+    def finalize_material_item(self, material_item_id: int) -> None:
+        self._finalize_material_item(material_item_id)
+
     def generate_for_all_accounts(
         self,
         *,
@@ -345,6 +377,9 @@ class MultiAccountOperator:
         title: str | None = None,
         url: str | None = None,
         future_symbol: str | None = None,
+        material_item_id: int | None = None,
+        direction: str | None = None,
+        source_enabled: bool | None = None,
     ) -> list[AccountContentRun]:
         runs = []
         for account in self.accounts:
@@ -355,6 +390,9 @@ class MultiAccountOperator:
                     title=title,
                     url=url,
                     future_symbol=future_symbol,
+                    material_item_id=material_item_id,
+                    direction=direction,
+                    source_enabled=source_enabled,
                 )
             )
         return runs
@@ -365,6 +403,7 @@ class MultiAccountOperator:
     ) -> list[AccountContentRun]:
         item = self.db.get_material_item(material_item_id)
         symbol = self._symbol_from_material(item)
+        direction = self._direction_from_material(item)
         runs: list[AccountContentRun] = []
         for account in self.accounts:
             existing = self.db.get_material_account_run(material_item_id, account.key)
@@ -386,6 +425,13 @@ class MultiAccountOperator:
                 title=item.get("title"),
                 url=item.get("url"),
                 future_symbol=symbol,
+                material_item_id=material_item_id,
+                direction=direction,
+                source_enabled=(
+                    bool(item.get("source_enabled"))
+                    if item.get("source_enabled") is not None
+                    else None
+                ),
             )
             self._save_material_run(material_item_id, run)
             runs.append(run)
@@ -407,12 +453,20 @@ class MultiAccountOperator:
             return self._restore_material_run(account_key=account.key, record=existing)
         item = self.db.get_material_item(material_item_id)
         symbol = self._symbol_from_material(item)
+        direction = self._direction_from_material(item)
         run = self._generate_for_account(
             account,
             content=item["content"],
             title=item.get("title"),
             url=item.get("url"),
             future_symbol=symbol,
+            material_item_id=material_item_id,
+            direction=direction,
+            source_enabled=(
+                bool(item.get("source_enabled"))
+                if item.get("source_enabled") is not None
+                else None
+            ),
         )
         self._save_material_run(material_item_id, run)
         self._finalize_material_item(material_item_id)

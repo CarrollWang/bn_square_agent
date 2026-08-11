@@ -16,6 +16,7 @@ from bn_square_agent.core.delivery import (
     PUBLISH_QUEUED,
     PUBLISH_UNKNOWN_MANUAL_RECOVERY,
     classify_publish_outcome,
+    content_fingerprint,
 )
 from bn_square_agent.core.secret_store import SecretStore
 from bn_square_agent.models.schemas import ContentReview, ReviewScores
@@ -131,11 +132,14 @@ class PublishingServiceTests(unittest.TestCase):
     def test_transport_error_is_saved_as_unknown(self) -> None:
         class FakeDatabase:
             def get_generated(self, generated_id):
+                content = "$BTC 继续看多"
                 return {
                     "id": generated_id,
                     "account_key": "writer",
                     "status": "approved",
                     "publish_status": "not_published",
+                    "content": content,
+                    "approval_hash": content_fingerprint("writer", content),
                 }
 
             def mark_published(self, generated_id, *, result, publish_status):

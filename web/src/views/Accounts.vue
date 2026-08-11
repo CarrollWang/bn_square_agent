@@ -32,6 +32,10 @@
           placeholder="http://user:pass@host:port 或 socks5://host:port"
         />
       </el-form-item>
+      <el-form-item label="发布前人工审核">
+        <el-switch v-model="form.require_manual_review" />
+        <span class="muted form-hint">关闭后仅 Gate 完全通过的稿件会自动进发布队列</span>
+      </el-form-item>
       <el-form-item class="wide advanced-toggle">
         <el-checkbox v-model="showAdvanced">高级发布通道配置</el-checkbox>
         <span class="muted">默认沿用全局 MCP 设置，通常不需要单独填写</span>
@@ -245,6 +249,7 @@ const form = reactive({
   proxy_url: "",
   mcp_url: "",
   mcp_auth_token: "",
+  require_manual_review: true,
 });
 
 function setCookieImportSessionId(sessionId: string) {
@@ -272,6 +277,7 @@ function resetForm() {
   form.proxy_url = "";
   form.mcp_url = "";
   form.mcp_auth_token = "";
+  form.require_manual_review = true;
   showAdvanced.value = false;
 }
 
@@ -285,6 +291,7 @@ async function saveAccount() {
       proxy_url: form.proxy_url.trim(),
       mcp_url: form.mcp_url.trim(),
       mcp_auth_token: form.mcp_auth_token.trim() || null,
+      require_manual_review: form.require_manual_review,
     });
     resetForm();
     await loadAccounts();
@@ -360,6 +367,7 @@ async function editAccount(accountKey: string) {
     form.proxy_url = detail.proxy_url || "";
     form.mcp_url = detail.mcp_url || "";
     form.mcp_auth_token = "";
+    form.require_manual_review = detail.require_manual_review;
     showAdvanced.value = Boolean(detail.mcp_url || detail.mcp_auth_token_configured);
   } finally {
     loadingAccountKey.value = "";
@@ -457,6 +465,10 @@ onMounted(loadAccounts);
 
 .advanced-toggle {
   align-items: center;
+}
+
+.form-hint {
+  margin-left: 10px;
 }
 
 .advanced-block {

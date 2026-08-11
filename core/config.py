@@ -19,6 +19,8 @@ SETTING_INTEGER_BOUNDS: dict[str, tuple[int, int]] = {
     "MATERIAL_TTL_SECONDS": (60, 604_800),
     "MATERIAL_CONSUME_BATCH_SIZE": (1, 20),
     "PUBLISH_FAILURE_ALERT_THRESHOLD": (1, 100),
+    "PUBLISH_MIN_INTERVAL_MINUTES": (0, 1_440),
+    "PUBLISH_DAILY_QUOTA_PER_ACCOUNT": (1, 1_000),
     "SMTP_PORT": (1, 65_535),
 }
 
@@ -115,6 +117,7 @@ class AccountConfig:
     mcp_auth_token: str = ""
     check_status: str = "unchecked"
     enabled: bool = True
+    require_manual_review: bool = True
 
 
 def _load_accounts(value: str) -> tuple[AccountConfig, ...]:
@@ -190,6 +193,8 @@ class Settings:
     auto_consume_materials: bool
     material_consume_batch_size: int
     publish_failure_alert_threshold: int
+    publish_min_interval_minutes: int
+    publish_daily_quota_per_account: int
     alert_email_enabled: bool
     alert_email_to: str
     smtp_host: str
@@ -285,6 +290,16 @@ class Settings:
                 "PUBLISH_FAILURE_ALERT_THRESHOLD",
                 os.getenv("PUBLISH_FAILURE_ALERT_THRESHOLD", "5"),
                 5,
+            ),
+            publish_min_interval_minutes=_bounded_integer(
+                "PUBLISH_MIN_INTERVAL_MINUTES",
+                os.getenv("PUBLISH_MIN_INTERVAL_MINUTES", "20"),
+                20,
+            ),
+            publish_daily_quota_per_account=_bounded_integer(
+                "PUBLISH_DAILY_QUOTA_PER_ACCOUNT",
+                os.getenv("PUBLISH_DAILY_QUOTA_PER_ACCOUNT", "30"),
+                30,
             ),
             alert_email_enabled=os.getenv("ALERT_EMAIL_ENABLED", "0")
             .strip()
@@ -436,6 +451,14 @@ class Settings:
             publish_failure_alert_threshold=integer(
                 "PUBLISH_FAILURE_ALERT_THRESHOLD",
                 self.publish_failure_alert_threshold,
+            ),
+            publish_min_interval_minutes=integer(
+                "PUBLISH_MIN_INTERVAL_MINUTES",
+                self.publish_min_interval_minutes,
+            ),
+            publish_daily_quota_per_account=integer(
+                "PUBLISH_DAILY_QUOTA_PER_ACCOUNT",
+                self.publish_daily_quota_per_account,
             ),
             alert_email_enabled=boolean(
                 "ALERT_EMAIL_ENABLED",

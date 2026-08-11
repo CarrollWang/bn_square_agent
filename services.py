@@ -23,6 +23,7 @@ def _load_accounts_from_db(db: Database) -> tuple[AccountConfig, ...]:
             mcp_auth_token=row.get("mcp_auth_token") or "",
             check_status=row.get("check_status") or "unchecked",
             enabled=bool(row.get("enabled", 1)),
+            require_manual_review=bool(row.get("require_manual_review", 1)),
         )
         for row in db.list_accounts()
     )
@@ -67,14 +68,15 @@ def build_services(settings: Settings | None = None) -> Services:
         WriterAgent(llm),
         ContentReviewAgent(llm),
     )
-    publisher = MCPPublisher(settings) if settings.auto_publish else None
-    publishing_service = PublishingService(db, publisher) if publisher else None
+    publisher = MCPPublisher(settings, validate_accounts=settings.auto_publish)
+    publishing_service = PublishingService(db, publisher)
     operator = MultiAccountOperator(
         db=db,
         accounts=accounts,
         content_graph=content_graph,
         publishing_service=publishing_service,
         auto_publish=settings.auto_publish,
+        publish_min_interval_minutes=settings.publish_min_interval_minutes,
     )
     return Services(
         settings,

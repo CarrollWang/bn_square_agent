@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from ..ai.agents import AnalysisAgent, ContentReviewAgent, StyleProfileAgent, WriterAgent
+from ..core.delivery import content_fingerprint
 from ..storage.database import Database
 from ..knowledge.style_rag import StyleRAG
-from ..models.schemas import Candidate, ContentReview, StyleProfile
+from ..models.schemas import Candidate, ContentReview, GateDecision, StyleProfile
 
 
 class ProfileState(TypedDict, total=False):
@@ -21,9 +22,10 @@ class ProfileState(TypedDict, total=False):
 class ContentState(TypedDict, total=False):
     account_key: str
     material_id: int
+    material_item_id: Optional[int]
     content: str
-    title: str | None
-    url: str | None
+    title: Optional[str]
+    url: Optional[str]
     profile: StyleProfile
     similar_analyses: list[dict[str, Any]]
     candidates: list[Candidate]
@@ -31,7 +33,36 @@ class ContentState(TypedDict, total=False):
     reviews: dict[int, ContentReview]
     rewrite_counts: dict[int, int]
     generated_ids: list[int]
-    approved_generated_id: int | None
+    approved_generated_id: Optional[int]
+    direction: Optional[str]
+    source_enabled: Optional[bool]
+    chart_image_failed: bool
+    require_manual_review: bool
+
+
+def classify_gate_status(
+    *,
+    review: ContentReview,
+    source_url: str | None,
+    direction: str | None,
+    source_enabled: bool | None,
+    chart_image_failed: bool,
+) -> GateDecision:
+    if not review.passed:
+        return GateDecision(status="blocked", reasons=["review_threshold_failed"])
+    reasons = []
+    if not str(source_url or "").strip():
+        reasons.append("source_url_missing")
+    if str(direction or "").strip().lower() not in {"long", "short"}:
+        reasons.append("direction_untagged")
+    if source_enabled is False:
+        reasons.append("source_disabled")
+    if chart_image_failed:
+        reasons.append("chart_image_failed")
+    return GateDecision(
+        status="manual_review" if reasons else "ok",
+        reasons=reasons,
+    )
 
 
 def default_style_profile(account_key: str) -> StyleProfile:
@@ -211,12 +242,29 @@ def build_content_graph(
         approved_generated_id = None
         for candidate in state["candidates"]:
             review = state["reviews"][candidate.candidate_index]
+            gate = classify_gate_status(
+                review=review,
+                source_url=state.get("url"),
+                direction=state.get("direction"),
+                source_enabled=state.get("source_enabled"),
+                chart_image_failed=bool(state.get("chart_image_failed", False)),
+            )
+            review = review.model_copy(update={"gate": gate})
             if not review.passed:
                 status = "failed"
             elif candidate.candidate_index == approved_index:
-                status = "approved"
+                status = (
+                    "approved"
+                    if gate.status == "ok" and not state.get("require_manual_review", True)
+                    else "pending_review"
+                )
             else:
                 status = "rejected"
+            approval_hash = (
+                content_fingerprint(state.get("account_key", "default"), candidate.content)
+                if status == "approved"
+                else None
+            )
             generated_id = db.save_generated(
                 source_post_id=state["material_id"],
                 candidate_index=candidate.candidate_index,
@@ -226,9 +274,11 @@ def build_content_graph(
                 review=review,
                 rewrite_count=state["rewrite_counts"][candidate.candidate_index],
                 account_key=state.get("account_key", "default"),
+                approval_hash=approval_hash,
+                material_item_id=state.get("material_item_id"),
             )
             ids.append(generated_id)
-            if status == "approved":
+            if candidate.candidate_index == approved_index:
                 approved_generated_id = generated_id
         return {"generated_ids": ids, "approved_generated_id": approved_generated_id}
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+import hashlib
 import json
 from typing import Any
 
@@ -75,3 +77,38 @@ def classify_publish_outcome(result: dict[str, Any]) -> str:
 
     # Fail closed: an unrecognized response must not be retried automatically.
     return PUBLISH_UNKNOWN_MANUAL_RECOVERY
+
+
+def content_fingerprint(account_key: str, content: str) -> str:
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    payload = f"{account_key.strip()}\0{normalized_content}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.astimezone() if parsed.tzinfo is None else parsed
+
+
+def next_scheduled_time(
+    *,
+    latest_at: str | None,
+    min_interval_minutes: int,
+    jitter_minutes: int,
+    now: datetime | None = None,
+) -> str:
+    local_now = now or datetime.now().astimezone()
+    if local_now.tzinfo is None:
+        local_now = local_now.astimezone()
+    latest = parse_iso_datetime(latest_at)
+    if latest is not None:
+        latest = latest.astimezone(local_now.tzinfo)
+        base = max(local_now, latest + timedelta(minutes=max(0, min_interval_minutes)))
+    else:
+        base = local_now
+    return (base + timedelta(minutes=max(0, jitter_minutes))).isoformat()

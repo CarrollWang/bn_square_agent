@@ -17,6 +17,7 @@ from ..core.delivery import (
     PUBLISH_QUEUED,
     PUBLISH_UNKNOWN_MANUAL_RECOVERY,
     classify_publish_outcome,
+    content_fingerprint,
 )
 from ..storage.database import Database
 from .chart_image import ChartImageService
@@ -37,8 +38,9 @@ class PublishResult:
 
 
 class MCPPublisher:
-    def __init__(self, settings: Settings):
-        settings.validate_for_publish()
+    def __init__(self, settings: Settings, *, validate_accounts: bool = True):
+        if validate_accounts:
+            settings.validate_for_publish()
         self.settings = settings
         self.chart_images = ChartImageService()
         self._tools_by_target: dict[tuple[str, str], list[MCPTool]] = {}
@@ -157,6 +159,7 @@ class PublishingService:
         *,
         account: AccountConfig,
         generated_id: int,
+        allow_queued: bool = False,
     ) -> PublishResult:
         generated = self.db.get_generated(generated_id)
         if generated["account_key"] != account.key:
@@ -170,7 +173,7 @@ class PublishingService:
             PUBLISH_PUBLISHED,
             PUBLISH_QUEUED,
             PUBLISH_UNKNOWN_MANUAL_RECOVERY,
-        }:
+        } and not (existing_publish_status == PUBLISH_QUEUED and allow_queued):
             result = self._decode_publish_result(generated.get("publish_json"))
             if existing_publish_status == PUBLISH_PUBLISHED:
                 if not result:
@@ -207,6 +210,32 @@ class PublishingService:
                 False,
                 result,
                 existing_publish_status,
+            )
+        expected_fingerprint = str(generated.get("approval_hash") or "")
+        actual_fingerprint = content_fingerprint(account.key, generated["content"])
+        if not expected_fingerprint or expected_fingerprint != actual_fingerprint:
+            error = (
+                "approval_hash_missing"
+                if not expected_fingerprint
+                else "content_modified_after_approval"
+            )
+            result = {
+                "success": False,
+                "outcome": OUTCOME_FAILED,
+                "error": error,
+                "publish_status": PUBLISH_FAILED_RETRYABLE,
+            }
+            self.db.mark_published(
+                generated_id,
+                result=result,
+                publish_status=PUBLISH_FAILED_RETRYABLE,
+            )
+            return PublishResult(
+                account.key,
+                generated_id,
+                False,
+                result,
+                PUBLISH_FAILED_RETRYABLE,
             )
         try:
             result = self.publisher.publish(account=account, generated=generated)
