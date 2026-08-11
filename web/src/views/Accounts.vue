@@ -108,9 +108,10 @@
           <div class="muted">{{ formatTime(row.checked_at) }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="250" fixed="right">
+      <el-table-column label="操作" width="340" fixed="right">
         <template #default="{ row }">
           <el-button size="small" @click="checkAccount(row.account_key)">检测</el-button>
+          <el-button size="small" type="primary" plain @click="openProfile(row)">风格档案</el-button>
           <el-button size="small" plain :loading="loadingAccountKey === row.account_key" @click="editAccount(row.account_key)">
             编辑
           </el-button>
@@ -118,6 +119,97 @@
         </template>
       </el-table-column>
     </el-table>
+
+    <el-drawer
+      v-model="profileDrawerVisible"
+      :title="`${profileAccountName || profileAccountKey} · 风格档案`"
+      size="min(720px, 92vw)"
+    >
+      <div v-loading="profileLoading" class="profile-drawer">
+        <el-alert
+          v-if="!profileSummary?.profile"
+          title="尚未生成风格档案"
+          description="先导入历史文章，再点击“重新构建档案”。构建会逐篇分析，并重建该账号的风格检索库。"
+          type="warning"
+          :closable="false"
+          show-icon
+        />
+
+        <template v-else>
+          <el-descriptions :column="1" border class="profile-section">
+            <el-descriptions-item label="人设定位">
+              {{ profileSummary.profile.profile.persona }}
+            </el-descriptions-item>
+            <el-descriptions-item label="语气">
+              {{ profileSummary.profile.profile.tone }}
+            </el-descriptions-item>
+            <el-descriptions-item label="风险偏好">
+              <el-tag type="warning" effect="plain">
+                {{ profileSummary.profile.profile.risk_level }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="开场方式">
+              {{ profileSummary.profile.profile.opening_style }}
+            </el-descriptions-item>
+            <el-descriptions-item label="常写主题">
+              <el-space wrap>
+                <el-tag
+                  v-for="item in profileSummary.profile.profile.favorite_topics"
+                  :key="item"
+                  effect="plain"
+                >{{ item }}</el-tag>
+              </el-space>
+            </el-descriptions-item>
+            <el-descriptions-item label="常用词">
+              {{ profileSummary.profile.profile.favorite_words.join("、") || "暂无" }}
+            </el-descriptions-item>
+            <el-descriptions-item label="稳定观点">
+              <ul class="profile-list">
+                <li v-for="item in profileSummary.profile.profile.beliefs" :key="item">{{ item }}</li>
+              </ul>
+            </el-descriptions-item>
+            <el-descriptions-item label="结构习惯">
+              <ul class="profile-list">
+                <li v-for="item in profileSummary.profile.profile.structure_patterns" :key="item">{{ item }}</li>
+              </ul>
+            </el-descriptions-item>
+            <el-descriptions-item label="更新时间">
+              {{ formatTime(profileSummary.profile.updated_at) }}
+            </el-descriptions-item>
+          </el-descriptions>
+        </template>
+
+        <el-card shadow="never" class="profile-section">
+          <template #header>
+            <div class="profile-section-header">
+              <strong>参考文章</strong>
+              <span class="muted">共 {{ profileSummary?.reference_count || 0 }} 篇</span>
+            </div>
+          </template>
+          <el-space wrap>
+            <el-tag type="info" effect="plain">待分析 {{ analysisCount("pending") }}</el-tag>
+            <el-tag type="success" effect="plain">成功 {{ analysisCount("success") }}</el-tag>
+            <el-tag type="danger" effect="plain">失败 {{ analysisCount("failed") }}</el-tag>
+          </el-space>
+        </el-card>
+
+        <el-card shadow="never" class="profile-section">
+          <template #header><strong>批量导入历史文章</strong></template>
+          <el-input
+            v-model="referencePostsText"
+            type="textarea"
+            :rows="10"
+            placeholder="粘贴文章正文；多篇文章请用单独一行 --- 分隔"
+          />
+          <div class="profile-actions">
+            <el-button :loading="referenceImporting" @click="importReferencePosts">导入</el-button>
+            <el-button type="primary" :loading="profileBuilding" @click="buildProfile">
+              重新构建档案
+            </el-button>
+          </div>
+        </el-card>
+      </div>
+    </el-drawer>
   </el-card>
 </template>
 
@@ -126,7 +218,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { onMounted, reactive, ref } from "vue";
 
 import { api } from "@/api";
-import type { Account } from "@/types";
+import type { Account, AccountProfileSummary } from "@/types";
 import { formatTime } from "@/utils";
 
 const accounts = ref<Account[]>([]);
@@ -138,6 +230,14 @@ const finishingImport = ref(false);
 const COOKIE_IMPORT_SESSION_KEY = "bn_square_cookie_import_session";
 const cookieImportSessionId = ref(sessionStorage.getItem(COOKIE_IMPORT_SESSION_KEY) || "");
 const showAdvanced = ref(false);
+const profileDrawerVisible = ref(false);
+const profileLoading = ref(false);
+const profileBuilding = ref(false);
+const referenceImporting = ref(false);
+const profileAccountKey = ref("");
+const profileAccountName = ref("");
+const profileSummary = ref<AccountProfileSummary | null>(null);
+const referencePostsText = ref("");
 const form = reactive({
   account_key: "",
   name: "",
@@ -272,6 +372,63 @@ async function checkAccount(accountKey: string) {
   ElMessage.success(result.valid ? "账号有效" : "检测完成，请查看状态");
 }
 
+function analysisCount(status: string) {
+  return profileSummary.value?.analysis_status?.[status] || 0;
+}
+
+async function loadProfile() {
+  if (!profileAccountKey.value) return;
+  profileLoading.value = true;
+  try {
+    profileSummary.value = await api.accountProfile(profileAccountKey.value);
+  } finally {
+    profileLoading.value = false;
+  }
+}
+
+async function openProfile(account: Account) {
+  profileAccountKey.value = account.account_key;
+  profileAccountName.value = account.name;
+  profileSummary.value = null;
+  referencePostsText.value = "";
+  profileDrawerVisible.value = true;
+  await loadProfile();
+}
+
+async function importReferencePosts() {
+  const posts = referencePostsText.value
+    .split(/\n\s*---\s*\n/g)
+    .map((content) => content.trim())
+    .filter(Boolean)
+    .map((content) => ({ content }));
+  if (!posts.length) {
+    ElMessage.warning("请先粘贴至少一篇历史文章");
+    return;
+  }
+  referenceImporting.value = true;
+  try {
+    const result = await api.importReferencePosts(profileAccountKey.value, posts);
+    referencePostsText.value = "";
+    await loadProfile();
+    ElMessage.success(`已导入 ${result.added} 篇，跳过重复 ${result.duplicated} 篇`);
+  } finally {
+    referenceImporting.value = false;
+  }
+}
+
+async function buildProfile() {
+  profileBuilding.value = true;
+  try {
+    const result = await api.buildAccountProfile(profileAccountKey.value);
+    await loadProfile();
+    ElMessage.success(
+      `档案构建完成：本次成功 ${result.analyzed_count} 篇，失败 ${result.failed_count} 篇`,
+    );
+  } finally {
+    profileBuilding.value = false;
+  }
+}
+
 async function deleteAccount(accountKey: string) {
   await ElMessageBox.confirm(`确认删除账号 ${accountKey}？`, "删除账号", { type: "warning" });
   await api.deleteAccount(accountKey);
@@ -308,6 +465,32 @@ onMounted(loadAccounts);
 
 .data-table {
   margin-top: 14px;
+}
+
+.profile-drawer {
+  min-height: 240px;
+}
+
+.profile-section {
+  margin-top: 16px;
+}
+
+.profile-section-header,
+.profile-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.profile-actions {
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+.profile-list {
+  margin: 0;
+  padding-left: 20px;
 }
 
 @media (max-width: 760px) {

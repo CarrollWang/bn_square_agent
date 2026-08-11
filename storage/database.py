@@ -1186,6 +1186,39 @@ class Database:
             ).fetchone()
         return StyleProfile.model_validate_json(row["profile_json"]) if row else None
 
+    def get_profile_record(self, account_key: str = "default") -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT account_key, profile_json, source_count, updated_at
+                FROM style_profiles
+                WHERE account_key = ?
+                """,
+                (account_key,),
+            ).fetchone()
+        if not row:
+            return None
+        record = dict(row)
+        record["profile"] = json.loads(record.pop("profile_json"))
+        return record
+
+    def reference_post_stats(self, account_key: str = "default") -> dict[str, Any]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT analysis_status, COUNT(*) AS count
+                FROM source_posts
+                WHERE account_key = ? AND role = 'reference'
+                GROUP BY analysis_status
+                """,
+                (account_key,),
+            ).fetchall()
+        statuses = {str(row["analysis_status"]): int(row["count"]) for row in rows}
+        return {
+            "reference_count": sum(statuses.values()),
+            "analysis_status": statuses,
+        }
+
     def save_generated(
         self,
         *,

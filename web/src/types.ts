@@ -26,6 +26,37 @@ export interface AccountDetail {
   mcp_auth_token_configured: boolean;
 }
 
+export interface StyleProfileData {
+  persona: string;
+  risk_level: string;
+  favorite_topics: string[];
+  favorite_words: string[];
+  opening_style: string;
+  tone: string;
+  beliefs: string[];
+  structure_patterns: string[];
+}
+
+export interface AccountProfileRecord {
+  account_key: string;
+  profile: StyleProfileData;
+  source_count: number;
+  updated_at: string;
+}
+
+export interface AccountProfileSummary {
+  account_key: string;
+  profile: AccountProfileRecord | null;
+  reference_count: number;
+  analysis_status: Record<string, number>;
+}
+
+export interface ProfileBuildResult {
+  analyzed_count: number;
+  failed_count: number;
+  source_count: number;
+}
+
 export interface CookieImportStartResult {
   ok: boolean;
   session_id: string;

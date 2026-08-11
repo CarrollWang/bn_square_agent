@@ -52,6 +52,7 @@ DIST_DIR = PACKAGE_DIR / "dist"
 MONITOR_LOCK_NAME = "material_monitor"
 MONITOR_LOCK_LEASE_SECONDS = 30 * 60
 MONITOR_LOCK_RENEW_SECONDS = 5 * 60
+PROFILE_BUILD_LOCK_LEASE_SECONDS = 30 * 60
 MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
 COOKIE_LOGIN_SESSION_TTL_SECONDS = 15 * 60
 MAX_COOKIE_LOGIN_SESSIONS = 2
@@ -661,6 +662,17 @@ class AccountCookieImportFinishPayload(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
 
 
+class ReferencePostPayload(BaseModel):
+    title: str | None = Field(default=None, max_length=500)
+    content: str = Field(min_length=1, max_length=50_000)
+    url: str | None = Field(default=None, max_length=2_048)
+    source_created_at: str | None = Field(default=None, max_length=100)
+
+
+class ReferencePostsPayload(BaseModel):
+    posts: list[ReferencePostPayload] = Field(min_length=1, max_length=200)
+
+
 class RunPayload(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
     title: str | None = Field(default=None, max_length=500)
@@ -786,6 +798,20 @@ def _account_from_row(row: dict[str, Any]) -> AccountConfig:
     )
 
 
+def _require_account(db: Database, account_key: str) -> dict[str, Any]:
+    account = next(
+        (
+            row
+            for row in db.list_accounts(include_disabled=True)
+            if row["account_key"] == account_key
+        ),
+        None,
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    return account
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(DIST_DIR / "index.html")
@@ -830,16 +856,7 @@ def list_accounts() -> list[dict]:
 
 @app.get("/api/accounts/{account_key}")
 def read_account(account_key: str) -> dict:
-    account = next(
-        (
-            row
-            for row in get_db().list_accounts(include_disabled=True)
-            if row["account_key"] == account_key
-        ),
-        None,
-    )
-    if not account:
-        raise HTTPException(status_code=404, detail="账号不存在")
+    account = _require_account(get_db(), account_key)
     return {
         "account_key": account["account_key"],
         "name": account["name"],
@@ -847,6 +864,75 @@ def read_account(account_key: str) -> dict:
         "proxy_url": account.get("proxy_url") or "",
         "mcp_url": account.get("mcp_url") or "",
         "mcp_auth_token_configured": bool(account.get("mcp_auth_token")),
+    }
+
+
+@app.post("/api/accounts/{account_key}/reference-posts")
+def import_account_reference_posts(
+    account_key: str,
+    payload: ReferencePostsPayload,
+) -> dict[str, int]:
+    db = get_db()
+    _require_account(db, account_key)
+    added = 0
+    duplicated = 0
+    for post in payload.posts:
+        content = post.content.strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="参考文章正文不能为空")
+        _, created = db.add_source_post(
+            account_key=account_key,
+            role="reference",
+            title=post.title.strip() if post.title else None,
+            content=content,
+            url=post.url.strip() if post.url else None,
+            created_at=post.source_created_at.strip() if post.source_created_at else None,
+        )
+        if created:
+            added += 1
+        else:
+            duplicated += 1
+    return {"added": added, "duplicated": duplicated}
+
+
+@app.get("/api/accounts/{account_key}/profile")
+def read_account_profile(account_key: str) -> dict[str, Any]:
+    db = get_db()
+    _require_account(db, account_key)
+    stats = db.reference_post_stats(account_key)
+    return {
+        "account_key": account_key,
+        "profile": db.get_profile_record(account_key),
+        **stats,
+    }
+
+
+@app.post("/api/accounts/{account_key}/profile/build")
+async def build_account_profile(account_key: str) -> dict[str, int]:
+    db = get_db()
+    _require_account(db, account_key)
+    job_name = f"profile_build:{account_key}"
+    owner_id = uuid4().hex
+    if not db.try_acquire_job_lock(
+        job_name,
+        owner_id=owner_id,
+        lease_seconds=PROFILE_BUILD_LOCK_LEASE_SECONDS,
+    ):
+        raise HTTPException(status_code=409, detail="该账号的风格档案正在构建，请稍后再试")
+    try:
+        services = await asyncio.to_thread(build_services)
+        result = await asyncio.to_thread(
+            services.profile_graph.invoke,
+            {"account_key": account_key},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        await asyncio.to_thread(db.release_job_lock, job_name, owner_id=owner_id)
+    return {
+        "analyzed_count": int(result.get("analyzed_count") or 0),
+        "failed_count": int(result.get("failed_count") or 0),
+        "source_count": int(result.get("source_count") or 0),
     }
 
 

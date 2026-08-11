@@ -1,5 +1,6 @@
 import type {
   Account,
+  AccountProfileSummary,
   AccountPerformanceDashboard,
   AccountDetail,
   CookieImportFinishResult,
@@ -9,6 +10,7 @@ import type {
   MonitorStatus,
   PublishAccountSummary,
   PublishHistoryItem,
+  ProfileBuildResult,
   Settings,
 } from "./types";
 
@@ -48,6 +50,31 @@ export const api = {
     requestJson<any>(`/api/accounts/${encodeURIComponent(accountKey)}/check`, {
       method: "POST",
     }),
+  accountProfile: (accountKey: string) =>
+    requestJson<AccountProfileSummary>(
+      `/api/accounts/${encodeURIComponent(accountKey)}/profile`,
+    ),
+  importReferencePosts: (
+    accountKey: string,
+    posts: Array<{
+      title?: string;
+      content: string;
+      url?: string;
+      source_created_at?: string;
+    }>,
+  ) =>
+    requestJson<{ added: number; duplicated: number }>(
+      `/api/accounts/${encodeURIComponent(accountKey)}/reference-posts`,
+      {
+        method: "POST",
+        body: JSON.stringify({ posts }),
+      },
+    ),
+  buildAccountProfile: (accountKey: string) =>
+    requestJson<ProfileBuildResult>(
+      `/api/accounts/${encodeURIComponent(accountKey)}/profile/build`,
+      { method: "POST" },
+    ),
   startCookieImport: (payload: {
     account_key: string;
     name?: string;
