@@ -312,6 +312,7 @@ export interface Settings {
   mcp_publish_tool: string;
   mcp_auth_token_configured: boolean;
   mcp_auth_token_masked: string;
+  legacy_publish_allowed: boolean;
   auto_monitor_enabled: boolean;
   auto_publish: boolean;
   auto_consume_materials: boolean;

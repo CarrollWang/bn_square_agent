@@ -225,6 +225,17 @@ class GateTests(unittest.TestCase):
 
 
 class ApprovalAndQueueTests(unittest.TestCase):
+    def test_publish_defaults_fail_closed(self) -> None:
+        settings = Settings.from_env()
+        self.assertFalse(settings.auto_publish)
+        self.assertFalse(settings.allow_legacy_mcp_publish)
+        with self.assertRaisesRegex(ValueError, "遗留 Remote MCP"):
+            settings.validate_for_publish()
+
+    def test_saved_auto_publish_cannot_bypass_legacy_gate(self) -> None:
+        settings = Settings.from_env().with_overrides({"AUTO_PUBLISH": "1"})
+        self.assertFalse(settings.auto_publish)
+
     def test_manual_publish_mode_can_start_before_account_cookie_is_configured(self) -> None:
         settings = replace(
             Settings.from_env(),

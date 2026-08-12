@@ -786,7 +786,7 @@ class RunPayload(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
     title: str | None = Field(default=None, max_length=500)
     url: str | None = Field(default=None, max_length=2_048)
-    auto_publish: bool = True
+    auto_publish: bool = False
 
 
 class SettingsPayload(BaseModel):
@@ -830,7 +830,7 @@ class MaterialSourcePayload(BaseModel):
 
 class RunMaterialPayload(BaseModel):
     material_item_id: int = Field(ge=1)
-    auto_publish: bool = True
+    auto_publish: bool = False
 
 
 class LLMTestResult(BaseModel):
@@ -1153,6 +1153,7 @@ def read_settings() -> dict:
         "mcp_publish_tool": settings.mcp_publish_tool,
         "mcp_auth_token_configured": bool(settings.mcp_auth_token),
         "mcp_auth_token_masked": mask_secret(settings.mcp_auth_token),
+        "legacy_publish_allowed": settings.allow_legacy_mcp_publish,
         "auto_monitor_enabled": settings.auto_monitor_enabled,
         "auto_publish": settings.auto_publish,
         "auto_consume_materials": settings.auto_consume_materials,

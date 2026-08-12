@@ -90,8 +90,15 @@
 
       <el-tab-pane label="自动运行设置" name="runtime">
         <el-form :model="form" label-width="170px" class="settings-form">
+          <el-alert
+            class="wide"
+            title="发布链路迁移中"
+            type="warning"
+            :closable="false"
+            description="正式目标是 Windows 本机 Web 私有接口发布器。Remote MCP 属于遗留链路，默认被后端门禁拒绝；当前建议只生成、审核和排队。"
+          />
           <el-form-item label="默认 MCP 地址" class="wide">
-            <el-input v-model="form.mcp_url" placeholder="https://your-mcp.example.com/mcp" />
+            <el-input v-model="form.mcp_url" placeholder="遗留迁移参数，不作为正式发布配置" />
           </el-form-item>
           <el-form-item label="默认发布工具">
             <el-input v-model="form.mcp_publish_tool" placeholder="publish_binance_square" />
@@ -104,7 +111,8 @@
             <el-switch v-model="form.auto_monitor_enabled" />
           </el-form-item>
           <el-form-item label="自动发布">
-            <el-switch v-model="form.auto_publish" />
+            <el-switch v-model="form.auto_publish" :disabled="!settings?.legacy_publish_allowed" />
+            <div v-if="!settings?.legacy_publish_allowed" class="muted">后端安全门禁已关闭遗留发布</div>
           </el-form-item>
           <el-form-item label="自动消费素材">
             <el-switch v-model="form.auto_consume_materials" />
@@ -172,7 +180,7 @@ const form = reactive<Record<string, any>>({
   mcp_publish_tool: "publish_binance_square",
   mcp_auth_token: "",
   auto_monitor_enabled: true,
-  auto_publish: true,
+  auto_publish: false,
   auto_consume_materials: true,
   material_poll_interval_seconds: 300,
   material_success_interval_seconds: 600,
@@ -209,7 +217,7 @@ function applySettings(data: Settings) {
   form.mcp_publish_tool = data.mcp_publish_tool || "publish_binance_square";
   form.mcp_auth_token = data.mcp_auth_token_masked || "";
   form.auto_monitor_enabled = Boolean(data.auto_monitor_enabled);
-  form.auto_publish = Boolean(data.auto_publish);
+  form.auto_publish = Boolean(data.auto_publish && data.legacy_publish_allowed);
   form.auto_consume_materials = Boolean(data.auto_consume_materials);
   form.material_poll_interval_seconds = data.material_poll_interval_seconds || 300;
   form.material_success_interval_seconds = data.material_success_interval_seconds || 600;

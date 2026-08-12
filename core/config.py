@@ -184,6 +184,7 @@ class Settings:
     mcp_url: str
     mcp_publish_tool: str
     mcp_auth_token: str
+    allow_legacy_mcp_publish: bool
     auto_monitor_enabled: bool
     auto_publish: bool
     material_poll_interval_seconds: int
@@ -250,13 +251,23 @@ class Settings:
             mcp_url=os.getenv("MCP_URL", "").strip(),
             mcp_publish_tool=os.getenv("MCP_PUBLISH_TOOL", "").strip(),
             mcp_auth_token=os.getenv("MCP_AUTH_TOKEN", "").strip(),
+            allow_legacy_mcp_publish=os.getenv(
+                "ALLOW_LEGACY_MCP_PUBLISH", "0"
+            )
+            .strip()
+            .lower()
+            not in {"0", "false", "no", "off"},
             auto_monitor_enabled=os.getenv("AUTO_MONITOR_ENABLED", "1")
             .strip()
             .lower()
             not in {"0", "false", "no", "off"},
-            auto_publish=os.getenv("AUTO_PUBLISH", "1").strip().lower()
-            not in {"0", "false", "no", "off"}
-            and publish_mode != "manual",
+            auto_publish=(
+                os.getenv("AUTO_PUBLISH", "0").strip().lower()
+                not in {"0", "false", "no", "off"}
+                and publish_mode != "manual"
+                and os.getenv("ALLOW_LEGACY_MCP_PUBLISH", "0").strip().lower()
+                not in {"0", "false", "no", "off"}
+            ),
             material_poll_interval_seconds=_bounded_integer(
                 "MATERIAL_POLL_INTERVAL_SECONDS",
                 os.getenv("MATERIAL_POLL_INTERVAL_SECONDS", "300"),
@@ -368,6 +379,12 @@ class Settings:
         return ""
 
     def validate_for_publish(self) -> None:
+        if not self.allow_legacy_mcp_publish:
+            raise ValueError(
+                "遗留 Remote MCP 发布链路默认关闭；正式方案应使用 Windows 本机 "
+                "Web 私有接口发布器。仅迁移验证时可显式设置 "
+                "ALLOW_LEGACY_MCP_PUBLISH=1"
+            )
         missing = [account.key for account in self.accounts if not account.cookie]
         if missing:
             raise ValueError(f"以下账号缺少 cookie: {', '.join(missing)}")
@@ -426,7 +443,10 @@ class Settings:
                 "AUTO_MONITOR_ENABLED",
                 self.auto_monitor_enabled,
             ),
-            auto_publish=boolean("AUTO_PUBLISH", self.auto_publish),
+            auto_publish=(
+                boolean("AUTO_PUBLISH", self.auto_publish)
+                and self.allow_legacy_mcp_publish
+            ),
             material_poll_interval_seconds=integer(
                 "MATERIAL_POLL_INTERVAL_SECONDS",
                 self.material_poll_interval_seconds,

@@ -94,6 +94,7 @@ class MCPPublisher:
         account: AccountConfig,
         generated: dict[str, Any],
     ) -> dict[str, Any]:
+        self.settings.validate_for_publish()
         if not account.cookie:
             raise RuntimeError(f"账号 {account.key} 缺少 Cookie，无法发布")
         tool_name = self.resolve_publish_tool(account)
